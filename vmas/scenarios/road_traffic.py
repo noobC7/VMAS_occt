@@ -2732,6 +2732,7 @@ class Rewards:
         higth_v=None,
         reach_goal=None,
         reach_intermediate_goal=None,
+        track_reference_vel=None,
     ):
         self.progress = progress
         self.weighting_ref_directions = weighting_ref_directions
