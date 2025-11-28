@@ -5,6 +5,9 @@
 
 
 import torch
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import numpy as np
 
 import vmas.simulator.core
 import vmas.simulator.utils
@@ -21,8 +24,8 @@ class DynamicKinematicBicycle(Dynamics):
         l_r: float,
         max_steering_angle: float,
         max_acceleration: float = 5.0,  # Maximum acceleration in m/s^2
-        max_deceleration: float = -10.0,  # Maximum deceleration in m/s^2 (negative)
-        max_steering_rate: float = torch.pi ,  # Maximum steering rate in rad/s
+        max_deceleration: float = -5.0,  # Maximum deceleration in m/s^2 (negative)
+        max_steering_rate: float = torch.pi / 4,  # 调整为π/4弧度/秒（45度/秒），更符合真实车辆
         integration: str = "rk4",  # one of "euler", "rk4"
     ):
         super().__init__()
@@ -44,6 +47,14 @@ class DynamicKinematicBicycle(Dynamics):
         # Additional state variables
         self.steering_angle = None  # Steering angle state
         self.velocity = None  # Linear velocity state
+        
+        # For debugging and visualization
+        self.history = {
+            'pos': [],
+            'vel': [],
+            'steering_angle': [],
+            'yaw': []
+        }
 
     def f(self, state, acceleration, steering_rate):
         # State now includes: [x, y, theta, v, delta]
@@ -174,3 +185,238 @@ class DynamicKinematicBicycle(Dynamics):
                 new_velocity,
                 new_steering_angle
             ), dim=1)
+        
+        # Store history for debugging
+        if batch_size == 1:  # Only store for single batch case
+            self.history['pos'].append(pos.cpu().numpy().copy()[0])
+            self.history['vel'].append(np.array([new_vel_x.cpu().numpy()[0], new_vel_y.cpu().numpy()[0]]))
+            self.history['steering_angle'].append(new_steering_angle.cpu().numpy()[0][0])
+            self.history['yaw'].append(theta.cpu().numpy()[0][0])
+
+    def reset_history(self):
+        """Reset the history for a new simulation run"""
+        self.history = {
+            'pos': [],
+            'vel': [],
+            'steering_angle': [],
+            'yaw': []
+        }
+
+    def plot_trajectory(self):
+        """Plot the vehicle trajectory and states"""
+        if not self.history['pos']:
+            print("No history data to plot")
+            return
+        
+        # Convert history to numpy arrays
+        positions = np.array(self.history['pos'])
+        velocities = np.array(self.history['vel'])
+        steering_angles = np.array(self.history['steering_angle'])
+        yaw_angles = np.array(self.history['yaw'])
+        
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # Plot trajectory
+        axes[0, 0].plot(positions[:, 0], positions[:, 1], 'b-')
+        axes[0, 0].set_title('Vehicle Trajectory')
+        axes[0, 0].set_xlabel('X Position (m)')
+        axes[0, 0].set_ylabel('Y Position (m)')
+        axes[0, 0].grid(True)
+        axes[0, 0].axis('equal')
+        
+        # Plot velocity
+        time = np.arange(len(velocities)) * self.dt
+        speed = np.linalg.norm(velocities, axis=1)
+        axes[0, 1].plot(time, speed, 'r-')
+        axes[0, 1].set_title('Vehicle Speed')
+        axes[0, 1].set_xlabel('Time (s)')
+        axes[0, 1].set_ylabel('Speed (m/s)')
+        axes[0, 1].grid(True)
+        
+        # Plot steering angle
+        axes[1, 0].plot(time, np.rad2deg(steering_angles), 'g-')
+        axes[1, 0].set_title('Steering Angle')
+        axes[1, 0].set_xlabel('Time (s)')
+        axes[1, 0].set_ylabel('Angle (degrees)')
+        axes[1, 0].grid(True)
+        
+        # Plot yaw angle
+        axes[1, 1].plot(time, np.rad2deg(yaw_angles), 'm-')
+        axes[1, 1].set_title('Yaw Angle')
+        axes[1, 1].set_xlabel('Time (s)')
+        axes[1, 1].set_ylabel('Angle (degrees)')
+        axes[1, 1].grid(True)
+        
+        plt.tight_layout()
+        plt.show()
+
+
+# 模拟环境和World类的简化版本，用于测试
+class MockWorld:
+    def __init__(self, dt=0.1):
+        self.dt = dt
+        self.device = torch.device('cpu')
+
+class MockAgent:
+    def __init__(self, world):
+        self.world = world
+        self.mass = 1500.0  # 典型车辆质量（kg）
+        self.moment_of_inertia = 2000.0  # 转动惯量
+        
+        # 初始状态
+        self.state = type('obj', (), {
+            'pos': torch.zeros((1, 2), device=world.device),  # 位置 [x, y]
+            'rot': torch.zeros((1, 1), device=world.device),  # 旋转角度
+            'vel': torch.zeros((1, 2), device=world.device),  # 速度
+            'ang_vel': torch.zeros((1, 1), device=world.device),  # 角速度
+            'force': torch.zeros((1, 2), device=world.device),  # 力
+            'torque': torch.zeros((1, 1), device=world.device)  # 扭矩
+        })
+        
+        # 动作
+        self.action = type('obj', (), {
+            'u': torch.zeros((1, 2), device=world.device)  # 动作 [acceleration, steering_rate]
+        })
+
+
+def simulate_simple_test():
+    """简单测试函数，模拟车辆运动并可视化"""
+    # 创建模拟世界
+    world = MockWorld(dt=0.05)
+    
+    # 创建车辆动力学模型
+    # 典型轿车参数：轴距约2.8米，前轮距和后轮距约1.6米
+    l_f = 1.4  # 前轮到重心距离
+    l_r = 1.4  # 后轮到重心距离
+    width = 1.6  # 车辆宽度
+    max_steering_angle = np.deg2rad(35)  # 最大转向角度35度
+    
+    dynamics = DynamicKinematicBicycle(
+        world=world,
+        width=width,
+        l_f=l_f,
+        l_r=l_r,
+        max_steering_angle=max_steering_angle,
+        max_acceleration=5.0,
+        max_deceleration=-10.0,
+        max_steering_rate=np.deg2rad(45),  # 45度/秒，更合理的转向角速度
+        integration="rk4"
+    )
+    
+    # 创建模拟智能体
+    agent = MockAgent(world)
+    dynamics.agent = agent
+    
+    # 运行模拟
+    steps = 200
+    for i in range(steps):
+        # 设置不同的测试动作
+        if i < 50:
+            # 前50步：加速向前
+            agent.action.u[0, 0] = 2.0  # 2 m/s^2 加速度
+            agent.action.u[0, 1] = 0.0   # 不转向
+        elif i < 100:
+            # 接下来50步：保持速度并开始转弯
+            agent.action.u[0, 0] = 0.0   # 保持速度
+            agent.action.u[0, 1] = np.deg2rad(20)  # 20度/秒的转向角速度
+        elif i < 150:
+            # 接下来50步：保持速度并反向转弯
+            agent.action.u[0, 0] = 0.0   # 保持速度
+            agent.action.u[0, 1] = -np.deg2rad(20)  # -20度/秒的转向角速度
+        else:
+            # 最后50步：减速停止
+            agent.action.u[0, 0] = -5.0  # 5 m/s^2 减速度
+            agent.action.u[0, 1] = 0.0   # 不转向
+        
+        # 处理动作
+        dynamics.process_action()
+        
+        # 更新智能体状态（简化版本，实际应该由物理引擎处理）
+        agent.state.pos += agent.state.vel * world.dt
+        agent.state.rot += agent.state.ang_vel * world.dt
+        agent.state.vel += (agent.state.force / agent.mass) * world.dt
+        agent.state.ang_vel += (agent.state.torque / agent.moment_of_inertia) * world.dt
+    
+    # 绘制轨迹和状态
+    dynamics.plot_trajectory()
+    
+    # 创建动画展示车辆运动
+    animate_vehicle_motion(dynamics, world.dt)
+
+def animate_vehicle_motion(dynamics, dt):
+    """创建车辆运动的动画"""
+    if not dynamics.history['pos']:
+        print("No history data to animate")
+        return
+    
+    positions = np.array(dynamics.history['pos'])
+    yaw_angles = np.array(dynamics.history['yaw'])
+    
+    # 车辆尺寸
+    length = dynamics.l_f + dynamics.l_r
+    width = dynamics.width
+    
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_xlim(np.min(positions[:, 0]) - 5, np.max(positions[:, 0]) + 5)
+    ax.set_ylim(np.min(positions[:, 1]) - 5, np.max(positions[:, 1]) + 5)
+    ax.set_aspect('equal')
+    ax.grid(True)
+    ax.set_title('Vehicle Motion Animation')
+    
+    # 初始化车辆表示
+    vehicle, = ax.plot([], [], 'b-', linewidth=2)
+    direction, = ax.plot([], [], 'r->', linewidth=2)
+    trajectory, = ax.plot([], [], 'g--', alpha=0.5)
+    
+    def init():
+        vehicle.set_data([], [])
+        direction.set_data([], [])
+        trajectory.set_data([], [])
+        return vehicle, direction, trajectory
+    
+    def update(frame):
+        # 绘制轨迹
+        trajectory.set_data(positions[:frame+1, 0], positions[:frame+1, 1])
+        
+        # 计算车辆轮廓点
+        x, y = positions[frame]
+        theta = yaw_angles[frame]
+        
+        # 车辆四个角的相对位置
+        corners_rel = np.array([
+            [length/2, width/2],
+            [-length/2, width/2],
+            [-length/2, -width/2],
+            [length/2, -width/2],
+            [length/2, width/2]  # 闭合图形
+        ])
+        
+        # 旋转矩阵
+        rot_matrix = np.array([
+            [np.cos(theta), -np.sin(theta)],
+            [np.sin(theta), np.cos(theta)]
+        ])
+        
+        # 旋转并平移车辆轮廓点
+        corners = np.dot(corners_rel, rot_matrix.T) + np.array([x, y])
+        
+        # 绘制车辆
+        vehicle.set_data(corners[:, 0], corners[:, 1])
+        
+        # 绘制方向指示器
+        direction_end = np.array([x, y]) + np.array([length/2 * np.cos(theta), length/2 * np.sin(theta)])
+        direction.set_data([x, direction_end[0]], [y, direction_end[1]])
+        
+        return vehicle, direction, trajectory
+    
+    ani = FuncAnimation(
+        fig, update, frames=len(positions), init_func=init,
+        blit=True, interval=dt*1000, repeat=False
+    )
+    
+    plt.show()
+
+
+if __name__ == "__main__":
+    # 运行简单测试并可视化
+    simulate_simple_test()

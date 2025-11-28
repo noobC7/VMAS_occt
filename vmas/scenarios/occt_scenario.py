@@ -165,7 +165,7 @@ class Scenario(BaseScenario):
         self.max_acceleration = float(kwargs.get("max_acceleration", 5.0))
         self.max_steering_rate = kwargs.pop(
             "max_steering_rate",
-            torch.deg2rad(torch.tensor(180, device=device, dtype=torch.float32)),
+            torch.deg2rad(torch.tensor(35, device=device, dtype=torch.float32)),
         )
         self.agent_width = float(kwargs.get("agent_width", 3.0))
         self.l_f = float(kwargs.get("l_f", 2.7))
