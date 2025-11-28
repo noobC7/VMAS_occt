@@ -1,5 +1,5 @@
 from vmas.scenarios.road_traffic import CircularBuffer
-
+import torch
 class OcctNormalizers:
     """Normalizers for positions, velocities, rotations, etc."""
 
@@ -80,7 +80,7 @@ class OcctObservations:
         self.n_stored_steps = n_stored_steps  # Number of past steps to store
         self.n_observed_steps = n_observed_steps  # Number of past steps to observe
         self.error_vel = error_vel  # Velocity error relative to reference velocity
-        self.error_space = error_space  # Gap error relative to reference gap
+        self.error_space = error_space  # Gap error relative to reference gap (unnormalized)
         
         self.past_pos = past_pos  # Past positions
         self.past_rot = past_rot  # Past rotations
@@ -110,3 +110,8 @@ class OcctObservations:
         self.past_distance_to_agents = (
             past_distance_to_agents  # Past mutual distance between agents
         )
+    def check_validity(self):
+        for attr_name, attr_value in self.__dict__.items():
+            if isinstance(attr_value, torch.Tensor) and torch.isnan(attr_value).any():
+                nan_indices = torch.nonzero(torch.isnan(attr_value), as_tuple=False)
+                raise ValueError(f"NaN found in self.{attr_name}, index:{nan_indices}")

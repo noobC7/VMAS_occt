@@ -2,19 +2,19 @@ import time
 from typing import Dict, List, Tuple, Optional
 import torch
 from torch import Tensor
-
 from vmas import render_interactively
 from vmas.simulator.scenario import BaseScenario
 from vmas.simulator.core import World, Agent, Sphere, Box
 from vmas.simulator.utils import Color
 from vmas.simulator.dynamics.kinematic_bicycle import KinematicBicycle
 from vmas.simulator.dynamics.dynamic_kinematic_bicycle import DynamicKinematicBicycle
+from vmas.simulator.dynamics.delayed_steering_kinematic_bicycle import DelayedSteeringKinematicBicycle
 from vmas.simulator import rendering
 from vmas.simulator.utils import Color, ScenarioUtils
 
 from vmas.scenarios.road_traffic import get_perpendicular_distances,get_distances_between_agents,get_rectangle_vertices,\
     transform_from_global_to_local_coordinate,interX,exponential_decreasing_fcn,angle_eliminate_two_pi,\
-    Rewards,Penalties,Collisions,Distances,Constants,CircularBuffer,Normalizers,Timer,Thresholds,StateBuffer
+    Penalties,Collisions,Distances,Constants,CircularBuffer,Timer,Thresholds,StateBuffer
 # 添加Road类导入
 from vmas.scenarios.occt_map import OcctRoad
 from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalizers
@@ -97,7 +97,28 @@ class Scenario(BaseScenario):
         world = self.init_world(batch_dim, device)
         self.init_agents(world, batch_dim, device)
         return world
-
+    def get_platoon_vel_space(self,vel_mean,vel_var):
+        """
+        Get the velocity and spacing of the platoon with batch_dim.
+        Args:
+            vel_mean: Mean velocity of the platoon.
+            vel_var: Variance of the velocity of the platoon.
+        Returns:
+            platoon_vel: Velocity of the platoon.
+            platoon_space: Spacing of the platoon.
+        """
+        # 创建局部随机数生成器，使用时间戳作为种子
+        import time
+        seed = int(time.time() * 1000) % 1000000
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(seed)
+        
+        # 使用局部生成器生成随机数，不会影响全局随机种子状态
+        platoon_vel_batch = torch.normal(vel_mean, vel_var, size=(self.batch_dim,), 
+                                        device=self.device, generator=generator)
+        platoon_space_batch = 7+0.5*platoon_vel_batch
+        #print(f"set platoon_vel_batch: {platoon_vel_batch}; platoon_space_batch: {platoon_space_batch}")
+        return platoon_vel_batch, platoon_space_batch
     # ========== 1) 读取参数 & 分配并行批缓存 ==========
     def init_params(self, batch_dim: int, device: torch.device, **kwargs):
         # world params
@@ -116,6 +137,8 @@ class Scenario(BaseScenario):
 
         self.is_real_time_rendering=kwargs.pop("is_real_time_rendering", False)
         self.n_points_short_term=kwargs.pop("n_points_short_term", 3)
+        self.sample_interval=kwargs.pop("sample_interval", 4)
+        
         self.n_points_nearing_boundary=kwargs.pop("n_points_nearing_boundary", 5)
         self.is_ego_view=kwargs.pop("is_ego_view", True)
         self.is_apply_mask=kwargs.pop("is_apply_mask", True)
@@ -124,7 +147,7 @@ class Scenario(BaseScenario):
             "is_observe_distance_to_agents", True
         )
         self.is_observe_distance_to_boundaries=kwargs.pop(
-            "is_observe_distance_to_boundaries", True
+            "is_observe_distance_to_boundaries", False
         )
         self.is_observe_distance_to_center_line=kwargs.pop(
             "is_observe_distance_to_center_line", True
@@ -155,8 +178,8 @@ class Scenario(BaseScenario):
                 int(self.world_y_dim * self.resolution_factor),
             ),
         )
-        self.platoon_vel = torch.full((self.batch_dim,), kwargs.pop("platoon_vel", 7.0), device=device)  # 前端参考速度
-        self.platoon_space = torch.full((self.batch_dim,), kwargs.pop("platoon_space", 7.0), device=device)  # 前端参考速度
+        self.platoon_vel_mean = kwargs.pop("platoon_vel_mean", 7.0)
+        self.platoon_vel_var = kwargs.pop("platoon_vel_var", 2.0) 
         self.max_speed = float(kwargs.get("max_speed", 10.0))
         self.max_steering_angle = kwargs.pop(
             "max_steering_angle",
@@ -609,14 +632,14 @@ class Scenario(BaseScenario):
             kwargs.pop("reward_progress", 10) / r_p_normalizer
         )  # Reward for moving along reference paths
         reward_vel = (
-            kwargs.pop("reward_vel", 5) / r_p_normalizer
+            kwargs.pop("reward_vel", 0) / r_p_normalizer
         )  # Reward for moving in high velocities.
         reward_reach_goal = (
             kwargs.pop("reward_reach_goal", 0) / r_p_normalizer
         )  # Goal-reaching reward
         
         reward_track_reference_vel = (
-            kwargs.pop("reward_track_reference_vel", 8) / r_p_normalizer
+            kwargs.pop("reward_track_reference_vel", 5) / r_p_normalizer
         )  # 参考速度跟踪奖励
         reward_track_reference_spacing = (
             kwargs.pop("reward_track_reference_spacing", 6) / r_p_normalizer
@@ -708,6 +731,31 @@ class Scenario(BaseScenario):
             #             integration="rk4",  # one of {"euler", "rk4"}
             #         ),
             #     )
+            # a = Agent(
+            #         name=f"agent_{i}", 
+            #         shape=Box(length=self.l_f + self.l_r, width=self.agent_width),
+            #         color=tuple(
+            #             torch.rand(3, device=world.device, dtype=torch.float32).tolist()
+            #         ),
+            #         collide=False,
+            #         render_action=False,
+            #         u_range=[
+            #             self.max_acceleration,
+            #             self.max_steering_rate,
+            #         ],
+            #         u_multiplier=[1, 1],
+            #         max_speed=self.max_speed,
+            #         dynamics=DynamicKinematicBicycle(
+            #             world,
+            #             width=self.agent_width,
+            #             l_f=self.l_f,
+            #             l_r=self.l_r,
+            #             max_steering_angle=self.max_steering_angle,
+            #             max_steering_rate=self.max_steering_rate,
+            #             max_acceleration=self.max_acceleration,
+            #             integration="rk4",  # one of {"euler", "rk4"}
+            #         ),
+            #     )
             a = Agent(
                     name=f"agent_{i}", 
                     shape=Box(length=self.l_f + self.l_r, width=self.agent_width),
@@ -718,17 +766,16 @@ class Scenario(BaseScenario):
                     render_action=False,
                     u_range=[
                         self.max_acceleration,
-                        self.max_steering_rate,
+                        self.max_steering_angle,
                     ],
                     u_multiplier=[1, 1],
                     max_speed=self.max_speed,
-                    dynamics=DynamicKinematicBicycle(
+                    dynamics=DelayedSteeringKinematicBicycle(
                         world,
                         width=self.agent_width,
                         l_f=self.l_f,
                         l_r=self.l_r,
                         max_steering_angle=self.max_steering_angle,
-                        max_steering_rate=self.max_steering_rate,
                         max_acceleration=self.max_acceleration,
                         integration="rk4",  # one of {"euler", "rk4"}
                     ),
@@ -738,7 +785,9 @@ class Scenario(BaseScenario):
             
         if self.task_class != TaskClass.SIMPLE_PLATOON:
             self.tractor_front = Agent(
-                name="tractor_front", 
+                name="agent_{i}", # otherwise error: NotImplementedError (note: full exception trace is shown but execution is paused at: _run_module_as_main)
+                # File "/home/yons/Graduation/rl_occt/sota-implementations/multiagent/mappo_ippo_occt.py", line 141, in train
+                # "low": env.full_action_spec_unbatched[("agents", "action")].space.low,
                 shape=Box(length=self.l_f + self.l_r, width=self.agent_width),
                 color=Color.RED,
                 collide=False,
@@ -759,7 +808,7 @@ class Scenario(BaseScenario):
                 ),
             )
             self.tractor_rear  = Agent(
-                name="tractor_rear",  
+                name="agent_{i}",  
                 shape=Box(length=self.l_f + self.l_r, width=self.agent_width),
                 color=Color.BLUE,
                 collide=False,
@@ -931,7 +980,8 @@ class Scenario(BaseScenario):
         agents = self.world.agents
 
         is_reset_single_agent = agent_index is not None
-
+        # refresh platoon vel and space
+        self.platoon_vel_batch, self.platoon_space_batch = self.get_platoon_vel_space(self.platoon_vel_mean, self.platoon_vel_var)
         for env_i in (
             [env_index] if env_index is not None else range(self.world.batch_dim)
         ):
@@ -1074,7 +1124,7 @@ class Scenario(BaseScenario):
             ],
             n_points_to_return=self.n_points_short_term,
             device=self.world.device,
-            sample_interval=1,
+            sample_interval=self.sample_interval,
             n_points_shift=1,
         )
 
@@ -1092,7 +1142,7 @@ class Scenario(BaseScenario):
                 ],
                 n_points_to_return=self.n_points_nearing_boundary,
                 device=self.world.device,
-                sample_interval=1,
+                sample_interval=self.sample_interval,
                 n_points_shift=1,
             )
             (
@@ -1107,7 +1157,7 @@ class Scenario(BaseScenario):
                 ],
                 n_points_to_return=self.n_points_nearing_boundary,
                 device=self.world.device,
-                sample_interval=1,
+                sample_interval=self.sample_interval,
                 n_points_shift=1,
             )
     # =========================
@@ -1148,7 +1198,7 @@ class Scenario(BaseScenario):
         if self.task_class==TaskClass.SIMPLE_PLATOON:
             return
         # ---- 1) 推进前端弧长并夹取到道路范围 ----
-        s_front = self.s_front + self.platoon_vel * self.dt                   # [B]
+        s_front = self.s_front + self.platoon_vel_batch * self.dt                   # [B]
         # 不要超过道路最大 s；留一点 eps 免得插值越界
         s_max = self.road.get_s_max() - 1e-6
         s_min = self.s_start
@@ -1394,11 +1444,20 @@ class Scenario(BaseScenario):
             self.observations.past_distance_to_boundaries.add(
                 self.distances.boundaries / self.normalizers.distance_lanelet
             )
-            reference_vel = self.platoon_vel.unsqueeze(1).expand(-1, self.n_agents)
-            actual_vel = torch.stack([torch.norm(a.state.vel, dim=1) for a in self.world.agents], dim=0).transpose(0, 1)
-            velocity_error = actual_vel - reference_vel
-            self.observations.error_vel = velocity_error / self.normalizers.v
-            
+
+            short_term = self.ref_paths_agent_related.short_term
+            assert short_term.shape[-2]>=2 # path pts dim
+            ref_vec = short_term[...,1,:]-short_term[...,0,:] 
+            ref_vec /= torch.clamp(torch.norm(ref_vec, dim=-1, keepdim=True),1e-5) #BUG: produce nan observation
+            agents_vel = (
+                torch.stack([a.state.vel for a in self.world.agents], dim=0)
+                .transpose(0, 1)
+                .squeeze(-1)
+            )
+            proj_v = torch.sum(agents_vel * ref_vec, dim=-1)
+            ref_vel = self.platoon_vel_batch.unsqueeze(1).expand(-1, self.n_agents)
+            self.observations.error_vel = (proj_v - ref_vel) / self.normalizers.v
+            assert not torch.isnan(self.observations.error_vel).any()
             # 初始化相对间距误差张量，形状为(batch_dim, self.n_agents, 2)
             self.observations.error_space = torch.zeros(
                 (self.world.batch_dim, self.n_agents, 2), 
@@ -1409,12 +1468,12 @@ class Scenario(BaseScenario):
                 # 计算与前一辆车的间距误差（第一个车没有前车，保持为0）
                 if i > 0:
                     actual_distance = self.distances.agents[:, i, i-1]
-                    self.observations.error_space[:, i, 0] = (actual_distance - self.platoon_space) / self.normalizers.distance_lanelet
+                    self.observations.error_space[:, i, 0] = (actual_distance - self.platoon_space_batch)
                 
                 # 计算与后一辆车的间距误差（最后一个车没有后车，保持为0）
                 if i < self.n_agents - 1:
                     actual_distance = self.distances.agents[:, i, i+1]
-                    self.observations.error_space[:, i, 1] = (actual_distance - self.platoon_space) / self.normalizers.distance_lanelet
+                    self.observations.error_space[:, i, 1] = (actual_distance - self.platoon_space_batch)
             if self.is_ego_view:
                 pos_i_others = torch.zeros(
                     (self.world.batch_dim, self.n_agents, self.n_agents, 2),
@@ -1618,6 +1677,7 @@ class Scenario(BaseScenario):
                     torch.stack([a.action.u[:, 1] for a in self.world.agents], dim=1)
                     / self.normalizers.action_steering
                 )
+        self.observations.check_validity()
 
     def observe_self(self, agent_index):
         """Observe the given agent itself."""
@@ -1954,14 +2014,13 @@ class Scenario(BaseScenario):
         # )
         # self.rew += reward_goal
         # [reward] 参考速度跟踪
-        vel_error_squared = torch.square(self.observations.error_vel[:, agent_index])
-        reward_vel_tracking = -vel_error_squared * self.rewards.track_reference_vel
+        vel_errors = torch.abs(self.observations.error_vel[:, agent_index])
+        reward_vel_tracking = -vel_errors * self.rewards.track_reference_vel
         self.rew += reward_vel_tracking
 
         # [reward] 参考间距跟踪
-        space_errors = self.observations.error_space[:, agent_index]
-        space_error_squared = torch.square(space_errors)
-        reward_space_tracking = -space_error_squared.mean() * self.rewards.track_reference_spacing
+        space_errors = torch.abs(self.observations.error_space[:, agent_index]) / self.platoon_space_batch[:,None]
+        reward_space_tracking = -torch.mean(space_errors,dim=-1) * self.rewards.track_reference_spacing
         self.rew += reward_space_tracking
         # [penalty] close to lanelet boundaries
         penalty_close_to_lanelets = (
@@ -2182,7 +2241,7 @@ class Scenario(BaseScenario):
             ],
             n_points_to_return=self.n_points_short_term,
             device=self.world.device,
-            sample_interval=1,
+            sample_interval=self.sample_interval,
         )
 
         if not self.is_observe_distance_to_boundaries:
@@ -2199,7 +2258,7 @@ class Scenario(BaseScenario):
                 ],
                 n_points_to_return=self.n_points_nearing_boundary,
                 device=self.world.device,
-                sample_interval=1,
+                sample_interval=self.sample_interval,
                 n_points_shift=-2,
             )
             (
@@ -2214,7 +2273,7 @@ class Scenario(BaseScenario):
                 ],
                 n_points_to_return=self.n_points_nearing_boundary,
                 device=self.world.device,
-                sample_interval=1,
+                sample_interval=self.sample_interval,
                 n_points_shift=-2,
             )
     
@@ -2293,6 +2352,8 @@ class Scenario(BaseScenario):
         - 绿色：被某随动车辆占用（docked & bound 到该点）
         - 灰色：空闲
         3) 随动车辆中心黑点；若 docked，则画一条连线到其绑定的铰接点
+        4) 车辆ID和状态信息
+        5) 车辆short_term参考轨迹
         """
         from vmas.simulator import rendering
 
@@ -2323,7 +2384,7 @@ class Scenario(BaseScenario):
             geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in left_pts.detach().cpu().tolist()],
                                     close=False)
             geom.set_color(*Color.BLACK.value, alpha=1.0)
-            geom.set_linewidth(2.0)  # 设置左边界线宽度
+            geom.set_linewidth(1.0)  # 设置左边界线宽度
             geoms.append(geom)
         
         # ---------- 3) 道路右边界（黑实线） ----------
@@ -2333,12 +2394,26 @@ class Scenario(BaseScenario):
             geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in right_pts.detach().cpu().tolist()],
                                     close=False)
             geom.set_color(*Color.BLACK.value, alpha=1.0)
-            geom.set_linewidth(2.0)  # 设置右边界线宽度
+            geom.set_linewidth(1.0)  # 设置右边界线宽度
+            geoms.append(geom)
+        k=5
+        for agent_i in range(self.n_agents):
+            pos=self.world.agents[agent_i].state.pos[env_index, :]
+            geom = rendering.TextLine(
+                text=f"{agent_i}",
+                x=(pos[0] / self.world.x_semidim * self.viewer_size[0])/self.viewer_zoom*k+self.viewer_size[0]/2, 
+                y=(pos[1] / self.world.y_semidim * self.viewer_size[1])/self.viewer_zoom*k+self.viewer_size[1]/2,
+                # x=(pos[0] / self.world.x_semidim * self.viewer_size[0]), 
+                # y=(pos[1] / self.world.y_semidim * self.viewer_size[1]),
+                font_size=14,
+            )
+            xform = rendering.Transform()
+            geom.add_attr(xform)
             geoms.append(geom)
 
         # ---------- 2) 随动车辆 ----------
         if hasattr(self, "followers"):
-            for i, ag in enumerate(self.followers):
+            for agent_i, ag in enumerate(self.followers):
                 pos = ag.state.pos[env_index].detach().cpu().tolist()
                 # 中心黑点
                 dot = rendering.make_circle(radius=0.12, filled=True)
@@ -2350,14 +2425,84 @@ class Scenario(BaseScenario):
 
                 # 若 docked，画到其锚点的连线
                 if hasattr(self, "dock_state") and hasattr(self, "bound_latch_id") and hasattr(self, "latch_pos_world"):
-                    if bool(self.dock_state[env_index, i].item()):
-                        lid = int(self.bound_latch_id[env_index, i].item())
+                    if bool(self.dock_state[env_index, agent_i].item()):
+                        lid = int(self.bound_latch_id[env_index, agent_i].item())
                         if lid >= 0 and lid < self.n_latch:
                             latch_p = self.latch_pos_world[env_index, lid].detach().cpu().tolist()
                             l = rendering.PolyLine(v=[tuple(pos), tuple(latch_p)], close=False)
                             l.set_color(*(0.1, 0.6, 0.1), alpha=0.9)
                             geoms.append(l)
 
+                # 绘制short_term参考轨迹
+                if hasattr(self, "ref_paths_agent_related") and hasattr(self.ref_paths_agent_related, "short_term"):
+                    # 确保short_term数组维度正确
+                    short_term_path = self.ref_paths_agent_related.short_term[env_index, agent_i]
+                    if short_term_path.shape[0] > 1:  # 确保有足够的点
+                        # 绘制轨迹线
+                        geom = rendering.PolyLine(
+                            v=[(float(p[0]), float(p[1])) for p in short_term_path.detach().cpu().tolist()],
+                            close=False
+                        )
+                        xform = rendering.Transform()
+                        geom.add_attr(xform)
+                        geom.set_color(*self.world.agents[agent_i].color)
+                        geoms.append(geom)
+                        
+                        # 绘制轨迹点
+                        for p in short_term_path:
+                            circle = rendering.make_circle(radius=0.2, filled=True)
+                            xform = rendering.Transform()
+                            circle.add_attr(xform)
+                            xform.set_translation(float(p[0]), float(p[1]))
+                            circle.set_color(*self.world.agents[agent_i].color)
+                            geoms.append(circle)
+                if not self.is_observe_distance_to_boundaries:
+                    # Visualize nearing points on boundaries
+                    # Left boundary
+                    geom = rendering.PolyLine(
+                        v=self.ref_paths_agent_related.nearing_points_left_boundary[
+                            env_index, agent_i
+                        ],
+                        close=False,
+                    )
+                    xform = rendering.Transform()
+                    geom.add_attr(xform)
+                    geom.set_linewidth(2)
+                    geom.set_color(*self.world.agents[agent_i].color)
+                    geoms.append(geom)
+
+                    for i_p in self.ref_paths_agent_related.nearing_points_left_boundary[
+                        env_index, agent_i
+                    ]:
+                        circle = rendering.make_circle(radius=0.2, filled=True)
+                        xform = rendering.Transform()
+                        circle.add_attr(xform)
+                        xform.set_translation(i_p[0], i_p[1])
+                        circle.set_color(*self.world.agents[agent_i].color)
+                        geoms.append(circle)
+
+                    # Right boundary
+                    geom = rendering.PolyLine(
+                        v=self.ref_paths_agent_related.nearing_points_right_boundary[
+                            env_index, agent_i
+                        ],
+                        close=False,
+                    )
+                    xform = rendering.Transform()
+                    geom.add_attr(xform)
+                    geom.set_linewidth(2)
+                    geom.set_color(*self.world.agents[agent_i].color)
+                    geoms.append(geom)
+
+                    for i_p in self.ref_paths_agent_related.nearing_points_right_boundary[
+                        env_index, agent_i
+                    ]:
+                        circle = rendering.make_circle(radius=0.2, filled=True)
+                        xform = rendering.Transform()
+                        circle.add_attr(xform)
+                        xform.set_translation(i_p[0], i_p[1])
+                        circle.set_color(*self.world.agents[agent_i].color)
+                        geoms.append(circle)
         # ---------- 3) 超大件（杆 + 锚点） ----------
         if self.task_class==TaskClass.OCCT_PLATOON:
             # 端点坐标
@@ -2422,4 +2567,5 @@ if __name__ == "__main__":
     render_interactively(
         __file__,
         control_two_agents=True,
+        display_info=True
     )
