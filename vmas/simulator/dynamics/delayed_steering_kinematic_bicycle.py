@@ -24,7 +24,6 @@ class DelayedSteeringKinematicBicycle(Dynamics):
         l_r: float,
         max_steering_angle: float,
         max_acceleration: float = 5.0,  # Maximum acceleration in m/s^2
-        max_deceleration: float = -5.0,  # Maximum deceleration in m/s^2 (negative)
         steering_time_constant: float = 0.1,  # Time constant for steering delay (s)
         integration: str = "rk4",  # one of "euler", "rk4"
     ):
@@ -36,185 +35,144 @@ class DelayedSteeringKinematicBicycle(Dynamics):
         self.width = width
         self.l_f = l_f  # Distance between the front axle and the center of gravity
         self.l_r = l_r  # Distance between the rear axle and the center of gravity
-        self.max_steering_angle = max_steering_angle
+        self.max_delta = max_steering_angle
         self.max_acceleration = max_acceleration
-        self.max_deceleration = max_deceleration
         self.steering_time_constant = steering_time_constant  # Time constant for first-order inertia
         self.dt = world.dt
         self.integration = integration
         self.world = world
         
         # Additional state variables
-        self.steering_angle = None  # Actual steering angle state (with delay)
-        self.target_steering_angle = None  # Target steering angle from action
-        self.velocity = None  # Linear velocity state
-        
+        self.cur_delta = None  # Actual steering angle state (with delay)
+
         # For debugging and visualization
         self.history = {
             'pos': [],
+            'yaw': [],
             'vel': [],
-            'steering_angle': [],
-            'target_steering_angle': [],
-            'yaw': []
+            'delta': [],
+            'target_delta': [],
+            'acc': [],
         }
 
-    def f(self, state, acceleration, steering_rate):
+    def f(self, state, acceleration, target_delta):
         # State now includes: [x, y, theta, v, delta]
-        # where delta is steering angle
         theta = state[:, 2]  # Yaw angle
         v = state[:, 3]  # Linear velocity
         delta = state[:, 4]  # Steering angle
         
-        # Calculate slip angle
         beta = torch.atan2(
             torch.tan(delta) * self.l_r / (self.l_f + self.l_r),
             torch.tensor(1, device=self.world.device),
         )
         
-        # State derivatives
         dx = v * torch.cos(theta + beta)
         dy = v * torch.sin(theta + beta)
         dtheta = (v / (self.l_f + self.l_r)) * torch.cos(beta) * torch.tan(delta)
-        dv = acceleration  # Velocity derivative is acceleration
-        ddelta = steering_rate  # Steering angle derivative is steering rate
+        dv = acceleration
+        # Calculate steering rate using first-order inertia model
+        ddelta = (target_delta - delta) / self.steering_time_constant
         
         return torch.stack((dx, dy, dtheta, dv, ddelta), dim=1)  # [batch_size,5]
-
-    def euler(self, state, acceleration, steering_rate):
-        # Euler integration method
-        return self.dt * self.f(state, acceleration, steering_rate)
-
-    def runge_kutta(self, state, acceleration, steering_rate):
-        # Fourth-order Runge-Kutta integration method
-        k1 = self.f(state, acceleration, steering_rate)
-        k2 = self.f(state + self.dt * k1 / 2, acceleration, steering_rate)
-        k3 = self.f(state + self.dt * k2 / 2, acceleration, steering_rate)
-        k4 = self.f(state + self.dt * k3, acceleration, steering_rate)
+    
+    def euler(self, state, acceleration, target_delta):
+        # Calculate the change in state using Euler's method
+        # For Euler's method, see https://math.libretexts.org/Bookshelves/Calculus/Book%3A_Active_Calculus_(Boelkins_et_al.)/07%3A_Differential_Equations/7.03%3A_Euler's_Method (the full link may not be recognized properly, please copy and paste in your browser)
+        return self.dt * self.f(state, acceleration, target_delta)
+    
+    def runge_kutta(self, state, acceleration, target_delta):
+        # Calculate the change in state using fourth-order Runge-Kutta method
+        # For Runge-Kutta method, see https://math.libretexts.org/Courses/Monroe_Community_College/MTH_225_Differential_Equations/3%3A_Numerical_Methods/3.3%3A_The_Runge-Kutta_Method
+        k1 = self.f(state, acceleration, target_delta)
+        k2 = self.f(state + self.dt * k1 / 2, acceleration, target_delta)
+        k3 = self.f(state + self.dt * k2 / 2, acceleration, target_delta)
+        k4 = self.f(state + self.dt * k3, acceleration, target_delta)
         return (self.dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
-
+    
     @property
     def needed_action_size(self) -> int:
-        return 2  # Action size remains 2: [acceleration, target_steering_angle]
+        return 2  # Action size remains 2: [acceleration, target_delta]
 
     def process_action(self):
         # Initialize additional state variables if not already done
         batch_size = self.agent.state.pos.shape[0]
-        if self.steering_angle is None:
-            self.steering_angle = torch.zeros((batch_size, 1), device=self.world.device)
-        if self.target_steering_angle is None:
-            self.target_steering_angle = torch.zeros((batch_size, 1), device=self.world.device)
-        if self.velocity is None:
-            # Initialize velocity as the magnitude of current velocity vector
-            self.velocity = torch.norm(self.agent.state.vel, dim=1, keepdim=True)
-        
+        if self.cur_delta is None:
+            self.cur_delta = torch.zeros((batch_size, 1), device=self.world.device)
         # Extract acceleration and target steering angle from actions
         acceleration = self.agent.action.u[:, 0]
-        target_steering_angle = self.agent.action.u[:, 1].unsqueeze(1)
+        target_delta = self.agent.action.u[:, 1]
         
         # Apply constraints to acceleration and target steering angle
         acceleration = torch.clamp(
-            acceleration, self.max_deceleration, self.max_acceleration
+            acceleration, -self.max_acceleration, self.max_acceleration
         )
-        target_steering_angle = torch.clamp(
-            target_steering_angle, -self.max_steering_angle, self.max_steering_angle
+        target_delta = torch.clamp(
+            target_delta, -self.max_delta, self.max_delta
         )
-        
-        # Update target steering angle
-        self.target_steering_angle = target_steering_angle
-        
-        # Calculate steering rate using first-order inertia model
-        # Model: d(steering_angle)/dt = (target_steering_angle - steering_angle) / time_constant
-        steering_rate = (target_steering_angle - self.steering_angle) / self.steering_time_constant
-        
         # Current state including additional state variables
         pos = self.agent.state.pos  # [x, y]
         theta = self.agent.state.rot  # [theta]
-        v = self.velocity  # [v]
-        delta = self.steering_angle  # [delta]
+        vel_mag = torch.norm(self.agent.state.vel, dim=1, keepdim=True)  # 速度大小（恒正）
+        vel_dir = self.agent.state.vel / (vel_mag + 1e-8)  # 速度单位向量（避免除零）
+        heading_vec = torch.cat([torch.cos(theta), torch.sin(theta)], dim=1)  # 航向方向向量（x=cosθ, y=sinθ）
+        direction_sign = torch.sign(torch.sum(vel_dir * heading_vec, dim=1, keepdim=True))  # 点积判断方向（1=同向，-1=反向）
+        cur_v = vel_mag * direction_sign  # 带正负号的标量速度（正=前进，负=倒车）
+        cur_delta = self.cur_delta  # [delta]
         
         # Create full state vector: [x, y, theta, v, delta]
-        state = torch.cat((pos, theta, v, delta), dim=1)
-        
-        # Select integration method to calculate state derivative
-        if self.integration == "euler":
-            delta_state = self.euler(state, acceleration, steering_rate.squeeze(1))
-        else:
-            delta_state = self.runge_kutta(state, acceleration, steering_rate.squeeze(1))
-        
-        # Update additional state variables
-        new_velocity = v + delta_state[:, 3].unsqueeze(1)
-        new_steering_angle = delta + delta_state[:, 4].unsqueeze(1)
-        
-        # Apply constraints to new state variables
-        new_velocity = torch.clamp(new_velocity, 0.0, None)  # Ensure velocity is non-negative
-        new_steering_angle = torch.clamp(
-            new_steering_angle, -self.max_steering_angle, self.max_steering_angle
-        )
-        
-        # Update state variables
-        self.velocity = new_velocity
-        self.steering_angle = new_steering_angle
-        
-        # Calculate new slip angle
-        beta = torch.atan2(
-            torch.tan(new_steering_angle).squeeze(1) * self.l_r / (self.l_f + self.l_r),
-            torch.tensor(1, device=self.world.device),
-        )
-        
-        # Calculate new velocity components
-        new_vel_x = new_velocity.squeeze(1) * torch.cos(theta.squeeze(1) + beta)
-        new_vel_y = new_velocity.squeeze(1) * torch.sin(theta.squeeze(1) + beta)
-        
-        # Calculate required acceleration components
-        acc_x = (new_vel_x - self.agent.state.vel[:, 0]) / self.dt
-        acc_y = (new_vel_y - self.agent.state.vel[:, 1]) / self.dt
-        acc_angular = (delta_state[:, 2] - self.agent.state.ang_vel[:, 0] * self.dt) / self.dt**2
-        
-        # Calculate forces and torque
-        force_x = self.agent.mass * acc_x
-        force_y = self.agent.mass * acc_y
-        torque = self.agent.moment_of_inertia * acc_angular
-        
-        # Update physical forces and torque
-        self.agent.state.force[:, vmas.simulator.utils.X] = force_x
-        self.agent.state.force[:, vmas.simulator.utils.Y] = force_y
-        self.agent.state.torque = torque.unsqueeze(-1)
-        
-        # Update the state variables in agent's state for visualization and other purposes
-        # This creates the state with velocity and steering angle appended at the end
-        if hasattr(self.agent.state, 'custom_state'):
-            # If custom_state already exists, update it
-            self.agent.state.custom_state = torch.cat((
-                state,
-                new_velocity,
-                new_steering_angle,
-                target_steering_angle
-            ), dim=1)
-        else:
-            # Create custom_state attribute
-            self.agent.state.custom_state = torch.cat((
-                state,
-                new_velocity,
-                new_steering_angle,
-                target_steering_angle
-            ), dim=1)
+        state = torch.cat((pos, theta, cur_v, cur_delta), dim=1)
         
         # Store history for debugging
         if batch_size == 1:  # Only store for single batch case
             self.history['pos'].append(pos.cpu().numpy().copy()[0])
-            self.history['vel'].append(np.array([new_vel_x.cpu().numpy()[0], new_vel_y.cpu().numpy()[0]]))
-            self.history['steering_angle'].append(new_steering_angle.cpu().numpy()[0][0])
-            self.history['target_steering_angle'].append(target_steering_angle.cpu().numpy()[0][0])
-            self.history['yaw'].append(theta.cpu().numpy()[0][0])
+            self.history['yaw'].append(theta.cpu().numpy().copy()[0][0])
+            self.history['vel'].append(cur_v.cpu().numpy().copy()[0][0])
+            self.history['delta'].append(cur_delta.cpu().numpy().copy()[0][0])
+            self.history['target_delta'].append(target_delta.cpu().numpy().copy()[0])
+            self.history['acc'].append(acceleration.cpu().numpy().copy()[0])
+
+        # Select integration method to calculate state derivative
+        if self.integration == "euler":
+            delta_state = self.euler(state, acceleration, target_delta)
+        else:
+            delta_state = self.runge_kutta(state, acceleration, target_delta)
+
+        v_cur_x = self.agent.state.vel[:, 0]  # Current velocity in x-direction
+        v_cur_y = self.agent.state.vel[:, 1]  # Current velocity in y-direction
+        v_cur_angular = self.agent.state.ang_vel[:, 0]  # Current angular velocity
+
+        # Calculate the accelerations required to achieve the change in state.
+        acceleration_x = (delta_state[:, 0] - v_cur_x * self.dt) / self.dt**2
+        acceleration_y = (delta_state[:, 1] - v_cur_y * self.dt) / self.dt**2
+        acceleration_angular = (
+            delta_state[:, 2] - v_cur_angular * self.dt
+        ) / self.dt**2
+
+        # Calculate the forces required for the linear accelerations
+        force_x = self.agent.mass * acceleration_x
+        force_y = self.agent.mass * acceleration_y
+
+        # Calculate the torque required for the angular acceleration
+        torque = self.agent.moment_of_inertia * acceleration_angular
+
+        # Update the physical force and torque required for the user inputs
+        self.agent.state.force[:, vmas.simulator.utils.X] = force_x
+        self.agent.state.force[:, vmas.simulator.utils.Y] = force_y
+        self.agent.state.torque = torque.unsqueeze(-1)
+
+        # Update additional state variables
+        self.cur_delta = cur_delta + delta_state[:, 4].unsqueeze(1)
+        
 
     def reset_history(self):
         """Reset the history for a new simulation run"""
         self.history = {
             'pos': [],
+            'yaw': [],
             'vel': [],
-            'steering_angle': [],
-            'target_steering_angle': [],
-            'yaw': []
+            'delta': [],
+            'target_delta': [],
+            'acc': [],
         }
 
     def plot_trajectory(self):
@@ -226,11 +184,13 @@ class DelayedSteeringKinematicBicycle(Dynamics):
         # Convert history to numpy arrays
         positions = np.array(self.history['pos'])
         velocities = np.array(self.history['vel'])
-        steering_angles = np.array(self.history['steering_angle'])
-        target_steering_angles = np.array(self.history['target_steering_angle'])
+        deltas = np.array(self.history['delta'])
+        target_deltas = np.array(self.history['target_delta'])
         yaw_angles = np.array(self.history['yaw'])
+        accelerations = np.array(self.history['acc'])  # 获取加速度数据
         
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        # 调整布局为 3x2 以容纳加速度曲线
+        fig, axes = plt.subplots(3, 2, figsize=(14, 12))
         
         # Plot trajectory
         axes[0, 0].plot(positions[:, 0], positions[:, 1], 'b-')
@@ -242,16 +202,15 @@ class DelayedSteeringKinematicBicycle(Dynamics):
         
         # Plot velocity
         time = np.arange(len(velocities)) * self.dt
-        speed = np.linalg.norm(velocities, axis=1)
-        axes[0, 1].plot(time, speed, 'r-')
+        axes[0, 1].plot(time, velocities, 'r-')
         axes[0, 1].set_title('Vehicle Speed')
         axes[0, 1].set_xlabel('Time (s)')
         axes[0, 1].set_ylabel('Speed (m/s)')
         axes[0, 1].grid(True)
         
         # Plot steering angle
-        axes[1, 0].plot(time, np.rad2deg(steering_angles), 'g-', label='Actual Steering')
-        axes[1, 0].plot(time, np.rad2deg(target_steering_angles), 'r--', label='Target Steering')
+        axes[1, 0].plot(time, np.rad2deg(deltas), 'g-', label='Actual Steering')
+        axes[1, 0].plot(time, np.rad2deg(target_deltas), 'r--', label='Target Steering')
         axes[1, 0].set_title('Steering Angle with Delay')
         axes[1, 0].set_xlabel('Time (s)')
         axes[1, 0].set_ylabel('Angle (degrees)')
@@ -265,13 +224,25 @@ class DelayedSteeringKinematicBicycle(Dynamics):
         axes[1, 1].set_ylabel('Angle (degrees)')
         axes[1, 1].grid(True)
         
+        # 添加加速度曲线
+        time = np.arange(len(accelerations)) * self.dt
+        axes[2, 0].plot(time, accelerations, 'c-')
+        axes[2, 0].set_title('Vehicle Acceleration')
+        axes[2, 0].set_xlabel('Time (s)')
+        axes[2, 0].set_ylabel('Acceleration (m/s²)')
+        axes[2, 0].grid(True)
+        
+        # 隐藏多余的子图
+        axes[2, 1].axis('off')
+        
         plt.tight_layout()
         plt.show()
 
 
+
 # 模拟环境和World类的简化版本，用于测试
 class MockWorld:
-    def __init__(self, dt=0.1):
+    def __init__(self, dt=0.01):
         self.dt = dt
         self.device = torch.device('cpu')
 
@@ -293,7 +264,7 @@ class MockAgent:
         
         # 动作
         self.action = type('obj', (), {
-            'u': torch.zeros((1, 2), device=world.device)  # 动作 [acceleration, target_steering_angle]
+            'u': torch.zeros((1, 2), device=world.device)  # 动作 [acceleration, target_delta]
         })
 
 
@@ -307,16 +278,15 @@ def simulate_simple_test():
     l_f = 1.4  # 前轮到重心距离
     l_r = 1.4  # 后轮到重心距离
     width = 1.6  # 车辆宽度
-    max_steering_angle = np.deg2rad(35)  # 最大转向角度35度
+    max_delta = np.deg2rad(35)  # 最大转向角度35度
     
     dynamics = DelayedSteeringKinematicBicycle(
         world=world,
         width=width,
         l_f=l_f,
         l_r=l_r,
-        max_steering_angle=max_steering_angle,
+        max_steering_angle=max_delta,
         max_acceleration=5.0,
-        max_deceleration=-10.0,
         steering_time_constant=0.2,  # 转向执行器时间常数，调整此值可改变延迟程度
         integration="rk4"
     )

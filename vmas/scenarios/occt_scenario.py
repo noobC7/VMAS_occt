@@ -770,13 +770,16 @@ class Scenario(BaseScenario):
                     ],
                     u_multiplier=[1, 1],
                     max_speed=self.max_speed,
+                    # 禁用 drag 和 linear_friction
+                    drag = 0.0,
+                    linear_friction = 0.0,
                     dynamics=DelayedSteeringKinematicBicycle(
                         world,
                         width=self.agent_width,
                         l_f=self.l_f,
                         l_r=self.l_r,
-                        max_steering_angle=self.max_steering_angle,
                         max_acceleration=self.max_acceleration,
+                        max_steering_angle=self.max_steering_angle,
                         integration="rk4",  # one of {"euler", "rk4"}
                     ),
                 )
@@ -849,6 +852,10 @@ class Scenario(BaseScenario):
             self._check_batch_index(env_index)  # 如果你沿用 VMAS 的检查
             idx_mask = torch.zeros(B, dtype=torch.bool, device=device)
             idx_mask[env_index] = True
+        
+        # 提前获取platoon_vel_batch和platoon_space_batch
+        self.platoon_vel_batch, self.platoon_space_batch = self.get_platoon_vel_space(self.platoon_vel_mean, self.platoon_vel_var)
+        
         if self.task_class==TaskClass.OCCT_PLATOON:
             # ---- 放置前/后端弧长 ----
             # 让 rear 在 s_start，front = s_start + L（夹取到道路范围）
@@ -865,7 +872,7 @@ class Scenario(BaseScenario):
             rod_theta = torch.atan2(rod_vec[:, 1], rod_vec[:, 0])  # [B]
 
             # 设置牵引车初始位姿（只对 mask 的样本赋值）
-            def _set_pose(agent: Agent, pos: Tensor, theta: Tensor):
+            def _set_pose(agent: Agent, pos: Tensor, theta: Tensor, vel: Tensor):
                 if hasattr(agent.state, "pos"):
                     agent.state.pos[idx_mask] = pos[idx_mask]
                 if hasattr(agent.state, "rot"):
@@ -877,14 +884,18 @@ class Scenario(BaseScenario):
                     theta_reshaped = theta.unsqueeze(-1) if theta.dim() == 1 else theta
                     agent.state.angle[idx_mask] = theta_reshaped[idx_mask]
                 if hasattr(agent.state, "vel"):
-                    agent.state.vel[idx_mask] = 0.0
+                    # 根据航向角和platoon_vel_batch计算速度分量
+                    vx = vel * torch.cos(theta[idx_mask])
+                    vy = vel * torch.sin(theta[idx_mask])
+                    agent.state.vel[idx_mask] = torch.stack([vx, vy], dim=-1)
+            
             # 计算道路切线方向而不是使用货物方向
             front_theta = self.road_tangent(self.s_front)
             rear_theta = self.road_tangent(self.s_rear)
             
             # 设置牵引车初始位姿
-            _set_pose(self.tractor_front, p_front, front_theta)
-            _set_pose(self.tractor_rear, p_rear, rear_theta)
+            _set_pose(self.tractor_front, p_front, front_theta, self.platoon_vel_batch[idx_mask])
+            _set_pose(self.tractor_rear, p_rear, rear_theta, self.platoon_vel_batch[idx_mask])
 
             # ---- 随动：初始 free & 随机放置在杆附近（不 dock）----
             self.dock_state[idx_mask, :]     = False
@@ -899,19 +910,10 @@ class Scenario(BaseScenario):
             # 设置随动初始位姿(无横向偏移)
             pos_f_init = base
 
+            # learn how to acc and deacc when cur vel is not equal to ref vel
+            tmp_platoon_vel_batch, _ = self.get_platoon_vel_space(self.platoon_vel_mean, self.platoon_vel_var)
             for i, ag in enumerate(self.followers):
-                if hasattr(ag.state, "pos"):
-                    ag.state.pos[idx_mask] = pos_f_init[idx_mask, i, :]
-                if hasattr(ag.state, "rot"):
-                    # Ensure rod_theta has the right shape for assignment
-                    theta_reshaped = rod_theta.unsqueeze(-1) if rod_theta.dim() == 1 else rod_theta
-                    ag.state.rot[idx_mask] = theta_reshaped[idx_mask]  # 朝向与杆一致先
-                elif hasattr(ag.state, "angle"):
-                    # Ensure rod_theta has the right shape for assignment
-                    theta_reshaped = rod_theta.unsqueeze(-1) if rod_theta.dim() == 1 else rod_theta
-                    ag.state.angle[idx_mask] = theta_reshaped[idx_mask]
-                if hasattr(ag.state, "vel"):
-                    ag.state.vel[idx_mask] = 0.0
+                _set_pose(ag, pos_f_init[idx_mask, i, :], rod_theta[idx_mask], tmp_platoon_vel_batch[idx_mask])
 
             # ---- 预计算锚点世界位姿（沿杆等间距）----
             # latch_pos = p_rear + alpha * (p_front - p_rear)
@@ -976,12 +978,15 @@ class Scenario(BaseScenario):
                 if hasattr(ag.state, "rot"):
                     ag.state.rot[idx_mask] = vehicle_theta[idx_mask, i][:,None]
                 if hasattr(ag.state, "vel"):
-                    ag.state.vel[idx_mask] = 0.0
+                    # 根据航向角和platoon_vel_batch计算速度分量
+                    vx = self.platoon_vel_batch[idx_mask] * torch.cos(vehicle_theta[idx_mask, i])
+                    vy = self.platoon_vel_batch[idx_mask] * torch.sin(vehicle_theta[idx_mask, i])
+                    ag.state.vel[idx_mask] = torch.stack([vx, vy], dim=-1)
+
         agents = self.world.agents
 
         is_reset_single_agent = agent_index is not None
         # refresh platoon vel and space
-        self.platoon_vel_batch, self.platoon_space_batch = self.get_platoon_vel_space(self.platoon_vel_mean, self.platoon_vel_var)
         for env_i in (
             [env_index] if env_index is not None else range(self.world.batch_dim)
         ):
@@ -2314,26 +2319,47 @@ class Scenario(BaseScenario):
         )  # [batch_dim]
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
 
+        # info = {
+        #     "pos": agent.state.pos / self.normalizers.pos_world,
+        #     "rot": angle_eliminate_two_pi(agent.state.rot) / self.normalizers.rot,
+        #     "vel": agent.state.vel / self.normalizers.v,
+        #     "act_vel": (agent.action.u[:, 0] / self.normalizers.action_vel)
+        #     if not is_action_empty
+        #     else self.constants.empty_action_vel[:, agent_index],
+        #     "act_steer": (agent.action.u[:, 1] / self.normalizers.action_steering)
+        #     if not is_action_empty
+        #     else self.constants.empty_action_steering[:, agent_index],
+        #     "ref": (
+        #         self.ref_paths_agent_related.short_term[:, agent_index]
+        #         / self.normalizers.pos_world
+        #     ).reshape(self.world.batch_dim, -1),
+        #     "distance_ref": self.distances.ref_paths[:, agent_index]
+        #     / self.normalizers.distance_ref,
+        #     "distance_left_b": self.distances.left_boundaries[:, agent_index].min(
+        #         dim=-1
+        #     )[0]
+        #     / self.normalizers.distance_lanelet,
+        #     "distance_right_b": self.distances.right_boundaries[:, agent_index].min(
+        #         dim=-1
+        #     )[0]
+        #     / self.normalizers.distance_lanelet,
+        #     "is_collision_with_agents": is_collision_with_agents,
+        #     "is_collision_with_lanelets": is_collision_with_lanelets,
+        # }
+
         info = {
-            "pos": agent.state.pos / self.normalizers.pos_world,
-            "rot": angle_eliminate_two_pi(agent.state.rot) / self.normalizers.rot,
-            "vel": agent.state.vel / self.normalizers.v,
-            "act_vel": (agent.action.u[:, 0] / self.normalizers.action_vel)
-            if not is_action_empty
-            else self.constants.empty_action_vel[:, agent_index],
-            "act_steer": (agent.action.u[:, 1] / self.normalizers.action_steering)
-            if not is_action_empty
-            else self.constants.empty_action_steering[:, agent_index],
+            "pos": agent.state.pos,
+            "rot": angle_eliminate_two_pi(agent.state.rot),
+            "vel": agent.state.vel,
+            "act_acc": (agent.action.u[:, 0]) if not is_action_empty else self.constants.empty_action_vel[:, agent_index],
+            "act_steer": (agent.action.u[:, 1])if not is_action_empty else self.constants.empty_action_steering[:, agent_index],
             "ref": (
                 self.ref_paths_agent_related.short_term[:, agent_index]
-                / self.normalizers.pos_world
             ).reshape(self.world.batch_dim, -1),
-            "distance_ref": self.distances.ref_paths[:, agent_index]
-            / self.normalizers.distance_ref,
+            "distance_ref": self.distances.ref_paths[:, agent_index],
             "distance_left_b": self.distances.left_boundaries[:, agent_index].min(
                 dim=-1
-            )[0]
-            / self.normalizers.distance_lanelet,
+            )[0],
             "distance_right_b": self.distances.right_boundaries[:, agent_index].min(
                 dim=-1
             )[0]
