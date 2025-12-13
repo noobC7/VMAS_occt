@@ -27,7 +27,7 @@ class OcctRoad:
         if road_pts is None:
             # 使用新的road_pts_gen函数生成道路点
             straight_length=50.0
-            radius=25.0
+            radius=35.0
             road_pts = self.road_pts_gen(
                 road_segments=[
                     [straight_length, 0], 
@@ -39,7 +39,7 @@ class OcctRoad:
                     [straight_length, 0],
                     [3.14*radius, -1/radius],
                 ],
-                start_pos=(0.0, 0.0),
+                start_pos=(-40.0, -30.0),
                 start_heading=0.0,
                 pts_gap=pts_gap
             )
