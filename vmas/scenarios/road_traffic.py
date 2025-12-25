@@ -3445,6 +3445,9 @@ def get_perpendicular_distances(
     # Calculate the distances from the given points to these closest points
     distances = torch.norm(closest_points - point_expanded, dim=2)
 
+    # C+7: Replace NaN values with inf so that these invalid values will be ignored.
+    distances = torch.nan_to_num(distances, nan=float('inf'))
+
     if n_points_long_term is not None:
         if n_points_long_term.ndim == 0:
             n_points_long_term = n_points_long_term.unsqueeze(0)
