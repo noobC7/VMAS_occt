@@ -1,8 +1,97 @@
 import torch
 from torch import Tensor
 from typing import List, Tuple, Optional
+from abc import ABC, abstractmethod
+import os
+import pickle
+import glob
+from collections import deque
+from commonroad.common.file_reader import CommonRoadFileReader
+from commonroad.scenario.scenario import Scenario
+import matplotlib.pyplot as plt
+import numpy as np
+from torchcubicspline import(natural_cubic_spline_coeffs, 
+                                NaturalCubicSpline)
 
-class OcctRoad:
+import torch.nn.functional as F
+class MapBase(ABC):
+    @abstractmethod
+    def get_s_max(self) -> Tensor:
+        #获取最大弧长参数s_max
+        pass
+    @abstractmethod
+    def get_road_center_pts(self) -> Tensor:
+        #获取道路中心线离散路径点
+        pass
+    @abstractmethod
+    def get_road_left_pts(self) -> Tensor:
+        #获取道路左侧离散路径点
+        pass
+    @abstractmethod
+    def get_road_right_pts(self) -> Tensor:
+        #获取道路右侧离散路径点
+        pass
+    @abstractmethod
+    # 以下函数输入s为弧长参数，支持[B] 或 [B,K] ，输出为[B,2] 或 [B,K,2] 
+    @abstractmethod
+    def get_pts(self, s: Tensor) -> Tensor:
+        #根据弧长参数s获取路径点
+        pass
+    @abstractmethod
+    def get_ref_v(self, s: Tensor) -> Tensor:
+        #根据弧长参数s获取参考速度
+        pass
+    def get_tangent_vector(self, s: Tensor) -> Tensor:
+        #根据弧长参数s获取道路切线单位向量
+        pass
+    def get_tangent_heading(self, s: Tensor) -> Tensor:
+        tangent_vec = self.get_tangent_vector(s)
+        tangent_theta = torch.atan2(tangent_vec[..., 1], tangent_vec[..., 0])
+        return tangent_theta
+    def get_normal_vector(self, s: Tensor) -> Tensor:
+        tangent_vec = self.get_tangent_vector(s)
+        normal_vec = torch.stack([-tangent_vec[..., 1], tangent_vec[..., 0]], dim=-1)
+        return normal_vec
+    def get_normal_heading(self, s: Tensor) -> Tensor:
+        normal_vec = self.get_normal_vector(s)
+        normal_theta = torch.atan2(normal_vec[..., 1], normal_vec[..., 0])
+        return normal_theta
+    def solve_delta_s(self, s_front: Tensor, L: Tensor, *, max_iter: int = 50, tol: float = 1e-3) -> Tuple[Tensor, Tensor]:
+        """
+        固定弦长二分法求弧长。
+        input:
+            s_front: [B] 前端点弧长
+            L:       [B] 固定弦长（货物长度）
+        return:
+            delta_s:        [B] 解出的 Δs (>=0)
+            infeasible:     [B] 是否无解（弦长过短）
+        """
+        # 预计算前端点坐标
+        lo = torch.zeros_like(s_front) 
+        p_f = self.get_pts(s_front)
+        p_r_hi = self.get_pts(lo) 
+        chord_max = torch.linalg.norm(p_f - p_r_hi, dim=-1)
+        infeasible = (chord_max + 1e-6) < L 
+        
+        hi = s_front
+        for _ in range(max_iter):
+            interval_length = hi - lo
+            
+            if torch.all(interval_length < tol):
+                break
+            
+            mid = 0.5 * (lo + hi)                                             # [B]
+            p_r = self.get_pts(s_front - mid)                                  # [B,2]
+            chord = torch.linalg.norm(p_f - p_r, dim=-1)                      # [B]
+            go_left = chord > L                                               # [B]
+            hi = torch.where(go_left, mid, hi)
+            lo = torch.where(go_left, lo, mid)
+        
+        delta_s = 0.5 * (lo + hi) 
+        delta_s = torch.where(infeasible, torch.zeros_like(delta_s), delta_s)
+        return delta_s, infeasible
+    
+class OcctMap(MapBase):
     def __init__(self,
                  batch_dim: int,
                  device: torch.device,
@@ -28,7 +117,7 @@ class OcctRoad:
             # 使用新的road_pts_gen函数生成道路点
             straight_length=50.0
             radius=35.0
-            road_pts = self.road_pts_gen(
+            road_pts = self._road_pts_gen(
                 road_segments=[
                     [straight_length, 0], 
                     [3.14*radius, 1/radius], 
@@ -52,241 +141,11 @@ class OcctRoad:
         seg_len = torch.linalg.norm(seg, dim=-1)  # [B, N-1]
         zero = torch.zeros(batch_dim, 1, device=device)
         self.road_cum_s = torch.cat([zero, torch.cumsum(seg_len, dim=-1)], dim=-1)  # [B, N]
-        self.s_start = self.road_cum_s[:, 0]  # [B]
-        self.s_end = self.road_cum_s[:, -1]  # [B]
         
         # 计算道路边界
         self._compute_boundaries()
-    def get_s_max(self) -> Tensor:
-        """
-        获取最大弧长参数s_max
-        
-        返回:
-            s_max: [B] 最大弧长参数
-        """
-        return self.road_cum_s[:, -1]  # [B]
-    def _compute_boundaries(self):
-        """
-        计算道路左右边界
-        """
-        # 计算切线向量
-        tangents = self.road_pts[:, 1:, :] - self.road_pts[:, :-1, :]  # [B, N-1, 2]
-        norm_tangents = torch.linalg.norm(tangents, dim=-1, keepdim=True) + 1e-8  # [B, N-1, 1]
-        unit_tangents = tangents / norm_tangents  # [B, N-1, 2]
-        
-        # 计算法线向量（逆时针旋转90度）
-        normals = torch.stack([-unit_tangents[..., 1], unit_tangents[..., 0]], dim=-1)  # [B, N-1, 2]
-        
-        # 为每个点计算法线（端点使用相邻线段的法线，中间点使用左右线段法线的平均值）
-        point_normals = torch.zeros_like(self.road_pts)  # [B, N, 2]
-        point_normals[:, 0, :] = normals[:, 0, :]
-        mid_normals = (normals[:, :-1, :] + normals[:, 1:, :]) / 2  # [B, N-2, 2]
-        point_normals[:, 1:-1, :] = mid_normals
-        point_normals[:, -1, :] = normals[:, -1, :]
-        
-        # 归一化法线向量
-        point_normals = point_normals / torch.linalg.norm(point_normals, dim=-1, keepdim=True) + 1e-8
-        
-        # 计算左右边界点
-        self.road_left_pts = self.road_pts + point_normals * self.lane_width / 2  # [B, N, 2]
-        self.road_right_pts = self.road_pts - point_normals * self.lane_width / 2  # [B, N, 2]
     
-    def get_pts(self, s: Tensor) -> Tensor:
-        """
-        根据弧长参数s获取道路上的坐标
-        
-        输入:
-            s: [B] 或 [B,K] 的弧长参数，单位需与 self.road_cum_s 一致
-        输出:
-            p: [B,2] 或 [B,K,2] 上对应的坐标（分段线性插值）
-        说明:
-            - 使用 torch.searchsorted 在最后维度上找段索引（向量化、支持 GPU）
-            - 自动夹取到合法弧长范围 [s_min, s_max]
-        """
-        cum_s = self.road_cum_s              # [B, N]
-        pts = self.road_pts                  # [B, N, 2]
-        B, N = cum_s.shape
-        eps = 1e-8
-
-        # 兼容 [B] 或 [B,K]
-        s_in = s
-        if s.dim() == 1:
-            s = s[:, None]                   # -> [B,1]
-            squeeze_back = True
-        else:
-            squeeze_back = False
-
-        # 每环境有效范围
-        s_min = cum_s[:, 0]
-        s_max = cum_s[:, -1]
-
-        # 夹取 s 到合法范围（广播到 [B,K]）
-        s = torch.maximum(s, s_min[:, None])
-        s = torch.minimum(s, s_max[:, None] - eps)
-
-        # searchsorted: 在最后一维上搜索；返回右边界索引（段右端点）
-        # idx_right ∈ [1, N-1]，我们使用左端点 idx0 = idx_right - 1
-        idx_right = torch.searchsorted(cum_s, s, right=False)                 # [B,K]
-        idx0 = torch.clamp(idx_right - 1, min=0, max=N-2)                     # [B,K]
-        idx1 = idx0 + 1                                                       # [B,K]
-
-        # 取段端点的 s 值
-        s0 = torch.take_along_dim(cum_s, idx0, dim=-1)                        # [B,K]
-        s1 = torch.take_along_dim(cum_s, idx1, dim=-1)                        # [B,K]
-        denom = (s1 - s0).clamp_min(eps)
-        t = (s - s0) / denom                                                  # [B,K] in [0,1]
-
-        # 取段端点坐标并线性插值
-        # 扩展索引用于 [B, N, 2] 按 dim=-2 抓取
-        gather_idx0 = idx0[..., None].expand(-1, -1, 2)                       # [B,K,2]
-        gather_idx1 = idx1[..., None].expand(-1, -1, 2)                       # [B,K,2]
-        p0 = torch.take_along_dim(pts, gather_idx0, dim=-2)                   # [B,K,2]
-        p1 = torch.take_along_dim(pts, gather_idx1, dim=-2)                   # [B,K,2]
-        p = p0 + t[..., None] * (p1 - p0)                                     # [B,K,2]
-
-        if squeeze_back:
-            p = p[:, 0, :]                                                    # [B,2]
-        return p
-    
-    def get_tangent_vector(self, s: Tensor) -> Tensor:
-        """
-        计算道路上弧长s处的切线方向向量
-        
-        Args:
-            s: [B] 或 [B,K] 弧长参数
-        Returns:
-            tangent_vec: [B,2] 或 [B,K,2] 切线单位向量
-        """
-        # 使用小扰动法计算切线向量
-        epsilon = 1e-3  # 小扰动值
-        # 确保max参数的维度与s匹配
-        max_values = self.road_cum_s[:, -1] - 1e-6  # [B]
-        if s.dim() > 1:  # 如果s是[B,K]形状
-            # 扩展max_values到[B,1]以支持广播
-            max_values = max_values.unsqueeze(-1)  # [B,1]
-        s_plus = torch.clamp(s + epsilon, max=max_values)
-        pos_plus = self.get_pts(s_plus)  # 调用get_pts而非road_C
-        pos = self.get_pts(s)  # 调用get_pts而非road_C
-        tangent_vec = pos_plus - pos
-        # 归一化切线向量
-        tangent_vec = tangent_vec / torch.linalg.norm(tangent_vec, dim=-1, keepdim=True) + 1e-8
-        return tangent_vec
-    
-    def get_tangent_heading(self, s: Tensor) -> Tensor:
-        """
-        计算道路上弧长s处的切线航向角
-        
-        Args:
-            s: [B] 或 [B,K] 弧长参数
-        Returns:
-            tangent_theta: [B] 或 [B,K] 切线方向角（弧度）
-        """
-        tangent_vec = self.get_tangent_vector(s)
-        # 计算切线方向角（弧度）
-        tangent_theta = torch.atan2(tangent_vec[..., 1], tangent_vec[..., 0])
-        return tangent_theta
-    
-    def get_normal_vector(self, s: Tensor) -> Tensor:
-        """
-        计算道路上弧长s处的法线方向向量
-        
-        Args:
-            s: [B] 或 [B,K] 弧长参数
-        Returns:
-            normal_vec: [B,2] 或 [B,K,2] 法线单位向量（逆时针旋转90度）
-        """
-        # 获取切线向量
-        tangent_vec = self.get_tangent_vector(s)
-        # 法线向量 = 切线向量逆时针旋转90度
-        normal_vec = torch.stack([-tangent_vec[..., 1], tangent_vec[..., 0]], dim=-1)
-        # 归一化法线向量
-        normal_vec = normal_vec / torch.linalg.norm(normal_vec, dim=-1, keepdim=True) + 1e-8
-        return normal_vec
-    
-    def get_normal_heading(self, s: Tensor) -> Tensor:
-        """
-        计算道路上弧长s处的法线航向角
-        
-        Args:
-            s: [B] 或 [B,K] 弧长参数
-        Returns:
-            normal_theta: [B] 或 [B,K] 法线方向角（弧度）
-        """
-        normal_vec = self.get_normal_vector(s)
-        # 计算法线方向角（弧度）
-        normal_theta = torch.atan2(normal_vec[..., 1], normal_vec[..., 0])
-        return normal_theta
-        
-    # 保留原有的get_tangent和get_normal函数以保持向后兼容，但更新实现
-    def get_tangent(self, s: Tensor) -> Tensor:
-        """
-        计算道路上弧长s处的切线方向角（向后兼容）
-        
-        Args:
-            s: [B] 弧长参数
-        Returns:
-            tangent_theta: [B] 切线方向角（弧度）
-        """
-        return self.get_tangent_heading(s)
-    
-    def get_normal(self, s: Tensor) -> Tensor:
-        """
-        计算道路上弧长s处的法线方向角（向后兼容）
-        
-        Args:
-            s: [B] 弧长参数
-        Returns:
-            normal_theta: [B] 法线方向角（弧度）
-        """
-        return self.get_normal_heading(s)
-    def solve_delta_s(self, s_front: Tensor, L: Tensor, *, max_iter: int = 20) -> Tuple[Tensor, Tensor]:
-        """
-        固定弦长：批量求 Δs（向量化二分）
-        
-        输入:
-            s_front: [B] 前端点弧长
-            L:       [B] 固定弦长（货物长度）
-        需要的成员:
-            self.s_start:   [B] 每环境的起点弧长（用于下界）
-            self.road_cum_s / self.road_pts: 供 road_C 调用
-        输出:
-            delta_s:        [B] 解出的 Δs (>=0)
-            infeasible:     [B] bool 掩码；若在给定上界下最大弦长仍 < L，则置 True（需降速/脱开）
-        数值:
-            - 固定迭代步数、纯张量 where 更新，无 Python 分支
-            - 单调性假设: chord(Δs) 随 Δs 近似单调增（对折线/样条在小步足够）
-        """
-        B = s_front.shape[0]
-        eps = 1e-8
-
-        # 下/上界
-        lo = torch.zeros_like(s_front)                                         # [B]
-        # 允许跨多段: hi = s_front - s_start（若 <0 则 0）
-        hi = torch.clamp(s_front - self.s_start, min=0.0)                      # [B]
-
-        # 预计算前端点坐标
-        p_f = self.get_pts(s_front)                                            # [B,2]
-
-        # 不可解判断：最大 Δs=hi 时的弦长仍 < L
-        p_r_hi = self.get_pts(s_front - hi)                                    # [B,2]
-        chord_max = torch.linalg.norm(p_f - p_r_hi, dim=-1)                   # [B]
-        infeasible = (chord_max + 1e-6) < L                                   # [B] 需要外部策略处理
-
-        # 向量化二分
-        for _ in range(max_iter):
-            mid = 0.5 * (lo + hi)                                             # [B]
-            p_r = self.get_pts(s_front - mid)                                  # [B,2]
-            chord = torch.linalg.norm(p_f - p_r, dim=-1)                      # [B]
-            go_left = chord > L                                               # [B]
-            hi = torch.where(go_left, mid, hi)
-            lo = torch.where(go_left, lo, mid)
-
-        delta_s = 0.5 * (lo + hi)                                             # [B]
-        # 对不可解样本，保持 delta_s 为 0（或可改为 hi），由上层降速/脱开处理
-        delta_s = torch.where(infeasible, torch.zeros_like(delta_s), delta_s)
-        return delta_s, infeasible
-
-    def road_pts_gen(
+    def _road_pts_gen(
         self,
         road_segments: List[List[float]],
         start_pos: Tuple[float, float] = (0.0, 0.0),
@@ -360,48 +219,982 @@ class OcctRoad:
         road_pts = torch.cat(points, dim=0) if points else torch.empty((0, 2), device=self.device)
         return road_pts
     
-# Debug 绘图函数，用于可视化道路
-import matplotlib.pyplot as plt
+    def _compute_boundaries(self):
+        """
+        计算道路左右边界
+        """
+        # 计算切线向量
+        tangents = self.road_pts[:, 1:, :] - self.road_pts[:, :-1, :]  # [B, N-1, 2]
+        norm_tangents = torch.linalg.norm(tangents, dim=-1, keepdim=True) + 1e-8  # [B, N-1, 1]
+        unit_tangents = tangents / norm_tangents  # [B, N-1, 2]
+        
+        # 计算法线向量（逆时针旋转90度）
+        normals = torch.stack([-unit_tangents[..., 1], unit_tangents[..., 0]], dim=-1)  # [B, N-1, 2]
+        
+        # 为每个点计算法线（端点使用相邻线段的法线，中间点使用左右线段法线的平均值）
+        point_normals = torch.zeros_like(self.road_pts)  # [B, N, 2]
+        point_normals[:, 0, :] = normals[:, 0, :]
+        mid_normals = (normals[:, :-1, :] + normals[:, 1:, :]) / 2  # [B, N-2, 2]
+        point_normals[:, 1:-1, :] = mid_normals
+        point_normals[:, -1, :] = normals[:, -1, :]
+        
+        # 归一化法线向量
+        point_normals = point_normals / torch.linalg.norm(point_normals, dim=-1, keepdim=True) + 1e-8
+        
+        # 计算左右边界点
+        self.road_left_pts = self.road_pts + point_normals * self.lane_width / 2  # [B, N, 2]
+        self.road_right_pts = self.road_pts - point_normals * self.lane_width / 2  # [B, N, 2]
+    
+    def get_pts(self, s: Tensor) -> Tensor:
+        cum_s = self.road_cum_s              # [B, N]
+        pts = self.road_pts                  # [B, N, 2]
+        B, N = cum_s.shape
+        eps = 1e-8
+        if s.dim() == 1:
+            s = s[:, None]                   # -> [B,1]
+            squeeze_back = True
+        else:
+            squeeze_back = False
 
-def plot_road_debug():
-    """
-    简单的debug绘图函数，用于可视化道路中心线和边界
-    """
-    # 创建OcctRoad实例
-    device = torch.device("cpu")
-    road = OcctRoad(batch_dim=1, device=device)
-    
-    # 获取道路数据
-    road_pts = road.road_pts[0].cpu().numpy()  # 取第一个batch的道路点
-    left_pts = road.road_left_pts[0].cpu().numpy()
-    right_pts = road.road_right_pts[0].cpu().numpy()
-    
-    # 绘制道路
-    plt.figure(figsize=(12, 8))
-    
-    # 绘制道路中心线
-    plt.plot(road_pts[:, 0], road_pts[:, 1], 'b-', label='Road Center Line')
-    
-    # 绘制道路边界
-    plt.plot(left_pts[:, 0], left_pts[:, 1], 'r--', label='Left Boundary')
-    plt.plot(right_pts[:, 0], right_pts[:, 1], 'g--', label='Right Boundary')
-    
-    # 标记起点和终点
-    plt.scatter(road_pts[0, 0], road_pts[0, 1], c='green', s=100, label='Start')
-    plt.scatter(road_pts[-1, 0], road_pts[-1, 1], c='red', s=100, label='End')
-    
-    # 设置图表
-    plt.title('Road Visualization (Debug)')
-    plt.xlabel('X Position')
-    plt.ylabel('Y Position')
-    plt.grid(True)
-    plt.axis('equal')
-    plt.legend()
-    
-    # 显示图表
-    plt.show()
+        # 每环境有效范围
+        s_min = cum_s[:, 0]
+        s_max = cum_s[:, -1]
 
+        # 夹取 s 到合法范围（广播到 [B,K]）
+        s = torch.maximum(s, s_min[:, None])
+        s = torch.minimum(s, s_max[:, None] - eps)
+
+        # searchsorted: 在最后一维上搜索；返回右边界索引（段右端点）
+        # idx_right ∈ [1, N-1]，我们使用左端点 idx0 = idx_right - 1
+        idx_right = torch.searchsorted(cum_s, s, right=False)                 # [B,K]
+        idx0 = torch.clamp(idx_right - 1, min=0, max=N-2)                     # [B,K]
+        idx1 = idx0 + 1                                                       # [B,K]
+
+        # 取段端点的 s 值
+        s0 = torch.take_along_dim(cum_s, idx0, dim=-1)                        # [B,K]
+        s1 = torch.take_along_dim(cum_s, idx1, dim=-1)                        # [B,K]
+        denom = (s1 - s0).clamp_min(eps)
+        t = (s - s0) / denom                                                  # [B,K] in [0,1]
+
+        # 取段端点坐标并线性插值
+        # 扩展索引用于 [B, N, 2] 按 dim=-2 抓取
+        gather_idx0 = idx0[..., None].expand(-1, -1, 2)                       # [B,K,2]
+        gather_idx1 = idx1[..., None].expand(-1, -1, 2)                       # [B,K,2]
+        p0 = torch.take_along_dim(pts, gather_idx0, dim=-2)                   # [B,K,2]
+        p1 = torch.take_along_dim(pts, gather_idx1, dim=-2)                   # [B,K,2]
+        p = p0 + t[..., None] * (p1 - p0)                                     # [B,K,2]
+
+        if squeeze_back:
+            p = p[:, 0, :]                                                    # [B,2]
+        return p
+    def get_ref_v(self, s: Tensor) -> Tensor:
+        raise NotImplementedError("get_ref_v is not implemented for this map type.")
+    def get_road_center_pts(self) -> Tensor:
+        return self.road_pts
+    
+    def get_road_left_pts(self) -> Tensor:
+        return self.road_left_pts
+    
+    def get_road_right_pts(self) -> Tensor:
+        return self.road_right_pts
+    
+    def get_s_max(self) -> Tensor:
+        return self.road_cum_s[:, -1]  # [B]
+    
+    def get_tangent_vector(self, s: Tensor) -> Tensor:
+        epsilon = 1e-3  # 小扰动值
+        max_values = self.road_cum_s[:, -1] - 1e-6  # [B]
+        if s.dim() > 1: 
+            max_values = max_values.unsqueeze(-1)  # [B,1]
+        s_plus = torch.clamp(s + epsilon, max=max_values)
+        pos_plus = self.get_pts(s_plus)  # 调用get_pts而非road_C
+        pos = self.get_pts(s)  # 调用get_pts而非road_C
+        tangent_vec = pos_plus - pos
+        tangent_vec = tangent_vec / torch.linalg.norm(tangent_vec, dim=-1, keepdim=True) + 1e-8
+        return tangent_vec
+    
+    
+def get_cr_scenario(scenario_path):
+    scenario, _ = CommonRoadFileReader(scenario_path).open()
+    for dyn_obs in scenario.dynamic_obstacles:
+        scenario.remove_obstacle(dyn_obs)
+    return scenario
+
+class OcctCRMap(MapBase):
+    def __init__(self,
+                 batch_dim: int,
+                 device: torch.device,
+                 cr_map_dir: str = "vmas/scenarios_data/cr_maps/debug",
+                 sample_gap: float = 1,
+                 min_lane_width: float = 2.1,
+                 max_ref_v: float = 20/3.6): # 采样间隔
+        """
+        初始化道路类，使用CommonRoad地图并基于torchcubicspline实现路径表示
+        
+        Args:
+            batch_dim: 批量环境维度
+            device: 计算设备
+            cr_map_dir: 外部CommonRoad地图所在的文件夹路径（必填）
+        """
+        self.device = device
+        self.batch_dim = batch_dim
+        self.cr_map_dir = cr_map_dir
+        self.vis_dir = os.path.join(cr_map_dir, "vis")
+        os.makedirs(self.vis_dir, exist_ok=True)
+        self.sample_gap = sample_gap
+        self.min_lane_width = min_lane_width
+        self.max_ref_v = max_ref_v # max ref vel in m/s
+        
+        # 初始化路径库
+        self.path_library = []
+        self.scenario_library = dict[str, Scenario]()
+        self.path_splines = []
+        self.path_s_max = []
+        self.max_path_length = 0
+        self.max_path_s_list = None
+        
+        # 处理CommonRoad地图
+        self._cr_map_process(cr_map_dir)
+        
+        # 确保有路径数据
+        if len(self.path_library) == 0:
+            raise ValueError("No paths found in the provided CommonRoad map directory")
+        
+        # 初始化路径样条
+        self.reset_splines()
+
+    def _get_cum_len(self, vertices: Tensor) -> Tensor:
+        """
+        计算路径点的累计长度
+        
+        Args:
+            vertices: [N, 2] 路径点
+        
+        Returns:
+            cum_len: [N] 累计长度
+        """
+        # 计算路径点的累计长度
+        seg = vertices[1:] - vertices[:-1]  # [N-1, 2]
+        seg_len = torch.linalg.norm(seg, dim=-1)  # [N-1]
+        cum_len = torch.cat([torch.zeros(1, device=self.device), torch.cumsum(seg_len, dim=0)])  # [N]
+        return cum_len
+    
+    def _resample_path(self, vertices: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        对路径点进行重采样
+        
+        Args:
+            vertices: [N, 2] 原始路径点
+        
+        Returns:
+            resampled_vertices: [M, 2] 重采样后的路径点
+            s: [M] 重采样后的弧长参数
+        """
+        original_s = self._get_cum_len(vertices)  # [N]
+        
+        # 计算重采样点数量
+        s_max = original_s[-1]
+        M = max(2, int(torch.floor(s_max / self.sample_gap)))
+        
+        # 生成重采样的弧长参数
+        s = torch.linspace(0.0, s_max, M, device=self.device)
+        
+        # 使用线性插值获取重采样点
+        resampled_vertices = torch.zeros(M, 2, device=self.device)
+        
+        # 找到每个t对应的区间
+        idx = torch.searchsorted(original_s, s, right=True) - 1
+        idx = torch.clamp(idx, 0, len(original_s) - 2)
+        
+        # 线性插值
+        s0 = original_s[idx]
+        s1 = original_s[idx + 1]
+        p0 = vertices[idx]
+        p1 = vertices[idx + 1]
+        
+        alpha = (s - s0) / (s1 - s0 + 1e-8)
+        resampled_vertices = p0 + alpha.unsqueeze(1) * (p1 - p0)
+        
+        return resampled_vertices, s
+    def _enrich_vertices_sampling(self, center_vertices, left_vertices, right_vertices):
+        """
+        对直路路径点进行重采样,确保采样点数量为sample_num
+        
+        Args:
+            vertices: [N, 2] 原始路径点
+        
+        Returns:
+            resampled_vertices: [M, 2] 重采样后的路径点
+            s: [M] 重采样后的弧长参数
+        """
+        center_lengths = np.linalg.norm(center_vertices[1:] - center_vertices[:-1], axis=1)[0]
+        if len(center_vertices) == 2 and center_lengths > self.sample_gap:
+            # make sure the resample pts num is the same for center, left, right
+            sample_num = max(2, int(np.floor(center_lengths / self.sample_gap)))
+            resampled_vertices = [np.zeros((sample_num, 2)),np.zeros((sample_num, 2)),np.zeros((sample_num, 2))]
+            for resampled, vertices in zip(resampled_vertices, [center_vertices, left_vertices, right_vertices]):
+                lengths = np.linalg.norm(vertices[1:] - vertices[:-1], axis=1)[0]
+                target_s = np.linspace(0, lengths, sample_num)
+                for i in range(2):
+                    resampled[:, i] = np.interp(target_s, [0,lengths], vertices[:, i])
+            return resampled_vertices[0], resampled_vertices[1], resampled_vertices[2]
+        return center_vertices, left_vertices, right_vertices
+    
+    def _cr_map_process(self, map_dir: str) -> None:
+        """
+        处理CommonRoad地图和车道信息
+        
+        Args:
+            map_dir: 地图所在的文件夹路径
+        """
+
+        dump_file = os.path.join(self.cr_map_dir, "map_data.pkl")
+        if os.path.exists(dump_file):
+            self.scenario_library, self.path_library,\
+                self.max_path_length,self.max_path_s_list = pickle.load(open(dump_file, "rb"))
+            self.max_path_length=self.max_path_length.to(self.device)
+            self.max_path_s_list=self.max_path_s_list.to(self.device)
+            return
+        # 递归读取文件夹中所有XML文件
+        map_files = glob.glob(os.path.join(map_dir, "**/*.xml"), recursive=True)
+        
+        # 打印地图库信息
+        print(f"找到 {len(map_files)} 个地图文件:")
+        for i, map_file in enumerate(map_files):
+            print(f"  {i+1}. {os.path.basename(map_file)}")
+        
+        # 处理每个地图文件
+        for map_file in map_files:
+            map_name = os.path.basename(map_file)
+            print(f"\n处理地图: {map_name}")
+            
+            # 读取地图场景
+            scenario = get_cr_scenario(map_file)
+
+            self.scenario_library[map_name] = scenario
+            
+            # 获取所有车道段
+            lanelets = scenario.lanelet_network.lanelets
+            
+            # 找到所有起点车道段（predecessor为空）
+            start_lanelets = [lanelet for lanelet in lanelets if not lanelet.predecessor]
+            
+            # 初始化路径ID库
+            path_id_library = []
+            
+            # 使用BFS获取所有可能的路径
+            for start_lanelet in start_lanelets:
+                queue = deque()
+                queue.append([start_lanelet.lanelet_id])
+                
+                while queue:
+                    current_path = queue.popleft()
+                    current_lanelet_id = current_path[-1]
+                    
+                    # 获取当前车道段对象
+                    current_lanelet = scenario.lanelet_network.find_lanelet_by_id(current_lanelet_id)
+                    
+                    # 如果没有后继，说明是路径终点
+                    if not current_lanelet.successor:
+                        path_id_library.append(current_path)
+                    else:
+                        # 遍历所有后继
+                        for successor_id in current_lanelet.successor:
+                        # 检查后继车道段是否已经在当前路径中，如果是则跳过（避免回环）
+                            if successor_id not in current_path:
+                                new_path = current_path.copy()
+                                new_path.append(successor_id)
+                                queue.append(new_path)
+            
+            # 打印路径ID库信息
+            print(f"找到 {len(path_id_library)} 条路径:")
+            for i, path in enumerate(path_id_library):
+                print(f"  路径 {i+1}: {path}")
+            
+            # 处理每条路径，生成路径数据
+            for path_ids in path_id_library:
+                path_data = {
+                    "center_vertices": [],
+                    "left_vertices": [],
+                    "right_vertices": []
+                }
+                if not (path_ids[0]==112 and path_ids[-1]==176):
+                    continue
+                for i, lanelet_id in enumerate(path_ids):
+                    lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
+                    left_vertices = lanelet.left_vertices
+                    right_vertices = lanelet.right_vertices
+                    center_vertices = lanelet.center_vertices
+                    # if lanelet.adj_left:
+                    #     left_lane=scenario.lanelet_network.find_lanelet_by_id(lanelet.adj_left)
+                    #     left_vertices = left_lane.left_vertices if lanelet.adj_left_same_direction else left_lane.right_vertices[::-1]
+                    
+                    # if lanelet.adj_right:
+                    #     right_lane=scenario.lanelet_network.find_lanelet_by_id(lanelet.adj_right)
+                    #     right_vertices = right_lane.right_vertices if lanelet.adj_right_same_direction else right_lane.left_vertices[::-1]
+                    lane_width=np.min([np.linalg.norm(left_vertices[i]-right_vertices[i]) for i in range(len(center_vertices))])
+                    if lane_width<self.min_lane_width:
+                        continue
+                    center_vertices, left_vertices, right_vertices = \
+                        self._enrich_vertices_sampling(center_vertices, left_vertices, right_vertices)
+
+                    slice_range = slice(None) if i == len(path_ids) - 1 else slice(-1)
+                    for key, vertices in zip(
+                        ["center_vertices", "left_vertices", "right_vertices"],
+                        [center_vertices, left_vertices, right_vertices]
+                    ):
+                        path_data[key].extend([v.tolist() for v in vertices[slice_range]])
+                
+                # 将路径数据转换为tensor
+                center_vertices = torch.tensor(path_data["center_vertices"], device=self.device, dtype=torch.float32)
+                left_vertices = torch.tensor(path_data["left_vertices"], device=self.device, dtype=torch.float32)
+                right_vertices = torch.tensor(path_data["right_vertices"], device=self.device, dtype=torch.float32)
+                
+                # 对中心路径进行重采样
+                center_cum_len = self._get_cum_len(center_vertices)  # [N]
+                # 创建样条 - 使用最长路径的t参数
+                coeffs = natural_cubic_spline_coeffs(center_cum_len, left_vertices)
+                left_splines = NaturalCubicSpline(coeffs)
+                coeffs = natural_cubic_spline_coeffs(center_cum_len, right_vertices)
+                right_splines = NaturalCubicSpline(coeffs)
+                resampled_center, s = self._resample_path(center_vertices)
+                resampled_left = left_splines.evaluate(s)  # [B, N, 2, 1]
+                resampled_right = right_splines.evaluate(s)  # [B, N, 2, 1]
+                assert len(resampled_center) == len(s), "重采样后的中心路径长度与s参数长度不一致"
+                 # caculate ref vel according to curvature
+                coeffs = natural_cubic_spline_coeffs(center_cum_len, center_vertices)
+                center_splines = NaturalCubicSpline(coeffs)
+                center_curvature = self.compute_curvature_2d(center_splines, s, smooth_distance=10)
+                factor=0.2
+                ref_v = torch.clamp_max(factor * 1.0 / torch.sqrt(center_curvature+1e-8)**2, self.max_ref_v) 
+                ref_v = self.gaussian_smooth_1d(ref_v)
+                assert len(resampled_center) == len(ref_v), "重采样后的中心路径长度与参考速度长度不一致"
+                # 保存重采样后的路径数据
+                self.path_library.append({
+                    "map_name": map_name,
+                    "path_ids": path_ids,
+                    "center_vertices": resampled_center,
+                    "left_vertices": resampled_left,
+                    "right_vertices": resampled_right,
+                    "s": s,
+                    "ref_v": ref_v
+                })
+                
+                # 更新最大路径长度
+                if s[-1] > self.max_path_length:
+                    self.max_path_length = s[-1]
+                    self.max_path_s_list = s
+        
+        print(f"\n所有地图处理完成，共生成 {len(self.path_library)} 条路径数据")
+        print(f"最长路径长度: {len(self.max_path_s_list)} 个顶点，长度为{self.max_path_length}米")
+        dump_file = os.path.join(self.cr_map_dir, "map_data.pkl")
+        pickle.dump((self.scenario_library,self.path_library,\
+                     self.max_path_length,self.max_path_s_list), open(dump_file, "wb"))
+    def gaussian_smooth_1d(self, x: torch.Tensor, sigma: float = 2.0) -> torch.Tensor:
+        """
+        对1D/批量张量做高斯平滑（保持形状不变，适配任意批量维度）
+        """
+        # 展平为2D（批量维度 + 序列维度），方便处理
+        orig_shape = x.shape
+        if x.dim() == 0:
+            return x
+        # 仅对最后一维做平滑
+        seq_dim = x.shape[-1]
+        batch_dims = x.shape[:-1]
+        x_flat = x.reshape(-1, seq_dim)  # (B, L)
+        
+        # 生成高斯核
+        kernel_size = int(2 * round(3 * sigma) + 1)  # 高斯核大小（3σ原则）
+        if kernel_size > seq_dim:
+            kernel_size = seq_dim if seq_dim % 2 == 1 else seq_dim - 1  # 保证奇数核
+        if kernel_size < 3:
+            return x  # 序列过短，无需平滑
+        
+        # 构建1D高斯核
+        kernel = torch.arange(kernel_size, device=x.device, dtype=torch.float32) - (kernel_size - 1) / 2
+        kernel = torch.exp(-kernel ** 2 / (2 * sigma ** 2))
+        kernel = kernel / torch.sum(kernel)  # 归一化
+        kernel = kernel.unsqueeze(0).unsqueeze(0)  # (1, 1, kernel_size)
+        
+        # 填充边界（避免边缘值失真）
+        x_padded = F.pad(x_flat.unsqueeze(1), pad=[kernel_size//2, kernel_size//2], mode='replicate')
+        
+        # 卷积平滑
+        smooth_x = F.conv1d(x_padded, kernel, stride=1).squeeze(1)  # (B, L)
+        
+        # 恢复原始形状
+        smooth_x = smooth_x.reshape(orig_shape)
+        return smooth_x
+
+    def get_scenario_by_env_index(self, env_index):
+        """
+        获取指定环境索引的场景
+        """
+        map_name = self.batch_map_name[env_index]
+        return self.scenario_library[map_name]
+    def reset_splines(self):
+        """
+        生成batch_dim长度的随机整型tensor，范围0到道路库数量-1
+        使用torchcubicspline初始化路径样条
+        """
+        self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
+        
+        # 准备batch数据
+        B = self.batch_dim
+        max_path_pts_num = len(self.max_path_s_list)
+        
+        # 初始化batch数据
+        self.batch_s = torch.zeros(B, max_path_pts_num, device=self.device)
+        self.batch_center_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
+        self.batch_left_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
+        self.batch_right_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
+        self.batch_ref_v = torch.empty(B, max_path_pts_num, 1, device=self.device).fill_(float('nan'))
+        self.batch_s_max = torch.zeros(B, device=self.device)
+        self.batch_map_name = [None]*B
+        max_s_len=0
+        max_s_len_id=0
+        for batch_idx, path_id in enumerate(self.batch_id):
+            path_id = path_id.item()
+            self.batch_map_name[batch_idx] = self.path_library[path_id]["map_name"]
+            path_data = self.path_library[path_id]
+            s = path_data["s"]
+            s_max = s[-1]
+            length = len(s)
+            if length > max_s_len:
+                max_s_len = length
+                max_s_len_id = path_id
+            self.batch_s[batch_idx, :length] = s
+            self.batch_center_vertices[batch_idx, :length] = path_data["center_vertices"]
+            self.batch_left_vertices[batch_idx, :length] = path_data["left_vertices"]
+            self.batch_right_vertices[batch_idx, :length] = path_data["right_vertices"]
+            self.batch_s_max[batch_idx] = s_max
+            self.batch_ref_v[batch_idx, :length, 0] = path_data["ref_v"]
+        #print(f"当前batch最大路径长度: {max_s_len} 个顶点，路径ID: {max_s_len_id}")
+
+        longest_s = self.max_path_s_list
+        coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_center_vertices)
+        self.center_splines = NaturalCubicSpline(coeffs)
+        coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_left_vertices)
+        self.left_splines = NaturalCubicSpline(coeffs)
+        coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_right_vertices)
+        self.right_splines = NaturalCubicSpline(coeffs)
+        coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_ref_v)
+        self.ref_v_splines = NaturalCubicSpline(coeffs)
+
+    def compute_curvature_2d(
+        self, 
+        spline: NaturalCubicSpline, 
+        t: torch.Tensor, 
+        smooth_distance: float = 5.0  # 曲率平滑范围（米），参数化控制
+    ) -> torch.Tensor:
+        """
+        计算 2D 三次样条曲线在参数 t 处的曲率（平滑版：当前点曲率=指定距离范围内点的曲率均值）。
+        
+        参数:
+            spline: NaturalCubicSpline 实例（需保证spline能通过参数t输出物理坐标）
+            t: 要计算曲率的参数值（可以是批量输入），shape: (...)
+            smooth_distance: 曲率平滑的物理距离范围（米），即当前点前后smooth_distance米内的均值
+                            建议取值：3~10米（值越大越平滑，值越小越接近原始曲率）
+        
+        返回:
+            curvature: t 处的平滑曲率（与 t 同形状）
+        """
+        # 边界保护：平滑距离不能为负
+        smooth_distance = max(0.1, smooth_distance)
+        
+        # -------------------------- 步骤1：预计算样条的参数-距离映射（密集采样） --------------------------
+        # 1.1 生成覆盖所有输入t的密集参数采样点（保证距离计算精度）
+        t_min = torch.min(t) - 0.1  # 扩展边界，避免边缘点范围越界
+        t_max = torch.max(t) + 0.1
+        # 采样密度：每米至少10个点，保证smooth_distance范围内有足够采样点
+        sample_density = 10  # 每米采样点数
+        total_t_range = t_max - t_min
+        total_length_estimate = total_t_range * torch.norm(spline.evaluate(t_max) - spline.evaluate(t_min)) / total_t_range
+        steps = max(500, int(total_length_estimate * sample_density))  # 最少500个点
+        t_samples = torch.linspace(t_min, t_max, steps=steps, device=t.device)
+        
+        # 1.2 计算采样点的物理坐标（米）
+        pos_samples = spline.evaluate(t_samples)  # shape: (steps, 2)
+        
+        # 1.3 计算采样点的累计物理距离（从第一个采样点开始，单位：米）
+        pos_diff = pos_samples[1:] - pos_samples[:-1]  # 相邻点坐标差
+        seg_lengths = torch.norm(pos_diff, dim=-1)  # 相邻点的物理距离（米）
+        cum_lengths = torch.cat([
+            torch.tensor([0.0], device=t.device),
+            torch.cumsum(seg_lengths, dim=0)
+        ])  # 累计距离，shape: (steps,)
+        
+        # 1.4 预计算所有采样点的原始曲率
+        dr_dt_samples = spline.derivative(t_samples, order=1)  # (steps, 2)
+        d2r_dt2_samples = spline.derivative(t_samples, order=2)  # (steps, 2)
+        
+        # 原始曲率计算（与原逻辑一致）
+        dr_norm_sq_samples = torch.sum(dr_dt_samples ** 2, dim=-1)
+        dr_norm_samples = torch.sqrt(dr_norm_sq_samples)
+        dr_norm_cube_samples = dr_norm_samples ** 3
+        numerator_samples = torch.abs(
+            dr_dt_samples[:, 0] * d2r_dt2_samples[:, 1] - dr_dt_samples[:, 1] * d2r_dt2_samples[:, 0]
+        )
+        curvature_samples = numerator_samples / (dr_norm_cube_samples + 1e-8)  # (steps,)
+        
+        # -------------------------- 步骤2：批量计算输入t对应的物理距离 --------------------------
+        # 展平批量维度，方便批量处理
+        t_flat = t.flatten()  # shape: (N,)
+        pos_t = spline.evaluate(t_flat)  # shape: (N, 2)
+        
+        # 批量插值：计算每个t对应的累计物理距离（米）
+        # 步骤2.1：找到每个t_flat在t_samples中的最近索引
+        t_samples_expand = t_samples.unsqueeze(0)  # (1, steps)
+        t_flat_expand = t_flat.unsqueeze(1)        # (N, 1)
+        idx_nearest = torch.argmin(torch.abs(t_flat_expand - t_samples_expand), dim=1)  # (N,)
+        
+        # 步骤2.2：计算当前点与最近采样点的物理距离差
+        pos_nearest = pos_samples[idx_nearest]  # (N, 2)
+        pos_diff = pos_t - pos_nearest          # (N, 2)
+        dist_diff = torch.norm(pos_diff, dim=-1)  # (N,)
+        
+        # 步骤2.3：计算每个t对应的累计物理距离
+        cum_lengths_nearest = cum_lengths[idx_nearest]  # (N,)
+        length_t = cum_lengths_nearest + dist_diff      # (N,) 每个t对应的累计距离（米）
+        
+        # -------------------------- 步骤3：批量计算指定距离范围内的曲率均值 --------------------------
+        # 3.1 构建距离范围掩码（N, steps）：每个t对应的[length_t-smooth_distance, length_t+smooth_distance]
+        length_t_expand = length_t.unsqueeze(1)  # (N, 1)
+        cum_lengths_expand = cum_lengths.unsqueeze(0)  # (1, steps)
+        mask = (cum_lengths_expand >= (length_t_expand - smooth_distance)) & \
+            (cum_lengths_expand <= (length_t_expand + smooth_distance))  # (N, steps)
+        
+        # 3.2 计算每个t范围内的曲率均值（处理空值情况）
+        # 给mask加极小值，避免除以0
+        mask_float = mask.float()
+        sum_weights = torch.sum(mask_float, dim=1)  # (N,) 每个t的有效点数
+        curvature_samples_expand = curvature_samples.unsqueeze(0)  # (1, steps)
+        
+        # 计算加权和（仅有效点参与）
+        curvature_sum = torch.sum(mask_float * curvature_samples_expand, dim=1)  # (N,)
+        
+        # 均值计算：有效点>0则取均值，否则用最近采样点的曲率
+        curvature_nearest = curvature_samples[idx_nearest]  # (N,) 兜底曲率
+        smooth_curvature_flat = torch.where(
+            sum_weights > 0,
+            curvature_sum / sum_weights,
+            curvature_nearest
+        )
+        
+        # 3.3 恢复原始形状
+        smooth_curvature = smooth_curvature_flat.reshape(t.shape)
+        
+        return smooth_curvature
+    def reset_batch_id(self):
+        """
+        重置batch_id并更新并行路径库
+        """
+        self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
+        self._reset_splines()
+    
+    def get_pts(self, s: Tensor) -> Tensor:
+        assert self.center_splines._a.shape[0] == s.shape[0], "s的批量维度必须与样条批量维度一致"
+        p = self.center_splines.evaluate(s)
+        p = p[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
+        return p
+    
+    def get_ref_v(self, s: Tensor) -> Tensor:
+        ref_v = self.ref_v_splines.evaluate(s)
+        ref_v = ref_v[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
+        return ref_v
+    
+    def get_tangent_vector(self, s: Tensor) -> Tensor:
+        assert self.center_splines._a.shape[0] == s.shape[0], "s的批量维度必须与样条批量维度一致"
+        tangent_vec = self.center_splines.derivative(s)
+        tangent_vec = tangent_vec[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
+        tangent_vec = tangent_vec / (torch.linalg.norm(tangent_vec, dim=-1, keepdim=True) + 1e-8)
+        return tangent_vec
+    
+    def get_s_max(self) -> Tensor:
+        return self.batch_s_max
+    
+    def get_road_center_pts(self) -> Tensor:
+        return self.batch_center_vertices
+    
+    def get_road_left_pts(self) -> Tensor:
+        return self.batch_left_vertices
+    
+    def get_road_right_pts(self) -> Tensor:
+        return self.batch_right_vertices 
+    
+    def plot_road_debug(self):
+        from commonroad.visualization.mp_renderer import MPRenderer, DynamicObstacleParams
+        from matplotlib.collections import LineCollection
+        from matplotlib.colors import Normalize
+        import matplotlib.pyplot as plt
+
+        # 创建图形和MPRenderer
+        fig1, ax1 = plt.subplots(figsize=(8, 7))  # 增加宽度以容纳颜色条
+        rnd = MPRenderer(ax=ax1)
+        fig2, ax2 = plt.subplots(figsize=(8, 7))
+        # 设置渲染参数
+        rnd.draw_params.dynamic_obstacle.draw_icon = True
+        rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
+        rnd.draw_params.dynamic_obstacle.show_label = False
+        rnd.draw_params.dynamic_obstacle.state.draw_arrow=False
+        rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
+        rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD"  # darkblue
+        ego_params = DynamicObstacleParams()
+        ego_params.draw_icon = True
+        ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
+        ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400"  # darkgreen
+        ego_params.vehicle_shape.occupancy.shape.zorder = 20
+        
+        # 遍历所有路径
+        for path_id, path_data in enumerate(self.path_library):
+            map_name = path_data["map_name"]
+            center_vertices = path_data["center_vertices"].detach().cpu().numpy()
+            left_vertices = path_data["left_vertices"].detach().cpu().numpy()
+            right_vertices = path_data["right_vertices"].detach().cpu().numpy()
+            ref_v = path_data["ref_v"].detach().cpu().numpy()
+            s = path_data["s"].detach().cpu().numpy()
+            
+            # 获取场景并绘制
+            scenario = self.scenario_library[map_name]
+            for i in range(0, 1):
+                plt.figure(fig1)
+                rnd.draw_params.time_begin = i
+                rnd.draw_params.time_end = i
+                ego_params.time_begin = i
+                ego_params.time_end = i
+                scenario.draw(rnd)
+                rnd.render(show=True)
+                
+                # 绘制左右边界（保持原有颜色）
+                rnd.ax.plot(left_vertices[:, 0], left_vertices[:, 1], 'r', label='Left Boundary', zorder=20)
+                rnd.ax.plot(right_vertices[:, 0], right_vertices[:, 1], 'b', label='Right Boundary', zorder=20)
+                
+                # 绘制带颜色映射的中心线
+                # 准备线段集合
+                points = center_vertices.reshape(-1, 1, 2)
+                segments = np.concatenate([points[:-1], points[1:]], axis=1)
+                
+                # 创建颜色映射（彩虹色系）
+                norm = Normalize(vmin=ref_v.min(), vmax=ref_v.max())
+                lc = LineCollection(segments, cmap='viridis', norm=norm, linewidth=2, linestyle='--', zorder=20)
+                
+                # 根据ref_v为线段分配颜色
+                lc.set_array(ref_v)
+                
+                # 添加到轴上
+                line = rnd.ax.add_collection(lc)
+                
+                # 添加颜色条
+                cbar = fig1.colorbar(line, ax=ax1, shrink=0.8, pad=0.05)
+                cbar.set_label('Reference Velocity (m/s)', fontsize=16)
+                cbar.ax.tick_params(labelsize=14)
+                
+                # 设置坐标轴
+                rnd.ax.set_xlabel("x/m", fontsize=20)
+                rnd.ax.set_ylabel("y/m", fontsize=20)
+                rnd.ax.tick_params(axis='both', direction='in', labelsize=16, top=False, right=False)
+                rnd.ax.set_title(f"Path {path_id + 1}: Reference Velocity Color Map", fontsize=18)
+                
+                # 暂停以显示
+                plt.pause(0.01)
+                
+                # 保存图像
+                fig1_path = f"{self.vis_dir}/fig1_{path_id:04d}_{i:04d}.svg"
+                fig1.savefig(fig1_path, dpi=300, format="svg", bbox_inches='tight')
+                
+                # 清除颜色条和中心线，准备下一个路径
+                cbar.remove()
+                line.remove()
+                plt.figure(fig2)
+                ax2.clear()
+                ax2.plot(s, ref_v, 'b', label='Reference Velocity', zorder=20)
+                ax2.set_xlabel("s/m", fontsize=20)
+                ax2.set_ylabel("v/m/s", fontsize=20)
+                ax2.tick_params(axis='both', direction='in', labelsize=16, top=False, right=False)
+                ax2.set_title(f"Path {path_id + 1}: Reference Velocity", fontsize=18)
+                ax2.legend(fontsize=14)
+                plt.pause(0.01)
+                fig2_path = f"{self.vis_dir}/fig2_{path_id:04d}_{i:04d}.svg"
+                fig2.savefig(fig2_path, dpi=300, format="svg", bbox_inches='tight')
+                
+    # def plot_road_debug(self):
+    #     from commonroad.visualization.mp_renderer import MPRenderer, DynamicObstacleParams
+
+    #     fig1, ax1 = plt.subplots(figsize=(7, 7))
+    #     rnd = MPRenderer(ax=ax1)
+    #     rnd.draw_params.dynamic_obstacle.draw_icon = True
+    #     rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
+    #     rnd.draw_params.dynamic_obstacle.show_label = False
+    #     rnd.draw_params.dynamic_obstacle.state.draw_arrow=False
+    #     rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
+    #     rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD" #darkgreen
+    #     ego_params = DynamicObstacleParams()
+    #     ego_params.draw_icon = True
+    #     ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
+    #     ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400" #mediumblue
+    #     ego_params.vehicle_shape.occupancy.shape.zorder = 20
+    #     #for name, scenario in self.scenario_library:
+        
+    #     for path_id, path_data in enumerate(self.path_library):
+    #         map_name=path_data["map_name"]
+    #         center_vertices=path_data["center_vertices"]
+    #         left_vertices=path_data["left_vertices"]
+    #         right_vertices=path_data["right_vertices"]
+    #         ref_v=path_data["ref_v"]
+                
+    #         scenario=self.scenario_library[map_name]
+    #         for i in range(0,1):
+    #             rnd.draw_params.time_begin=i
+    #             rnd.draw_params.time_end=i
+    #             ego_params.time_begin = i
+    #             ego_params.time_end=i
+    #             scenario.draw(rnd)
+    #             rnd.render(show=True)
+
+    #             rnd.ax.plot(center_vertices[:, 0], center_vertices[:, 1], 'purple',linestyle='--', label='Road Center Line',zorder=20)
+    #             rnd.ax.plot(left_vertices[:, 0], left_vertices[:, 1], 'r', label='Left Boundary',zorder=20)
+    #             rnd.ax.plot(right_vertices[:, 0], right_vertices[:, 1], 'b', label='Right Boundary',zorder=20)
+    #             rnd.ax.set_xlabel("x/m",fontsize=20,)
+    #             rnd.ax.set_ylabel("y/m",fontsize=20,)
+    #             rnd.ax.tick_params(axis='both', direction='in',labelsize=16, top=False, right=False)
+    #             #rnd.ax.set_title(f"scenario {scenario_id}")
+                
+    #             plt.pause(0.0001)
+    #             fig1_path = f"{self.vis_dir}/fig1_{path_id:04d}_{i:04d}.svg"
+    #             fig1.savefig(fig1_path,dpi=300,format="svg")
+                
+    
+    # def simulate(self):
+
+    #     road = OcctCRMap(batch_dim=1, device=device)
+    #     hv_ref=MapCcosyRef(self.cfg)
+    #     for target_dict in target_scenario_dict[1:2]:
+    #         scenario_id=target_dict["scenario_id"]
+    #         scenario=self.interactive_scenarios[scenario_id]
+    #         ego_id=target_dict["ego_id"]
+    #         #scenario=self.scenario_filter(scenario,include_ids=[162,171,173]+[ego_id])
+    #         time_offset=target_dict["time_offset"]
+    #         goal_pos=target_dict["goal_pos"]
+    #         focus_sv_ids=target_dict["focus_sv_ids"]
+    #         ego_abc_str = hv_ref.classify_obs_route(scenario.obstacle_by_id(ego_id))#next(k for k, v in self.interactive_id_pairs[scenario_id].items() if v == ego_id)
+    #         self.init_hv_planners(scenario,time_offset,ego_id)
+    #         ev_shadow=scenario.obstacle_by_id(ego_id)    
+    #         ego_ref_v=target_dict.get("ref_v",4)
+    #         from map_ccosy_ref_ego import MapCcosyRefEgo
+    #         ego_ref=MapCcosyRefEgo(self.cfg)
+    #         ego_planner=EVPlanner(cfg=self.cfg,
+    #                               scenario=scenario,
+    #                               dt=0.1,
+    #                               raw_obs=ev_shadow,
+    #                               ref_v=ego_ref_v,
+    #                               simulator=self,
+    #                               abc_str=ego_abc_str,
+    #                               hv_ref=ego_ref,
+    #                               goal_pos=goal_pos,
+    #                               time_offset=time_offset,
+    #                               fix_sv_num=True)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
+    #         self.ego_vehicle_id=ego_planner.vehicle_id
+    #         self.planners[self.ego_vehicle_id]=ego_planner
+    #         raw_obs_dict={obs.obstacle_id:obs for obs in scenario.obstacles}
+    #         raw_obs_dict.update({self.ego_vehicle_id:ev_shadow})
+    #         scenario.remove_obstacle(ev_shadow)
+    #         fig1, ax1 = plt.subplots(figsize=(7, 7))
+    #         fig_vel, ax_vel = plt.subplots(3,1, figsize=(6,10))
+            
+    #         fig2, ax_list = plt.subplots(3,2, figsize=(10,12), sharex=True)
+    #         rnd = MPRenderer(plot_limits=target_dict["plot_limits"],ax=ax1)
+    #         rnd.draw_params.dynamic_obstacle.draw_icon = True
+    #         rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
+    #         rnd.draw_params.dynamic_obstacle.show_label = False
+    #         rnd.draw_params.dynamic_obstacle.state.draw_arrow=False
+    #         rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
+    #         rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD" #darkgreen
+    #         ego_params = DynamicObstacleParams()
+    #         ego_params.draw_icon = True
+    #         ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
+    #         ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400" #mediumblue
+    #         ego_params.vehicle_shape.occupancy.shape.zorder = 20
+    #         interact_params=DynamicObstacleParams()
+    #         interact_params.draw_icon = True
+    #         interact_params.vehicle_shape.occupancy.shape.facecolor = "white"
+    #         interact_params.vehicle_shape.occupancy.shape.edgecolor = "#A52A2A" #mediumblue
+    #         interact_params.vehicle_shape.occupancy.shape.zorder = 20
+    #         start_time_step=ego_planner.start_time_step
+    #         end_time_step=ego_planner.end_time_step
+    #         for i in range(start_time_step+time_offset,end_time_step):
+    #             t0=time.time()
+    #             plt.figure(fig1.number)
+    #             for planner in self.planners.values():
+    #                 planner.step(i)
+    #             rnd.draw_params.time_begin=i
+    #             rnd.draw_params.time_end=i
+    #             ego_params.time_begin = i
+    #             ego_params.time_end=i
+    #             interact_params.time_begin = i
+    #             interact_params.time_end=i
+    #             scenario.draw(rnd)
+    #             ego_planner.vehicle.draw(rnd,draw_params=ego_params)
+    #             if hasattr(ego_planner,"objective"):
+    #                 for kcv in ego_planner.objective.top_obs_ids:
+    #                     scenario.obstacle_by_id(kcv).draw(rnd,draw_params=interact_params)
+    #             rnd.render(show=True)
+    #             rnd.ax.set_xlabel("x/m",fontsize=20,)
+    #             rnd.ax.set_ylabel("y/m",fontsize=20,)
+    #             rnd.ax.tick_params(axis='both', direction='in',labelsize=16, top=False, right=False)
+    #             #rnd.ax.set_title(f"scenario {scenario_id}")
+    #             for hv_id,hv_planner in self.planners.items():
+    #                 hv_planner.draw_planning_result(ax1,i)
+    #             ego_planner.draw_prediction_result(ax1,i)
+    #             ego_planner.draw_attention_vehicle(ax1,i)
+    #             plt.figure(fig2.number)
+    #             if hasattr(ego_planner,"data_recorder"):
+    #                 ego_planner.data_recorder.plot_sv_state(type(ego_planner)==EVPlanner,focus_sv_ids,start_time_step+time_offset,ax_list,i,600)
+    #                 self.plot_sv_gt_vel(ego_ref_v,focus_sv_ids,start_time_step+time_offset, ax_list[0,0], i, N=600)
+    #                 plt.figure(fig_vel.number)
+    #                 specific_vehicle_ids=[165,168]
+    #                 if False and type(ego_planner)==EVPlanner:
+    #                     ego_planner.data_recorder.plot_velocity_trajectories(ax_vel,i,specific_vehicle_ids)
+    #                     self.plot_hv_vel_traj(ax_vel,specific_vehicle_ids)
+    #             if SHOW_DEBUG:
+    #                 plt.figure(fig1.number)
+    #                 self.plot_obstacle_id(i,scenario,ax1)
+    #             plt.pause(0.0001)
+    #             # 保存三张图为临时文件
+    #             if SAVE_FIG:
+    #                 fig1_path = f"{FIG_SAVE_PATH}/fig1_{i:04d}.svg"
+    #                 fig2_path = f"{FIG_SAVE_PATH}/fig2_{i:04d}.png"
+    #                 fig_vel_path = f"{FIG_SAVE_PATH}/fig_vel_{i:04d}.png"
+    #                 fig1.savefig(fig1_path,dpi=300,format="svg")
+    #                 fig2.savefig(fig2_path,dpi=300)
+    #                 fig_vel.savefig(fig_vel_path,dpi=300)
+                
+    #             if ego_planner.is_finished:
+                    
+    #                 break
+
+    #             plt.pause(0.01)
+    #             t1=time.time()
+    #         plt.pause(1)
+    #         plt.close()
+
+# def ref_path_gen(self):
+
+#     road = OcctCRMap(batch_dim=1, device=device)
+#     hv_ref=MapCcosyRef(self.cfg)
+#     for target_dict in target_scenario_dict[1:2]:
+#         scenario_id=target_dict["scenario_id"]
+#         scenario=self.interactive_scenarios[scenario_id]
+#         ego_id=target_dict["ego_id"]
+#         #scenario=self.scenario_filter(scenario,include_ids=[162,171,173]+[ego_id])
+#         time_offset=target_dict["time_offset"]
+#         goal_pos=target_dict["goal_pos"]
+#         focus_sv_ids=target_dict["focus_sv_ids"]
+#         ego_abc_str = hv_ref.classify_obs_route(scenario.obstacle_by_id(ego_id))#next(k for k, v in self.interactive_id_pairs[scenario_id].items() if v == ego_id)
+#         self.init_hv_planners(scenario,time_offset,ego_id)
+#         ev_shadow=scenario.obstacle_by_id(ego_id)    
+#         ego_ref_v=target_dict.get("ref_v",4)
+#         from map_ccosy_ref_ego import MapCcosyRefEgo
+#         ego_ref=MapCcosyRefEgo(self.cfg)
+#         ego_planner=EVPlanner(cfg=self.cfg,
+#                                 scenario=scenario,
+#                                 dt=0.1,
+#                                 raw_obs=ev_shadow,
+#                                 ref_v=ego_ref_v,
+#                                 simulator=self,
+#                                 abc_str=ego_abc_str,
+#                                 hv_ref=ego_ref,
+#                                 goal_pos=goal_pos,
+#                                 time_offset=time_offset,
+#                                 fix_sv_num=True)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+#         self.ego_vehicle_id=ego_planner.vehicle_id
+#         self.planners[self.ego_vehicle_id]=ego_planner
+#         raw_obs_dict={obs.obstacle_id:obs for obs in scenario.obstacles}
+#         raw_obs_dict.update({self.ego_vehicle_id:ev_shadow})
+#         scenario.remove_obstacle(ev_shadow)
+#         fig1, ax1 = plt.subplots(figsize=(7, 7))
+#         fig_vel, ax_vel = plt.subplots(3,1, figsize=(6,10))
+        
+#         fig2, ax_list = plt.subplots(3,2, figsize=(10,12), sharex=True)
+#         rnd = MPRenderer(plot_limits=target_dict["plot_limits"],ax=ax1)
+#         rnd.draw_params.dynamic_obstacle.draw_icon = True
+#         rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
+#         rnd.draw_params.dynamic_obstacle.show_label = False
+#         rnd.draw_params.dynamic_obstacle.state.draw_arrow=False
+#         rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
+#         rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD" #darkgreen
+#         ego_params = DynamicObstacleParams()
+#         ego_params.draw_icon = True
+#         ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
+#         ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400" #mediumblue
+#         ego_params.vehicle_shape.occupancy.shape.zorder = 20
+#         interact_params=DynamicObstacleParams()
+#         interact_params.draw_icon = True
+#         interact_params.vehicle_shape.occupancy.shape.facecolor = "white"
+#         interact_params.vehicle_shape.occupancy.shape.edgecolor = "#A52A2A" #mediumblue
+#         interact_params.vehicle_shape.occupancy.shape.zorder = 20
+#         start_time_step=ego_planner.start_time_step
+#         end_time_step=ego_planner.end_time_step
+#         for i in range(start_time_step+time_offset,end_time_step):
+#             t0=time.time()
+#             plt.figure(fig1.number)
+#             for planner in self.planners.values():
+#                 planner.step(i)
+#             rnd.draw_params.time_begin=i
+#             rnd.draw_params.time_end=i
+#             ego_params.time_begin = i
+#             ego_params.time_end=i
+#             interact_params.time_begin = i
+#             interact_params.time_end=i
+#             scenario.draw(rnd)
+#             ego_planner.vehicle.draw(rnd,draw_params=ego_params)
+#             if hasattr(ego_planner,"objective"):
+#                 for kcv in ego_planner.objective.top_obs_ids:
+#                     scenario.obstacle_by_id(kcv).draw(rnd,draw_params=interact_params)
+#             rnd.render(show=True)
+#             rnd.ax.set_xlabel("x/m",fontsize=20,)
+#             rnd.ax.set_ylabel("y/m",fontsize=20,)
+#             rnd.ax.tick_params(axis='both', direction='in',labelsize=16, top=False, right=False)
+#             #rnd.ax.set_title(f"scenario {scenario_id}")
+#             for hv_id,hv_planner in self.planners.items():
+#                 hv_planner.draw_planning_result(ax1,i)
+#             ego_planner.draw_prediction_result(ax1,i)
+#             ego_planner.draw_attention_vehicle(ax1,i)
+#             plt.figure(fig2.number)
+#             if hasattr(ego_planner,"data_recorder"):
+#                 ego_planner.data_recorder.plot_sv_state(type(ego_planner)==EVPlanner,focus_sv_ids,start_time_step+time_offset,ax_list,i,600)
+#                 self.plot_sv_gt_vel(ego_ref_v,focus_sv_ids,start_time_step+time_offset, ax_list[0,0], i, N=600)
+#                 plt.figure(fig_vel.number)
+#                 specific_vehicle_ids=[165,168]
+#                 if False and type(ego_planner)==EVPlanner:
+#                     ego_planner.data_recorder.plot_velocity_trajectories(ax_vel,i,specific_vehicle_ids)
+#                     self.plot_hv_vel_traj(ax_vel,specific_vehicle_ids)
+#             if SHOW_DEBUG:
+#                 plt.figure(fig1.number)
+#                 self.plot_obstacle_id(i,scenario,ax1)
+#             plt.pause(0.0001)
+#             # 保存三张图为临时文件
+#             if SAVE_FIG:
+#                 fig1_path = f"{FIG_SAVE_PATH}/fig1_{i:04d}.svg"
+#                 fig2_path = f"{FIG_SAVE_PATH}/fig2_{i:04d}.png"
+#                 fig_vel_path = f"{FIG_SAVE_PATH}/fig_vel_{i:04d}.png"
+#                 fig1.savefig(fig1_path,dpi=300,format="svg")
+#                 fig2.savefig(fig2_path,dpi=300)
+#                 fig_vel.savefig(fig_vel_path,dpi=300)
+            
+#             if ego_planner.is_finished:
+#                 break
+
+#             plt.pause(0.01)
+#             t1=time.time()
+#         plt.pause(1)
+#         plt.close()
 
 if __name__ == "__main__":
-    # 运行debug绘图函数
-    plot_road_debug()
+    device = torch.device("cpu")
+    # road = OcctMap(batch_dim=1, device=device)
+    # road.plot_road_debug()
+
+    road = OcctCRMap(batch_dim=1, device=device, sample_gap=1)
+    road.plot_road_debug()

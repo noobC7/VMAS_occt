@@ -37,16 +37,93 @@ class OcctRewards:
         higth_v=None,
         reach_goal=None,
         reach_intermediate_goal=None,
-        track_reference_vel=None,
-        track_reference_spacing=None,
     ):
         self.progress = progress
         self.weighting_ref_directions = weighting_ref_directions
         self.higth_v = higth_v
         self.reach_goal = reach_goal
         self.reach_intermediate_goal = reach_intermediate_goal
-        self.track_reference_vel = track_reference_vel
-        self.track_reference_spacing = track_reference_spacing
+
+class OcctPenalties:
+    """Penalties for collisions, being too close to other agents or lane boundaries, etc."""
+
+    def __init__(
+        self,
+        deviate_from_ref_path=None,
+        deviate_from_goal=None,
+        weighting_deviate_from_ref_path=None,
+        near_boundary=None,
+        near_other_agents=None,
+        collide_with_agents=None,
+        collide_with_boundaries=None,
+        collide_with_obstacles=None,
+        backward=None,
+        time=None,
+        change_steering=None,
+        ref_vel_error=None,
+        ref_space_error=None,
+    ):
+        self.deviate_from_ref_path = (
+            deviate_from_ref_path  # Penalty for deviating from reference path
+        )
+        self.deviate_from_goal = (
+            deviate_from_goal  # Penalty for deviating from goal position
+        )
+        self.weighting_deviate_from_ref_path = weighting_deviate_from_ref_path
+        self.near_boundary = (
+            near_boundary  # Penalty for being too close to lanelet boundaries
+        )
+        self.near_other_agents = (
+            near_other_agents  # Penalty for being too close to other agents
+        )
+        self.collide_with_agents = (
+            collide_with_agents  # Penalty for colliding with other agents
+        )
+        self.collide_with_boundaries = (
+            collide_with_boundaries  # Penalty for colliding with lanelet boundaries
+        )
+        self.collide_with_obstacles = (
+            collide_with_obstacles  # Penalty for colliding with obstacles
+        )
+        self.backward = backward  # Penalty for leaving the world
+        self.time = time  # Penalty for losing time
+        self.change_steering = (
+            change_steering  # Penalty for changing steering direction
+        )
+        self.ref_vel_error = ref_vel_error  # Penalty for velocity error relative to reference velocity
+        self.ref_space_error = ref_space_error  # Penalty for gap error relative to reference gap (unnormalized)
+class OcctThresholds:
+    """Different thresholds, such as starting from which distance agents are deemed being too close to other agents."""
+
+    def __init__(
+        self,
+        deviate_from_ref_path=None,
+        near_boundary_low=None,
+        near_boundary_high=None,
+        near_other_agents_low=None,
+        near_other_agents_high=None,
+        reach_goal=None,
+        reach_intermediate_goal=None,
+        change_steering=None,
+        change_acc=None,
+        no_reward_if_too_close_to_boundaries=None,
+        no_reward_if_too_close_to_other_agents=None,
+        distance_mask_agents=None,
+    ):
+        self.deviate_from_ref_path = deviate_from_ref_path
+        self.near_boundary_low = near_boundary_low
+        self.near_boundary_high = near_boundary_high
+        self.near_other_agents_low = near_other_agents_low
+        self.near_other_agents_high = near_other_agents_high
+        self.reach_goal = reach_goal  # Threshold less than which agents are considered at their goal positions
+        self.reach_intermediate_goal = reach_intermediate_goal  # Threshold less than which agents are considered at their intermediate goal positions
+        self.change_steering = change_steering  # Threshold above which agents will be penalized for changing steering too quick [degree]
+        self.change_acc = change_acc  # Threshold above which agents will be penalized for changing acceleration too quick [m/s^2]
+        self.no_reward_if_too_close_to_boundaries = no_reward_if_too_close_to_boundaries  # Agents get no reward if they are too close to lanelet boundaries
+        self.no_reward_if_too_close_to_other_agents = no_reward_if_too_close_to_other_agents  # Agents get no reward if they are too close to other agents
+        self.distance_mask_agents = (
+            distance_mask_agents  # Threshold above which nearing agents will be masked
+        )
 class OcctObservations:
     def __init__(
         self,
@@ -58,6 +135,7 @@ class OcctObservations:
         n_observed_steps=None,
         error_vel=None,
         error_space=None,
+        agent_s=None,
         past_pos: CircularBuffer = None,
         past_rot: CircularBuffer = None,
         past_vertices: CircularBuffer = None,
@@ -81,6 +159,7 @@ class OcctObservations:
         self.n_observed_steps = n_observed_steps  # Number of past steps to observe
         self.error_vel = error_vel  # Velocity error relative to reference velocity
         self.error_space = error_space  # Gap error relative to reference gap (unnormalized)
+        self.agent_s = agent_s  # Arc length position
         
         self.past_pos = past_pos  # Past positions
         self.past_rot = past_rot  # Past rotations
