@@ -119,7 +119,7 @@ def get_short_term_reference_path_by_s(
         print(f"共有 {len(nan_sample_indices)} 个样本包含NaN")
         assert True, "Some samples have NaN points in the short-term reference path!"
     if single_env:
-        return short_term_path[0]
+        return short_term_path[env_j]
     return short_term_path
 
 
