@@ -37,12 +37,18 @@ class OcctRewards:
         higth_v=None,
         reach_goal=None,
         reach_intermediate_goal=None,
+        reward_track_ref_vel=None,
+        reward_track_ref_space=None,
+        reward_track_ref_path=None,
     ):
         self.progress = progress
         self.weighting_ref_directions = weighting_ref_directions
         self.higth_v = higth_v
         self.reach_goal = reach_goal
         self.reach_intermediate_goal = reach_intermediate_goal
+        self.reward_track_ref_vel = reward_track_ref_vel
+        self.reward_track_ref_space = reward_track_ref_space
+        self.reward_track_ref_path = reward_track_ref_path
 
 class OcctPenalties:
     """Penalties for collisions, being too close to other agents or lane boundaries, etc."""
@@ -134,7 +140,7 @@ class OcctObservations:
         n_stored_steps=None,
         n_observed_steps=None,
         error_vel=None,
-        error_space=None,
+        error_space: CircularBuffer = None,
         agent_s=None,
         past_pos: CircularBuffer = None,
         past_rot: CircularBuffer = None,
