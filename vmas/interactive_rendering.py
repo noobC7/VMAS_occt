@@ -308,6 +308,7 @@ def render_interactively(
     control_two_agents: bool = False,
     display_info: bool = True,
     save_render: bool = False,
+    seed: int = 0,
     **kwargs,
 ):
     """Executes a scenario and renders it so that you can debug and control agents interactively.
@@ -347,7 +348,7 @@ def render_interactively(
             device="cpu",
             continuous_actions=True,
             wrapper="gym",
-            seed=0,
+            seed=seed,
             wrapper_kwargs={"return_numpy": False},
             # Environment specific variables
             **kwargs,
