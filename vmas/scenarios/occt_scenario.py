@@ -98,27 +98,26 @@ def get_short_term_reference_path_by_s(
                                     set to 1 when using this function to get the nearing boundary points."""
     if device is None:
         device = torch.device("cpu")
-    single_env=False
-    if agent_s.ndim == 0:
-        assert env_j is not None, "env_j must be provided when agent_s is a scalar!"
-        B=occt_map.batch_dim
-        agent_s=agent_s.expand(B)
-        single_env=True
-    else:
-        B=agent_s.shape[0]
+    B=agent_s.shape[0] if agent_s.dim() else 1
     short_term_path=torch.zeros((B, n_points_to_return , 3 if return_ref_v else 2), device=device, dtype=torch.float32)
     for i in range(n_points_to_return):
-        short_term_path[:, i, :2] = occt_map.get_pts(agent_s+i*sample_interval)
+        short_term_path[:, i, :2] = occt_map.get_pts(agent_s+i*sample_interval,env_j)
         if return_ref_v:
-            short_term_path[:, i, 2] = occt_map.get_ref_v(agent_s+i*sample_interval).squeeze(dim=1)
+            ref_v = occt_map.get_ref_v(agent_s+i*sample_interval,env_j)
+            if ref_v.dim()==2:
+                short_term_path[:, i, 2] = ref_v.squeeze(dim=1)
+            elif ref_v.dim()==1:
+                short_term_path[:, i, 2] = ref_v
+            else:
+                raise ValueError(f"ref_v should be either [batch_size, 1] or [batch_size] or [1], but got {ref_v.shape}")
     has_nan = torch.isnan(short_term_path).any(dim=(1, 2))
     nan_sample_indices = torch.nonzero(has_nan).squeeze(dim=1)
     if len(nan_sample_indices):
         print(f"包含NaN的样本索引：{nan_sample_indices}")
         print(f"共有 {len(nan_sample_indices)} 个样本包含NaN")
         assert True, "Some samples have NaN points in the short-term reference path!"
-    if single_env:
-        return short_term_path[env_j]
+    if agent_s.dim()==0:
+        return short_term_path[0,...]
     return short_term_path
 
 
@@ -227,10 +226,10 @@ class Scenario(BaseScenario):
             raise ValueError("n_nearing_agents_observed must be less than n_agents")
 
         self.is_real_time_rendering=kwargs.pop("is_real_time_rendering", False)
-        self.n_points_short_term=kwargs.pop("n_points_short_term", 8)
+        self.n_points_short_term=kwargs.pop("n_points_short_term", 5)
         self.sample_interval=kwargs.pop("sample_interval", 2)
         
-        self.n_points_nearing_boundary=kwargs.pop("n_points_nearing_boundary", 8)
+        self.n_points_nearing_boundary=kwargs.pop("n_points_nearing_boundary", 6)
         self.is_ego_view=kwargs.pop("is_ego_view", True)
         self.is_apply_mask=kwargs.pop("is_apply_mask", True)
         self.is_observe_vertices=kwargs.pop("is_observe_vertices", True)
@@ -1103,7 +1102,7 @@ class Scenario(BaseScenario):
         vehicle_s = torch.clamp(vehicle_s, max=self.road.get_s_max()[:, None].expand(-1, F) - 1e-6) #BUG FIXED: produce nan pos
 
         # 251224: record arch of agents for closest ref pts
-        self.observations.agent_s = vehicle_s
+        self.observations.agent_s[env_index] = vehicle_s[env_index] #BUG FIX： asynchronous update of agent_s instead of self.observations.agent_s = vehicle_s
         # 计算每辆车的位置和方向
         # 获取道路坐标
         vehicle_pos = self.road.get_pts(vehicle_s)  # [B, F, 2]
@@ -1280,19 +1279,10 @@ class Scenario(BaseScenario):
                     env_j=env_j
                 )
             # check
-            pos_tmp = agents[i_agent].state.pos[env_j, :]
-            ref_tmp = self.road.get_pts(self.observations.agent_s[env_j, i_agent],env_j)
-            dis_tmp = torch.linalg.norm(ref_tmp-pos_tmp,dim=-1)
-            mask = dis_tmp > self.lane_width/2
-            invalid_indices = torch.where(mask)[0]
-            if len(invalid_indices) > 0:
-                for idx in invalid_indices:
-                    # 将tensor索引转为整数，tensor值转为numpy以便打印
-                    idx = idx.item()
-                    pos = pos_tmp[idx].cpu().numpy() if pos_tmp.is_cuda else pos_tmp[idx].numpy()
-                    ref = ref_tmp[idx].cpu().numpy() if ref_tmp.is_cuda else ref_tmp[idx].numpy()
-                    dist = dis_tmp[idx].item()
-                    print(f"Agent {i_agent} - Batch[{idx}] (pos:{pos}) is far away from ref:{ref}, distance: {dist:.2f}.")
+            # pos_tmp = agents[i_agent].state.pos[env_j, :]
+            # ref_tmp = self.road.get_pts(self.observations.agent_s[env_j, i_agent],env_j)
+            # dis_tmp = torch.linalg.norm(ref_tmp-pos_tmp,dim=-1)
+            # print(f"reset_init_distances_and_short_term_ref_path,dis_tmp: {torch.mean(dis_tmp)}")
         else:
             (
                 self.ref_paths_agent_related.short_term[env_j, i_agent, :, 0:2],
@@ -1428,12 +1418,16 @@ class Scenario(BaseScenario):
         tangent_vec = self.road.get_tangent_vector(self.observations.agent_s)  # [B, F, 2]
         agents_pos = torch.zeros_like(latest_pos)
         for i, agent in enumerate(self.followers):
-                agents_pos[:, i, 0:2] = agent.state.pos
+            agents_pos[:, i, 0:2] = agent.state.pos
         agents_move_vec = agents_pos - latest_pos
         
         delta_s = torch.sum(agents_move_vec * tangent_vec, dim=-1)  # [B, F]
-        self.observations.agent_s = self.observations.agent_s + delta_s
-
+        self.observations.agent_s += delta_s
+        # # debug: s error
+        # pos_tmp = agents[i_agent].state.pos[env_j, :]
+        # ref_tmp = self.road.get_pts(self.observations.agent_s[env_j, i_agent],env_j)
+        # dis_tmp = torch.linalg.norm(ref_tmp-pos_tmp,dim=-1)
+        # print(f"reset_init_distances_and_short_term_ref_path,dis_tmp: {torch.mean(dis_tmp)}")
         if self.task_class==TaskClass.SIMPLE_PLATOON:
             return
         for i, agent in enumerate(self.followers):
@@ -2579,6 +2573,19 @@ class Scenario(BaseScenario):
                     return_ref_v=True,
                     
                 )
+            # debug_dis=torch.linalg.norm(self.world.agents[agent_index].state.pos-self.ref_paths_agent_related.short_term[:,agent_index,0,:2],dim=-1)
+            # if torch.mean(debug_dis) > self.lane_width/2:
+            #     print(f"update_state_after_rewarding,debug_dis:{torch.mean(debug_dis)}")
+            self.ref_paths_agent_related.short_term[:, agent_index] = \
+                get_short_term_reference_path_by_s(
+                    self.road,
+                    self.observations.agent_s[:, agent_index],
+                    n_points_to_return=self.n_points_short_term,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    return_ref_v=True,
+                    
+                )
         else:
             (
                 self.ref_paths_agent_related.short_term[:, agent_index, :, 0:2],
@@ -2814,6 +2821,9 @@ class Scenario(BaseScenario):
                 if hasattr(self, "ref_paths_agent_related") and hasattr(self.ref_paths_agent_related, "short_term"):
                     # 确保short_term数组维度正确
                     short_term_path = self.ref_paths_agent_related.short_term[env_index, agent_i]
+                    if torch.linalg.norm(ag.state.pos[env_index]-short_term_path[0,:2])>0.5:
+                        a=1
+                        pass
                     if short_term_path.shape[0] > 1:  # 确保有足够的点
                         # 绘制轨迹线
                         geom = rendering.PolyLine(

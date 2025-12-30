@@ -860,24 +860,28 @@ class OcctCRMap(MapBase):
         self._reset_splines()
     
     def get_pts(self, s: Tensor, env_j: int = None) -> Tensor:
+        p = self.center_splines.evaluate(s)
         if s.dim()==0:
             # get pts for env_j
             assert env_j is not None, "当s的维度为0时，env_j不能为空"
-            expand_s = s.unsqueeze(0).expand(self.batch_dim, -1)
-            p = self.center_splines.evaluate(expand_s)
-            p = p[torch.arange(expand_s.shape[0]), torch.arange(expand_s.shape[0])]
             return p[env_j]
         else:
             # get pts for batch
             assert self.center_splines._a.shape[0] == s.shape[0], "s的批量维度必须与样条批量维度一致"
-            p = self.center_splines.evaluate(s)
             p = p[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
             return p
 
-    def get_ref_v(self, s: Tensor) -> Tensor:
+    def get_ref_v(self, s: Tensor, env_j: int = None) -> Tensor:
         ref_v = self.ref_v_splines.evaluate(s)
-        ref_v = ref_v[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
-        return ref_v
+        if s.dim()==0:
+            # get pts for env_j
+            assert env_j is not None, "当s的维度为0时，env_j不能为空"
+            return ref_v[env_j]
+        else:
+            # get pts for batch
+            assert self.center_splines._a.shape[0] == s.shape[0], "s的批量维度必须与样条批量维度一致"
+            ref_v = ref_v[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
+            return ref_v
     
     def get_tangent_vector(self, s: Tensor) -> Tensor:
         assert self.center_splines._a.shape[0] == s.shape[0], "s的批量维度必须与样条批量维度一致"
