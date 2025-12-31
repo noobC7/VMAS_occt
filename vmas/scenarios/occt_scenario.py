@@ -1328,10 +1328,23 @@ class Scenario(BaseScenario):
                 n_points_shift=1,
             )
         
-            #251225 exit segment initialization
+            #251231 exit segment initialization
             s_max_idx = self.road.get_s_max_idx()[env_j]
-            self.ref_paths_agent_related.exit[env_j, i_agent, 0, :] = self.ref_paths_agent_related.left_boundary[env_j, i_agent, s_max_idx, :]
-            self.ref_paths_agent_related.exit[env_j, i_agent, 1, :] = self.ref_paths_agent_related.right_boundary[env_j, i_agent, s_max_idx, :]
+            if s_max_idx.dim():
+                last_pts_idx = s_max_idx[:, None, None].expand(-1, -1, 2)
+            else:
+                # single env_j
+                last_pts_idx = s_max_idx[None, None].expand(-1, 2)
+            self.ref_paths_agent_related.exit[env_j, i_agent, 0, :] = torch.gather(
+                self.ref_paths_agent_related.left_boundary[env_j, i_agent], 
+                dim=-2,
+                index=last_pts_idx
+            ).squeeze(-2)
+            self.ref_paths_agent_related.exit[env_j, i_agent, 1, :] = torch.gather(
+                self.ref_paths_agent_related.right_boundary[env_j, i_agent], 
+                dim=-2,
+                index=last_pts_idx
+            ).squeeze(-2)
     # =========================
     # 核心动作处理/几何解算
     # =========================
