@@ -1,5 +1,30 @@
 from vmas.scenarios.road_traffic import CircularBuffer
 import torch
+
+class OcctConstants:
+    # Predefined constants that may be used during simulations
+    def __init__(
+        self,
+        env_idx_broadcasting: torch.Tensor = None,
+        empty_action_acc: torch.Tensor = None,
+        empty_action_steering: torch.Tensor = None,
+        mask_pos: torch.Tensor = None,
+        mask_vel: torch.Tensor = None,
+        mask_rot: torch.Tensor = None,
+        mask_zero: torch.Tensor = None,
+        mask_one: torch.Tensor = None,
+        reset_agent_min_distance: torch.Tensor = None,
+    ):
+        self.env_idx_broadcasting = env_idx_broadcasting
+        self.empty_action_acc = empty_action_acc
+        self.empty_action_steering = empty_action_steering
+        self.mask_pos = mask_pos
+        self.mask_zero = mask_zero
+        self.mask_one = mask_one
+        self.mask_vel = mask_vel
+        self.mask_rot = mask_rot
+        self.reset_agent_min_distance = reset_agent_min_distance  # The minimum distance between agents when being reset
+
 class OcctNormalizers:
     """Normalizers for positions, velocities, rotations, etc."""
 
@@ -147,7 +172,7 @@ class OcctObservations:
         past_vertices: CircularBuffer = None,
         past_vel: CircularBuffer = None,
         past_short_term_ref_points: CircularBuffer = None,
-        past_action_vel: CircularBuffer = None,
+        past_action_acc: CircularBuffer = None,
         past_action_steering: CircularBuffer = None,
         past_distance_to_ref_path: CircularBuffer = None,
         past_distance_to_boundaries: CircularBuffer = None,
@@ -178,7 +203,7 @@ class OcctObservations:
         self.past_left_boundary = past_left_boundary  # Past left lanelet boundary
         self.past_right_boundary = past_right_boundary  # Past right lanelet boundary
 
-        self.past_action_vel = past_action_vel  # Past velocity action
+        self.past_action_acc = past_action_acc  # Past velocity action
         self.past_action_steering = past_action_steering  # Past steering action
         self.past_distance_to_ref_path = (
             past_distance_to_ref_path  # Past distance to refrence path

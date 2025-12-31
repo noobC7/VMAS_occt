@@ -14,10 +14,10 @@ from vmas.simulator.utils import Color, ScenarioUtils
 
 from vmas.scenarios.road_traffic import get_perpendicular_distances,get_distances_between_agents,get_rectangle_vertices,\
     transform_from_global_to_local_coordinate,interX,exponential_decreasing_fcn,angle_eliminate_two_pi,\
-    Collisions,Distances,Constants,CircularBuffer,Timer,StateBuffer
+    Collisions,Distances,CircularBuffer,Timer,StateBuffer
 # 添加Road类导入
 from vmas.scenarios.occt_map import OcctMap,OcctCRMap,MapBase
-from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalizers,OcctPenalties,OcctThresholds
+from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalizers,OcctPenalties,OcctThresholds,OcctConstants
 
 def get_short_term_reference_path_simple(
     polyline: torch.Tensor,
@@ -212,11 +212,10 @@ class Scenario(BaseScenario):
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", True)
         self.init_arc_pos = kwargs.pop("init_arc_pos", 5.0)
         self.is_rand_init_vel=kwargs.pop("is_rand_init_vel", True)
-        self.init_vel = kwargs.pop("init_vel", 0.0)
+        self.init_vel_mean = kwargs.pop("init_vel_mean", 3.0)
+        self.init_vel_std = kwargs.pop("init_vel_std", 1.0) 
         self.still_space = kwargs.pop("still_space", 10.0)
         self.platoon_tau = kwargs.pop("platoon_tau", 0.0)
-        self.platoon_vel_mean = kwargs.pop("platoon_vel_mean", 3.0)
-        self.platoon_vel_var = kwargs.pop("platoon_vel_var", 1.0) 
         if self.task_class == TaskClass.SIMPLE_PLATOON:
             self.n_followers = self.n_agents
         else:
@@ -309,7 +308,7 @@ class Scenario(BaseScenario):
             batch_dim=B,
             device=device,
             cr_map_dir="/home/yons/Graduation/VMAS_occt/vmas/scenarios_data/cr_maps/debug",
-            max_ref_v=self.platoon_vel_mean,
+            max_ref_v=self.max_speed,
             is_constant_ref_v=True, #TODO: variant ref v perform bad, change to constant
         )
         self.lane_width = self.road.get_lane_width("mean")
@@ -397,11 +396,11 @@ class Scenario(BaseScenario):
             step_begin=time.time(),
             render_begin=0,
         )
-        self.constants = Constants(
+        self.constants = OcctConstants(
             env_idx_broadcasting=torch.arange(
                 batch_dim, device=device, dtype=torch.int32
             ).unsqueeze(-1),
-            empty_action_vel=torch.zeros(
+            empty_action_acc=torch.zeros(
                 (batch_dim, self.n_agents), device=device, dtype=torch.float32
             ),
             empty_action_steering=torch.zeros(
@@ -548,7 +547,7 @@ class Scenario(BaseScenario):
                     dtype=torch.float32,
                 )
             ),
-            past_action_vel = CircularBuffer(
+            past_action_acc = CircularBuffer(
                 torch.zeros(
                     (n_stored_steps, batch_dim, self.n_agents),
                     device=device,
@@ -991,7 +990,6 @@ class Scenario(BaseScenario):
         """
         B = self.batch_dim
         device = self.device
-        
         if env_index is None:
             idx_mask = torch.ones(B, dtype=torch.bool, device=device)
         else:
@@ -999,25 +997,23 @@ class Scenario(BaseScenario):
             idx_mask = torch.zeros(B, dtype=torch.bool, device=device)
             idx_mask[env_index] = True
         
+        # self.road.reset_splines(env_index) #TODO: extremely slow, freezze the map for now
         # 提前获取platoon_vel_batch和platoon_space_batch
-        if self.is_rand_init_vel:
-            self.platoon_vel_batch = self.get_normal_tensor(self.platoon_vel_mean, self.platoon_vel_var)
-            self.platoon_vel_batch = torch.clamp(self.platoon_vel_batch, min=0.0)
-        else:
-            self.platoon_vel_batch = torch.ones(B,device=device) * self.init_vel
+        platoon_vel_batch = self.get_normal_tensor(self.init_vel_mean, self.init_vel_std)
+        self.platoon_vel_batch = torch.clamp(platoon_vel_batch, min=0.0)
         # 1. 随机最后一辆车所在的弧长和间距
         self.platoon_space_batch = self.get_platoon_space(self.platoon_vel_batch)
         spacing = self.platoon_space_batch
         s_buffer = 5.0
         if self.is_rand_arc_pos:
-            last_vehicle_s = torch.clamp(self.get_random_tensor() * self.road.get_s_max(),
-                                        s_buffer * torch.ones(B,device=device),
-                                        self.road.get_s_max() - 2* s_buffer - (self.n_agents - 1) * torch.mean(spacing, dim=-1))# [B]
+            last_vehicle_s = self.get_random_tensor() * self.road.get_s_max()
         else:
             last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos
-
+        last_vehicle_s = torch.clamp(last_vehicle_s, s_buffer * torch.ones(B,device=device),
+                                    self.road.get_s_max() - 2* s_buffer - (self.n_agents - 1) * torch.mean(spacing, dim=-1))
+        
         if self.task_class == TaskClass.OCCT_PLATOON:
-            self.rod_len = (self.n_agents - 1) * torch.mean(spacing, dim=-1)  # [B]
+            self.rod_len = (self.n_agents - 1) * torch.mean(spacing, dim=-1)
             self.s_rear = torch.where(idx_mask, last_vehicle_s, self.s_rear)
             # 3. 计算self.s_front = self.s_rear + rod_len，并夹取到道路合法范围
             s_front_new = self.s_rear + self.rod_len
@@ -1297,7 +1293,7 @@ class Scenario(BaseScenario):
                 sample_interval=self.sample_interval,
                 n_points_shift=1,
             )
-            self.ref_paths_agent_related.short_term[env_j, i_agent, :, 2] = self.platoon_vel_mean
+            self.ref_paths_agent_related.short_term[env_j, i_agent, :, 2] = self.init_vel_mean
 
         if not self.is_observe_distance_to_boundaries:
             # Get nearing points on boundaries
@@ -1333,8 +1329,9 @@ class Scenario(BaseScenario):
             )
         
             #251225 exit segment initialization
-            self.ref_paths_agent_related.exit[env_j, i_agent, 0, :] = self.ref_paths_agent_related.left_boundary[env_j, i_agent, -1, :]
-            self.ref_paths_agent_related.exit[env_j, i_agent, 1, :] = self.ref_paths_agent_related.right_boundary[env_j, i_agent, -1, :]
+            s_max_idx = self.road.get_s_max_idx()[env_j]
+            self.ref_paths_agent_related.exit[env_j, i_agent, 0, :] = self.ref_paths_agent_related.left_boundary[env_j, i_agent, s_max_idx, :]
+            self.ref_paths_agent_related.exit[env_j, i_agent, 1, :] = self.ref_paths_agent_related.right_boundary[env_j, i_agent, s_max_idx, :]
     # =========================
     # 核心动作处理/几何解算
     # =========================
@@ -1862,14 +1859,14 @@ class Scenario(BaseScenario):
 
             # Add new observation - actions & normalize
             if agent.action.u is None:
-                self.observations.past_action_vel.add(self.constants.empty_action_vel)
+                self.observations.past_action_acc.add(self.constants.empty_action_acc)
                 self.observations.past_action_steering.add(
                     self.constants.empty_action_steering
                 )
             else:
-                self.observations.past_action_vel.add(
+                self.observations.past_action_acc.add(
                     torch.stack([a.action.u[:, 0] for a in self.world.agents], dim=1)
-                    / self.normalizers.action_vel
+                    / self.normalizers.action_acc
                 )
                 self.observations.past_action_steering.add(
                     torch.stack([a.action.u[:, 1] for a in self.world.agents], dim=1)
@@ -2689,40 +2686,12 @@ class Scenario(BaseScenario):
         )  # [batch_dim]
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
 
-        # info = {
-        #     "pos": agent.state.pos / self.normalizers.pos_world,
-        #     "rot": angle_eliminate_two_pi(agent.state.rot) / self.normalizers.rot,
-        #     "vel": agent.state.vel / self.normalizers.v,
-        #     "act_vel": (agent.action.u[:, 0] / self.normalizers.action_vel)
-        #     if not is_action_empty
-        #     else self.constants.empty_action_vel[:, agent_index],
-        #     "act_steer": (agent.action.u[:, 1] / self.normalizers.action_steering)
-        #     if not is_action_empty
-        #     else self.constants.empty_action_steering[:, agent_index],
-        #     "ref": (
-        #         self.ref_paths_agent_related.short_term[:, agent_index]
-        #         / self.normalizers.pos_world
-        #     ).reshape(self.world.batch_dim, -1),
-        #     "distance_ref": self.distances.ref_paths[:, agent_index]
-        #     / self.normalizers.distance_ref,
-        #     "distance_left_b": self.distances.left_boundaries[:, agent_index].min(
-        #         dim=-1
-        #     )[0]
-        #     / self.normalizers.distance_lanelet,
-        #     "distance_right_b": self.distances.right_boundaries[:, agent_index].min(
-        #         dim=-1
-        #     )[0]
-        #     / self.normalizers.distance_lanelet,
-        #     "is_collision_with_agents": is_collision_with_agents,
-        #     "is_collision_with_lanelets": is_collision_with_lanelets,
-        # }
-
         info = {
             "pos": agent.state.pos,
             "rot": angle_eliminate_two_pi(agent.state.rot),
             "vel": agent.state.vel,
             "vel_norm": torch.norm(agent.state.vel, dim=-1),
-            "act_acc": (agent.action.u[:, 0]) if not is_action_empty else self.constants.empty_action_vel[:, agent_index],
+            "act_acc": (agent.action.u[:, 0]) if not is_action_empty else self.constants.empty_action_acc[:, agent_index],
             "act_steer": (agent.action.u[:, 1])if not is_action_empty else self.constants.empty_action_steering[:, agent_index],
             "distance_ref": self.distances.ref_paths[:, agent_index],
             "distance_left_b": self.distances.left_boundaries[:, agent_index].min(

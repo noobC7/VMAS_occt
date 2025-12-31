@@ -12,12 +12,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 from torchcubicspline import(natural_cubic_spline_coeffs, 
                                 NaturalCubicSpline)
-
+import time
 import torch.nn.functional as F
 class MapBase(ABC):
     @abstractmethod
     def get_s_max(self) -> Tensor:
         #获取最大弧长参数s_max
+        pass
+    @abstractmethod
+    def get_s_max_idx(self) -> Tensor:
+        #获取最大弧长参数s_max的索引
         pass
     @abstractmethod
     def get_road_center_pts(self) -> Tensor:
@@ -300,7 +304,8 @@ class OcctMap(MapBase):
     
     def get_s_max(self) -> Tensor:
         return self.road_cum_s[:, -1]  # [B]
-    
+    def get_s_max_idx(self) -> Tensor:
+        raise NotImplementedError("get_s_max_idx is not implemented for this map type.")
     def get_tangent_vector(self, s: Tensor) -> Tensor:
         epsilon = 1e-3  # 小扰动值
         max_values = self.road_cum_s[:, -1] - 1e-6  # [B]
@@ -699,24 +704,29 @@ class OcctCRMap(MapBase):
         """
         map_name = self.batch_map_name[env_index]
         return self.scenario_library[map_name]
-    def reset_splines(self):
+    def reset_splines(self, env_index=None):
         """
         生成batch_dim长度的随机整型tensor，范围0到道路库数量-1
         使用torchcubicspline初始化路径样条
         """
-        self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
+        start_time=time.time()
+        print(f"开始reset_splines, env_index: {env_index}")
+        if env_index:
+            self.batch_id[env_index] = torch.randint(0, len(self.path_library), (1,), device=self.device)
+        else:
+            self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
         
         # 准备batch数据
         B = self.batch_dim
         max_path_pts_num = len(self.max_path_s_list)
         
         # 初始化batch数据
-        self.batch_s = torch.zeros(B, max_path_pts_num, device=self.device)
+        self.batch_s = torch.empty(B, max_path_pts_num, device=self.device).fill_(float('nan'))
         self.batch_center_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
         self.batch_left_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
         self.batch_right_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
         self.batch_ref_v = torch.empty(B, max_path_pts_num, 1, device=self.device).fill_(float('nan'))
-        self.batch_s_max = torch.zeros(B, device=self.device)
+        self.batch_s_max = torch.empty(B, device=self.device).fill_(float('nan'))
         self.batch_map_name = [None]*B
         max_s_len=0
         max_s_len_id=0
@@ -736,8 +746,22 @@ class OcctCRMap(MapBase):
             self.batch_right_vertices[batch_idx, :length] = path_data["right_vertices"]
             self.batch_s_max[batch_idx] = s_max
             self.batch_ref_v[batch_idx, :length, 0] = path_data["ref_v"]
-        #print(f"当前batch最大路径长度: {max_s_len} 个顶点，路径ID: {max_s_len_id}")
-
+        # 对长度不足的道路样本进行延伸填充
+        for batch_idx in range(B):
+            current_length = torch.count_nonzero(~torch.isnan(self.batch_center_vertices[batch_idx, :, 0])).item()
+            if current_length < max_path_pts_num:
+                extend_points = max_path_pts_num - current_length
+                for vertex_type in ["center", "left", "right"]:
+                    vertices = getattr(self, f"batch_{vertex_type}_vertices")
+                    last_point = vertices[batch_idx, current_length - 1]
+                    second_last_point = vertices[batch_idx, current_length - 2]
+                    direction = last_point - second_last_point
+                    for i in range(1, extend_points + 1):
+                        new_point = last_point + direction * i
+                        vertices[batch_idx, current_length - 1 + i] = new_point
+                last_ref_v = self.batch_ref_v[batch_idx, current_length - 1]
+                self.batch_ref_v[batch_idx, current_length:] = last_ref_v
+        
         longest_s = self.max_path_s_list
         coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_center_vertices)
         self.center_splines = NaturalCubicSpline(coeffs)
@@ -747,6 +771,8 @@ class OcctCRMap(MapBase):
         self.right_splines = NaturalCubicSpline(coeffs)
         coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_ref_v)
         self.ref_v_splines = NaturalCubicSpline(coeffs)
+        end_time=time.time()
+        print(f"结束reset_splines, cost time: {end_time-start_time}")
 
     def compute_curvature_2d(
         self, 
@@ -852,12 +878,6 @@ class OcctCRMap(MapBase):
         smooth_curvature = smooth_curvature_flat.reshape(t.shape)
         
         return smooth_curvature
-    def reset_batch_id(self):
-        """
-        重置batch_id并更新并行路径库
-        """
-        self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
-        self._reset_splines()
     
     def get_pts(self, s: Tensor, env_j: int = None) -> Tensor:
         p = self.center_splines.evaluate(s)
@@ -892,7 +912,10 @@ class OcctCRMap(MapBase):
     
     def get_s_max(self) -> Tensor:
         return self.batch_s_max
-    
+    def get_s_max_idx(self) -> Tensor:
+        s_max_mask = ~torch.isnan(self.batch_s)
+        s_max_idx = self.batch_s.shape[1] - 1 - torch.argmax(torch.flip(s_max_mask.int(), dims=[1]), dim=1)
+        return s_max_idx
     def get_road_center_pts(self) -> Tensor:
         return self.batch_center_vertices
     
@@ -1276,5 +1299,5 @@ if __name__ == "__main__":
     # road = OcctMap(batch_dim=1, device=device)
     # road.plot_road_debug()
 
-    road = OcctCRMap(batch_dim=1, cr_map_dir="vmas/scenarios_data/cr_maps/debug",min_lane_width=3, device=device, sample_gap=1, is_constant_ref_v=True)
-    road.plot_road_debug()
+    road = OcctCRMap(batch_dim=200, cr_map_dir="vmas/scenarios_data/cr_maps/debug",min_lane_width=3, device=device, sample_gap=1, is_constant_ref_v=True)
+    #road.plot_road_debug()
