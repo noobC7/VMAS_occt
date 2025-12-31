@@ -249,16 +249,16 @@ class Scenario(BaseScenario):
         
         # Visualization
         self.visualize_semidims=True
-        self.viewer_zoom = float(kwargs.get("viewer_zoom", 12.0)) #7
+        self.viewer_zoom = float(kwargs.get("viewer_zoom", 8.0)) #7
         self.world_x_dim = kwargs.pop(
-            "world_x_dim", 130
+            "world_x_dim", 150
         )  # The x-dimension of the world in [m]
         self.world_y_dim = kwargs.pop(
-            "world_y_dim", 120
+            "world_y_dim", 100
         )  # The y-dimension of the world in [m]
-        self.resolution_factor = kwargs.pop("resolution_factor", 10)  # Default 200
+        self.resolution_factor = kwargs.pop("resolution_factor", 12)  # Default 200
         self.render_origin = kwargs.pop(
-            "render_origin", [0, 0]
+            "render_origin", [50, -10]
         )
         self.viewer_size = kwargs.pop(
             "viewer_size",
@@ -2744,6 +2744,7 @@ class Scenario(BaseScenario):
             geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in pts.detach().cpu().tolist()],
                                     close=False)
             geom.set_color(*Color.PURPLE.value, alpha=1.0)
+            geom.set_linewidth(3.0)  # 设置左边界线宽度
             geoms.append(geom)
         
             # 使用road对象获取左边界点
@@ -2762,19 +2763,19 @@ class Scenario(BaseScenario):
             geom.set_linewidth(1.0)  # 设置右边界线宽度
             geoms.append(geom)
         k=5 # k=8 correspond to viewer_zoom=12.0
-        for agent_i in range(self.n_agents):
-            pos=self.world.agents[agent_i].state.pos[env_index, :]
-            geom = rendering.TextLine(
-                text=f"{agent_i}",
-                x=(pos[0] / self.world.x_semidim * self.viewer_size[0])/self.viewer_zoom*k+self.viewer_size[0]/2, 
-                y=(pos[1] / self.world.y_semidim * self.viewer_size[1])/self.viewer_zoom*k+self.viewer_size[1]/2,
-                # x=(pos[0] / self.world.x_semidim * self.viewer_size[0]), 
-                # y=(pos[1] / self.world.y_semidim * self.viewer_size[1]),
-                font_size=14,
-            )
-            xform = rendering.Transform()
-            geom.add_attr(xform)
-            geoms.append(geom)
+        # for agent_i in range(self.n_agents):
+        #     pos=self.world.agents[agent_i].state.pos[env_index, :]
+        #     geom = rendering.TextLine(
+        #         text=f"{agent_i}",
+        #         x=(pos[0] / self.world.x_semidim * self.viewer_size[0])/self.viewer_zoom*k+self.viewer_size[0]/2, 
+        #         y=(pos[1] / self.world.y_semidim * self.viewer_size[1])/self.viewer_zoom*k+self.viewer_size[1]/2,
+        #         # x=(pos[0] / self.world.x_semidim * self.viewer_size[0]), 
+        #         # y=(pos[1] / self.world.y_semidim * self.viewer_size[1]),
+        #         font_size=14,
+        #     )
+        #     xform = rendering.Transform()
+        #     geom.add_attr(xform)
+        #     geoms.append(geom)
 
         if hasattr(self, "followers"):
             for agent_i, ag in enumerate(self.followers):
