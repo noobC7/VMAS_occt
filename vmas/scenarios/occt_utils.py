@@ -64,6 +64,7 @@ class OcctRewards:
         reach_intermediate_goal=None,
         reward_track_ref_vel=None,
         reward_track_ref_space=None,
+        reward_track_ref_heading=None,
         reward_track_ref_path=None,
     ):
         self.progress = progress
@@ -73,6 +74,7 @@ class OcctRewards:
         self.reach_intermediate_goal = reach_intermediate_goal
         self.reward_track_ref_vel = reward_track_ref_vel
         self.reward_track_ref_space = reward_track_ref_space
+        self.reward_track_ref_heading = reward_track_ref_heading
         self.reward_track_ref_path = reward_track_ref_path
 
 class OcctPenalties:
@@ -91,6 +93,7 @@ class OcctPenalties:
         backward=None,
         time=None,
         change_steering=None,
+        change_acc=None,
         ref_vel_error=None,
         ref_space_error=None,
     ):
@@ -121,6 +124,7 @@ class OcctPenalties:
         self.change_steering = (
             change_steering  # Penalty for changing steering direction
         )
+        self.change_acc = change_acc  # Penalty for changing acceleration direction
         self.ref_vel_error = ref_vel_error  # Penalty for velocity error relative to reference velocity
         self.ref_space_error = ref_space_error  # Penalty for gap error relative to reference gap (unnormalized)
 class OcctThresholds:
@@ -219,9 +223,9 @@ class OcctObservations:
         )
         self.past_distance_to_agents = (
             past_distance_to_agents  # Past mutual distance between agents
-        )
-    def check_validity(self):
-        for attr_name, attr_value in self.__dict__.items():
-            if isinstance(attr_value, torch.Tensor) and torch.isnan(attr_value).any():
-                nan_indices = torch.nonzero(torch.isnan(attr_value), as_tuple=False)
-                raise ValueError(f"NaN found in self.{attr_name}, index:{nan_indices}")
+    )
+def check_validity(obj):
+    for attr_name, attr_value in obj.__dict__.items():
+        if isinstance(attr_value, torch.Tensor) and torch.isnan(attr_value).any():
+            nan_indices = torch.nonzero(torch.isnan(attr_value), as_tuple=False)
+            raise ValueError(f"NaN found in self.{attr_name}, index:{nan_indices}")

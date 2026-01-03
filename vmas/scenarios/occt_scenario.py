@@ -17,7 +17,7 @@ from vmas.scenarios.road_traffic import get_perpendicular_distances,get_distance
     Collisions,Distances,CircularBuffer,Timer,StateBuffer
 # 添加Road类导入
 from vmas.scenarios.occt_map import OcctMap,OcctCRMap,MapBase
-from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalizers,OcctPenalties,OcctThresholds,OcctConstants
+from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalizers,OcctPenalties,OcctThresholds,OcctConstants,check_validity
 
 def get_short_term_reference_path_simple(
     polyline: torch.Tensor,
@@ -211,7 +211,6 @@ class Scenario(BaseScenario):
         self.use_frenet_ref=kwargs.pop("use_frenet_ref", True)
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", True)
         self.init_arc_pos = kwargs.pop("init_arc_pos", 5.0)
-        self.is_rand_init_vel=kwargs.pop("is_rand_init_vel", True)
         self.init_vel_mean = kwargs.pop("init_vel_mean", 3.0)
         self.init_vel_std = kwargs.pop("init_vel_std", 1.0) 
         self.still_space = kwargs.pop("still_space", 10.0)
@@ -312,6 +311,7 @@ class Scenario(BaseScenario):
             is_constant_ref_v=True, #TODO: variant ref v perform bad, change to constant
         )
         self.lane_width = self.road.get_lane_width("mean")
+        
 
         if self.task_class == TaskClass.OCCT_PLATOON:
             # agent params
@@ -442,7 +442,6 @@ class Scenario(BaseScenario):
                 self.agent_length * 10, device=device, dtype=torch.float32
             ),
         )
-
         self.observations = OcctObservations(
             is_partial=torch.tensor(
                 is_partial_observation, device=device, dtype=torch.bool
@@ -624,20 +623,23 @@ class Scenario(BaseScenario):
                 (batch_dim, self.n_agents), device=device, dtype=torch.int32
             ),
         )
+        n_agents=self.n_agents
         self.reward_details = {
-                           "reward_progress": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "reward_vel": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "reward_goal": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "reward_track_ref_vel": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "reward_track_ref_space": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "reward_track_ref_path": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "penalty_near_boundary": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "penalty_near_other_agents": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "penalty_change_steering": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "penalty_collide_with_agents": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "penalty_outside_boundaries": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           "penalty_backward": torch.zeros((batch_dim), device=device, dtype=torch.float32),
-                           }
+            "reward_progress": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_goal": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_track_ref_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_track_ref_space": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_track_ref_heading": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_track_ref_path": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "penalty_near_boundary": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "penalty_near_other_agents": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "penalty_change_steering": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "penalty_change_acc": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "penalty_collide_with_agents": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "penalty_outside_boundaries": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "penalty_backward": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+        }
 
         # Penalty
         threshold_deviate_from_ref_path = kwargs.pop(
@@ -768,6 +770,9 @@ class Scenario(BaseScenario):
         reward_track_ref_space = (
             kwargs.pop("reward_track_ref_space", 20) / r_p_normalizer
         )
+        reward_track_ref_heading = (
+            kwargs.pop("reward_track_ref_heading", 50) / r_p_normalizer
+        )
         reward_track_ref_path = (
             kwargs.pop("reward_track_ref_path", 50) / r_p_normalizer
         )
@@ -779,6 +784,7 @@ class Scenario(BaseScenario):
             reach_goal=torch.tensor(reward_goal, device=device, dtype=torch.float32),
             reward_track_ref_vel=torch.tensor(reward_track_ref_vel, device=device, dtype=torch.float32),
             reward_track_ref_space=torch.tensor(reward_track_ref_space, device=device, dtype=torch.float32),
+            reward_track_ref_heading=torch.tensor(reward_track_ref_heading, device=device, dtype=torch.float32),
             reward_track_ref_path=torch.tensor(reward_track_ref_path, device=device, dtype=torch.float32),
         )
         self.rew = torch.zeros(batch_dim, device=device, dtype=torch.float32)
@@ -798,6 +804,9 @@ class Scenario(BaseScenario):
         penalty_change_steering = (
             kwargs.pop("penalty_change_steering", -20) / r_p_normalizer
         )
+        penalty_change_acc = (
+            kwargs.pop("penalty_change_acc", -20)
+        )
         penalty_backward = (
             kwargs.pop("penalty_backward", -100) / r_p_normalizer
         ) 
@@ -814,6 +823,7 @@ class Scenario(BaseScenario):
                 penalty_outside_boundaries, device=device, dtype=torch.float32
             ),
             change_steering=torch.tensor(penalty_change_steering, device=device, dtype=torch.float32),
+            change_acc=torch.tensor(penalty_change_acc, device=device, dtype=torch.float32),
             backward=torch.tensor(penalty_backward, device=device, dtype=torch.float32),
         )
 
@@ -917,6 +927,7 @@ class Scenario(BaseScenario):
                         max_acceleration=self.max_acceleration,
                         max_steering_angle=self.max_steering_angle,
                         integration="rk4",  # one of {"euler", "rk4"}
+                        steering_time_constant=0.05,# no delay
                     ),
                 )
             world.add_agent(a)
@@ -1158,7 +1169,7 @@ class Scenario(BaseScenario):
                 if not is_reset_single_agent
                 else agent_index.unsqueeze(0)
             ):
-
+                assert torch.isnan(agents[i_agent].state.pos[env_j, :]).any() == False, f"agent {i_agent} pos is nan"
                 self.reset_init_distances_and_short_term_ref_path(
                     env_j, i_agent, agents
                 )
@@ -1226,6 +1237,7 @@ class Scenario(BaseScenario):
         self.distances.right_boundaries[env_j, i_agent, 0] = center_2_right_b - (
             agents[i_agent].shape.width / 2
         )
+        assert torch.isnan(agents[i_agent].state.pos[env_j, :]).any() == False, f"agent {i_agent} pos is nan"
         # Calculate the positions of the four vertices of the agents
         self.vertices[env_j, i_agent] = get_rectangle_vertices(
             center=agents[i_agent].state.pos[env_j, :],
@@ -1885,7 +1897,6 @@ class Scenario(BaseScenario):
                     torch.stack([a.action.u[:, 1] for a in self.world.agents], dim=1)
                     / self.normalizers.action_steering
                 )
-        self.observations.check_validity()
 
     def observe_self(self, agent_index):
         """Observe the given agent itself."""
@@ -2138,6 +2149,8 @@ class Scenario(BaseScenario):
 
         obs = torch.hstack(obs_all)  # Convert from list to tensor
 
+        check_validity(self.observations)
+        check_validity(self.ref_paths_agent_related)
         if self.is_add_noise:
             # Add sensor noise if required
             return obs + (
@@ -2171,7 +2184,7 @@ class Scenario(BaseScenario):
             A tensor with shape [batch_dim].
         """
         # Initialize
-        reward_details=dict()
+        reward_details=self.reward_details
         self.rew[:] = 0
         # Get the index of the current agent
         agent_index = self.world.agents.index(agent)
@@ -2190,7 +2203,7 @@ class Scenario(BaseScenario):
             )
             * self.penalties.near_boundary
         )
-        reward_details["penalty_near_boundary"] = penalty_near_boundary
+        reward_details["penalty_near_boundary"][:,agent_index] = penalty_near_boundary
         self.rew += penalty_near_boundary
 
         # [penalty] close to other agents
@@ -2202,7 +2215,7 @@ class Scenario(BaseScenario):
         penalty_near_other_agents = (
             torch.sum(mutual_distance_exp_fcn, dim=1) * self.penalties.near_other_agents
         )
-        reward_details["penalty_near_other_agents"] = penalty_near_other_agents
+        reward_details["penalty_near_other_agents"][:,agent_index] = penalty_near_other_agents
         self.rew += penalty_near_other_agents
 
 
@@ -2219,21 +2232,39 @@ class Scenario(BaseScenario):
             - self.thresholds.change_steering,  # Not forget to denormalize
             min=0,
         )
-        steering_change_reward_factor = steering_change / (
-            2 * agent.u_range[1] - 2 * self.thresholds.change_steering
-        )
         penalty_change_steering = (
-            steering_change_reward_factor * self.penalties.change_steering
+            steering_change/torch.deg2rad(torch.tensor(3,device=self.device)) * self.penalties.change_steering
         )
-        reward_details["penalty_change_steering"] = penalty_change_steering
+        reward_details["penalty_change_steering"][:,agent_index] = penalty_change_steering
         self.rew += penalty_change_steering
+
+
+        # [penalty] changing acc too quick
+        acc_current = self.observations.past_action_acc.get_latest(n=1)[
+            :, agent_index
+        ]
+        acc_past = self.observations.past_action_acc.get_latest(n=2)[
+            :, agent_index
+        ]
+
+        acc_change = torch.clamp(
+            (acc_current - acc_past).abs() * self.normalizers.action_acc
+            - self.thresholds.change_acc,  # Not forget to denormalize
+            min=0,
+        )
+        acc_nor=0.1
+        penalty_change_acc = (
+            acc_change/acc_nor * self.penalties.change_acc
+        )
+        reward_details["penalty_change_acc"][:,agent_index] = penalty_change_acc
+        self.rew += penalty_change_acc
 
         # [penalty] colliding with other agents
         is_collide_with_agents = self.collisions.with_agents[:, agent_index]
         penalty_collide_with_agents = (
             is_collide_with_agents.any(dim=-1) * self.penalties.collide_with_agents
         )
-        reward_details["penalty_collide_with_agents"] = penalty_collide_with_agents
+        reward_details["penalty_collide_with_agents"][:,agent_index] = penalty_collide_with_agents
         self.rew += penalty_collide_with_agents
 
         # [penalty] colliding with lanelet boundaries
@@ -2242,7 +2273,7 @@ class Scenario(BaseScenario):
             is_collide_with_lanelets * self.penalties.collide_with_boundaries
         )
         #251228: if vehicle out of boundary, also add penalty
-        reward_details["penalty_outside_boundaries"] = penalty_outside_boundaries
+        reward_details["penalty_outside_boundaries"][:,agent_index] = penalty_outside_boundaries
         self.rew += penalty_outside_boundaries
 
         # [penalty/reward] time
@@ -2263,7 +2294,7 @@ class Scenario(BaseScenario):
             torch.where(v_proj <= 0, 1, 0)
             * self.penalties.backward
         )
-        reward_details["penalty_backward"] = backward_penalty
+        reward_details["penalty_backward"][:,agent_index] = backward_penalty
         self.rew += backward_penalty
 
         # [reward] forward movement
@@ -2288,21 +2319,21 @@ class Scenario(BaseScenario):
             / (agent.max_speed * self.world.dt)
             * self.rewards.progress
         )
-        reward_details["reward_progress"] = reward_progress
+        reward_details["reward_progress"][:,agent_index] = reward_progress
         self.rew += reward_progress  # Relative to the maximum possible movement
 
         # [reward] high velocity
         
         reward_vel = v_proj / agent.max_speed * self.rewards.higth_v
 
-        reward_details["reward_vel"] = reward_vel
+        reward_details["reward_vel"][:,agent_index] = reward_vel
         self.rew += reward_vel
 
         # [reward] reach goal
         reward_goal = (
             self.collisions.with_exit_segments[:, agent_index] * self.rewards.reach_goal
         )
-        reward_details["reward_goal"] = reward_goal
+        reward_details["reward_goal"][:,agent_index] = reward_goal
         self.rew += reward_goal  # Relative to the maximum possible movement
 
         # [reward] 编队跟踪
@@ -2320,8 +2351,8 @@ class Scenario(BaseScenario):
             #     x1=ref_vel+1e-8,
             # )
             reward_track_ref_vel = 1 - (error_vel/ref_vel)**2
-            reward_details["reward_track_ref_vel"] = self.rewards.reward_track_ref_vel * reward_track_ref_vel
-            reward_details["reward_track_ref_space"] = torch.zeros_like(reward_track_ref_vel)
+            reward_details["reward_track_ref_vel"][:,agent_index] = self.rewards.reward_track_ref_vel * reward_track_ref_vel
+            reward_details["reward_track_ref_space"][:,agent_index] = torch.zeros_like(reward_track_ref_vel)
             self.rew += reward_track_ref_vel
         else:
             # DonNan University Design: when error less then threshold, negative pow2 reward, otherwise, reward acc when error>0, decrease when error<0
@@ -2336,58 +2367,102 @@ class Scenario(BaseScenario):
             nonacceptable_reward = 2.5*(abs(last_space_errors)-abs(space_errors))
             reward_track_ref_space[acceptable_space_agent] = acceptable_reward[acceptable_space_agent]
             reward_track_ref_space[~acceptable_space_agent] = nonacceptable_reward[~acceptable_space_agent]
-            reward_details["reward_track_ref_space"] = self.rewards.reward_track_ref_space * reward_track_ref_space
-            reward_details["reward_track_ref_vel"] = torch.zeros_like(reward_track_ref_space)
+            reward_details["reward_track_ref_space"][:,agent_index] = self.rewards.reward_track_ref_space * reward_track_ref_space
+            reward_details["reward_track_ref_vel"][:,agent_index] = torch.zeros_like(reward_track_ref_space)
             self.rew += reward_track_ref_space
         """
-
-        reward_track_ref_vel = 1 - (error_vel/ref_vel)**2
-        reward_details["reward_track_ref_vel"] = self.rewards.reward_track_ref_vel * reward_track_ref_vel
+        
+        reward_track_ref_vel = 1 - torch.abs(error_vel) if agent_index==0 else torch.ones_like(error_vel)
+        reward_details["reward_track_ref_vel"][:,agent_index] = self.rewards.reward_track_ref_vel * reward_track_ref_vel
         self.rew += reward_track_ref_vel
         
-        leader_index = 0
-        leader_ref_vel = self.ref_paths_agent_related.short_term[:, leader_index, 0, 2]
-        leader_vel = self.observations.error_vel[:, leader_index] + leader_ref_vel
+        # leader_index = 0
+        # leader_ref_vel = self.ref_paths_agent_related.short_term[:, leader_index, 0, 2]
+        # leader_vel = self.observations.error_vel[:, leader_index] + leader_ref_vel
         agent_vel = error_vel + ref_vel
-        error_vel = agent_vel - leader_vel
+        #error_vel = agent_vel - leader_vel
+        error_vel = agent_vel - ref_vel
         reward_track_ref_space = torch.zeros_like(self.platoon_space_batch,device=self.device)
-        acceptable_space_agent = (torch.abs(space_errors)<space_threshold) & (torch.abs(error_vel)<vel_threshold)
-        acceptable_reward = 1 - (0.5*error_vel/(ref_vel+1e-8)**2 + 0.125*(space_errors/(space_threshold+1e-8))**2)
-        nonacceptable_reward = 2.5*(abs(last_space_errors)/(space_threshold+1e-8)-abs(space_errors)/(space_threshold+1e-8))
+        acceptable_space_agent = (torch.abs(space_errors)<space_threshold)# & (torch.abs(error_vel)<vel_threshold)
+        #acceptable_reward = 1 - (0.5*error_vel/(ref_vel+1e-8)**2 + 0.125*(space_errors/(space_threshold+1e-8))**2)
+        acceptable_reward = 1 - 0.25*abs(space_errors)
+        nonacceptable_reward = torch.clamp(10*(abs(last_space_errors)-abs(space_errors)),min=-1.0,max=1.0)
         reward_track_ref_space[acceptable_space_agent] = acceptable_reward[acceptable_space_agent]
         reward_track_ref_space[~acceptable_space_agent] = nonacceptable_reward[~acceptable_space_agent]
-        reward_details["reward_track_ref_space"] = self.rewards.reward_track_ref_space * reward_track_ref_space
+        reward_details["reward_track_ref_space"][:,agent_index] = self.rewards.reward_track_ref_space * reward_track_ref_space
         self.rew += reward_track_ref_space
         # [reward] 横向跟踪
         ref_vector = torch.mean(ref_points_vecs,dim=1) # or ref_points_vecs[:,0,:]
         ref_vector_normalized = ref_vector / (torch.norm(ref_vector, dim=-1, keepdim=True) + 1e-8)
         move_vector = move_vec[:,0,:]
         move_vector_normalized = move_vector/ (torch.norm(move_vector, dim=-1, keepdim=True) + 1e-8)
-        constant_k=1/(1-3**0.5/2)
+        max_delta_angle=torch.deg2rad(torch.tensor(15, device=self.device, dtype=torch.float32))
+        constant_k=1/(1-torch.cos(max_delta_angle))
         costant_b=1-constant_k
-        cosine_similarity = constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b
+        reward_track_ref_heading = self.rewards.reward_track_ref_heading * \
+                                   (constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b)
+        reward_track_ref_heading = 1 - self.rewards.reward_track_ref_heading * \
+                                   torch.abs(torch.acos(torch.clamp(torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0))/max_delta_angle)
+        reward_details["reward_track_ref_heading"][:,agent_index] =  reward_track_ref_heading
+        self.rew += reward_track_ref_heading
+
         reward_track_ref_path = (
-            cosine_similarity +
             1 - self.distances.ref_paths[:, agent_index]
-            / (self.distances.left_boundaries[:, agent_index, 0] + 
-               self.distances.right_boundaries[:, agent_index, 0] - 
-               self.agent_width)/2
+            / (0.5*self.lane_width)
             ) * self.rewards.reward_track_ref_path
-        reward_details["reward_track_ref_path"] = reward_track_ref_path
+        reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
         self.rew += reward_track_ref_path
 
-        # normalize reward
-        reward_details_mean_sum=sum([torch.abs(torch.mean(v)) for v in reward_details.values()])
-        for k,v in reward_details.items():
-            # if "penalty" in k:
-            #     assert torch.mean(v) <= 0, f"{k} should be negative"
-            # TODO:AssertionError: reward_progress should be positive
-            # elif "reward" in k:
-            #     assert torch.mean(v) >= 0, f"{k} should be positive"
-            assert torch.isnan(v).any() == False, f"{k} should not be nan"
-            #reward_details[k] /= reward_details_mean_sum+1e-8
+        REWARD_MAX_THRESHOLD = 10.0    # 奖励最大值阈值（超过则异常）
+        REWARD_MIN_THRESHOLD = -10.0   # 奖励最小值阈值（低于则异常）
+        PRINT_DETAILED_INDEX = True     # 是否打印异常值的具体索引（True=打印，False=只打印key）
+        # 遍历每个奖励项，检测异常
+        for k, v in reward_details.items():
+            # 1. 检查NaN（保留你原有的断言）
+            v=v[:,agent_index]
+            assert not torch.isnan(v).any(), f"{k} contains NaN values!"
+            
+            # 2. 计算关键统计信息（方便定位异常）
+            v_mean = torch.mean(v).item()
+            v_max = torch.max(v).item()
+            v_min = torch.min(v).item()
+            
+            # 3. 检测异常值（超出阈值）
+            has_overflow = False
+            overflow_info = {}
+            if v_max > REWARD_MAX_THRESHOLD or v_min < REWARD_MIN_THRESHOLD:
+                has_overflow = True
+                overflow_info = {
+                    "key": k,
+                    "mean": round(v_mean, 4),
+                    "max": round(v_max, 4),
+                    "min": round(v_min, 4),
+                    "threshold": (REWARD_MIN_THRESHOLD, REWARD_MAX_THRESHOLD)
+                }
+            
+            # 4. 触发异常时打印详细信息
+            if has_overflow:
+                # 打印基础信息
+                print(f"\n⚠️ 异常奖励检测！Key: {k}")
+                print(f"  均值: {overflow_info['mean']}, 最大值: {overflow_info['max']}, 最小值: {overflow_info['min']}")
+                print(f"  阈值范围: [{REWARD_MIN_THRESHOLD}, {REWARD_MAX_THRESHOLD}]")
+                
+                # 可选：打印异常值的具体索引和数值（精准定位样本）
+                if PRINT_DETAILED_INDEX:
+                    # 找到所有超出阈值的位置
+                    max_mask = v > REWARD_MAX_THRESHOLD
+                    min_mask = v < REWARD_MIN_THRESHOLD
+                    all_overflow_mask = max_mask | min_mask
+                    
+                    # 获取异常值的索引和数值
+                    overflow_indices = torch.where(all_overflow_mask)
+                    overflow_values = v[all_overflow_mask].cpu().numpy()  # 转numpy方便打印
+                    
+                    print(f"  异常值数量: {len(overflow_values)}")
+                    print(f"  异常值索引（前10个）: {overflow_indices[0][:10].cpu().numpy() if len(overflow_indices[0])>0 else '无'}")
+                    print(f"  异常值数值（前10个）: {overflow_values[:10]}")
+
         # [update] previous positions and short-term reference paths
-        self.reward_details = reward_details
         self.update_state_after_rewarding(agent_index)
 
         return self.rew
@@ -2435,7 +2510,7 @@ class Scenario(BaseScenario):
                 time.time()
             )  # Set to the current time as the begin of the current time step
             self.timer.step += 1  # Increment step by 1
-
+            assert torch.isnan(agent.state.pos).any() == False, f"agent {agent_index} pos is nan"
             # Update distances between agents
             self.distances.agents = get_distances_between_agents(
                 self=self, is_set_diagonal=True
@@ -2443,7 +2518,7 @@ class Scenario(BaseScenario):
             self.collisions.with_agents[:] = False  # Reset
             self.collisions.with_lanelets[:] = False  # Reset
             self.collisions.with_exit_segments[:] = False  # Reset
-
+            
             for a_i in range(self.n_agents):
                 self.vertices[:, a_i] = get_rectangle_vertices(
                     center=self.world.agents[a_i].state.pos,
@@ -2698,6 +2773,12 @@ class Scenario(BaseScenario):
             dim=-1
         )  # [batch_dim]
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
+        agent_error_space=self.observations.error_space.get_latest()[:, agent_index,:]
+        agent_reward_details = {}
+        for reward_name, reward_tensor in self.reward_details.items():
+            # reward_tensor 维度：(batch_dim, n_agents) → 提取当前智能体的列
+            # 结果维度：(batch_dim,)，与info中其他字段（如pos/vel）维度对齐
+            agent_reward_details[reward_name] = reward_tensor[:, agent_index]
 
         info = {
             "pos": agent.state.pos,
@@ -2715,11 +2796,11 @@ class Scenario(BaseScenario):
             )[0],
             "is_collision_with_agents": is_collision_with_agents,
             "is_collision_with_lanelets": is_collision_with_lanelets,
-            "mean_error_space": self.observations.error_space.get_latest().mean(-1).mean(-1),
-            "error_space": self.observations.error_space.get_latest(),
-            "error_vel": self.observations.error_vel,
+            "mean_error_space": agent_error_space.mean(-1),
+            "error_space": agent_error_space,
+            "error_vel": self.observations.error_vel[:, agent_index],
             "ref_vel": self.ref_paths_agent_related.short_term[:, :, 0, 2],
-            **self.reward_details 
+            **agent_reward_details,
             }
         
         return info
