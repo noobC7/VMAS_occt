@@ -56,6 +56,9 @@ class DelayedSteeringKinematicBicycle(Dynamics):
         }
 
     def f(self, state, acceleration, target_delta):
+        assert torch.isnan(state).any() == False, f"state is nan"
+        assert torch.isnan(acceleration).any() == False, f"acceleration is nan"
+        assert torch.isnan(target_delta).any() == False, f"target_delta is nan"
         # State now includes: [x, y, theta, v, delta]
         theta = state[:, 2]  # Yaw angle
         v = state[:, 3]  # Linear velocity
@@ -72,8 +75,9 @@ class DelayedSteeringKinematicBicycle(Dynamics):
         dv = acceleration
         # Calculate steering rate using first-order inertia model
         ddelta = (target_delta - delta) / self.steering_time_constant
-        
-        return torch.stack((dx, dy, dtheta, dv, ddelta), dim=1)  # [batch_size,5]
+        new_state = torch.stack((dx, dy, dtheta, dv, ddelta), dim=1)  # [batch_size,5]
+        assert torch.isnan(new_state).any() == False, f"new_state is nan"
+        return new_state
     
     def euler(self, state, acceleration, target_delta):
         # Calculate the change in state using Euler's method
