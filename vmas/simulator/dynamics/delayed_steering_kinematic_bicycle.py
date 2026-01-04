@@ -46,14 +46,7 @@ class DelayedSteeringKinematicBicycle(Dynamics):
         self.cur_delta = None  # Actual steering angle state (with delay)
 
         # For debugging and visualization
-        self.history = {
-            'pos': [],
-            'yaw': [],
-            'vel': [],
-            'delta': [],
-            'target_delta': [],
-            'acc': [],
-        }
+        self.reset_history()
 
     def f(self, state, acceleration, target_delta):
         assert torch.isnan(state).any() == False, f"state is nan"
@@ -291,7 +284,7 @@ def simulate_simple_test():
         l_r=l_r,
         max_steering_angle=max_delta,
         max_acceleration=5.0,
-        steering_time_constant=0.2,  # 转向执行器时间常数，调整此值可改变延迟程度
+        steering_time_constant=0.1,  # 转向执行器时间常数，调整此值可改变延迟程度
         integration="rk4"
     )
     
