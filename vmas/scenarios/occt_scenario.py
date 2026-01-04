@@ -87,6 +87,7 @@ def get_short_term_reference_path_by_s(
     sample_interval: int = 2,
     return_ref_v: bool = False,
     env_j: int = None,
+    line: str = "center",
 ):
     """
     Args:
@@ -100,22 +101,19 @@ def get_short_term_reference_path_by_s(
         device = torch.device("cpu")
     B=agent_s.shape[0] if agent_s.dim() else 1
     short_term_path=torch.zeros((B, n_points_to_return , 3 if return_ref_v else 2), device=device, dtype=torch.float32)
-    for i in range(n_points_to_return):
-        short_term_path[:, i, :2] = occt_map.get_pts(agent_s+i*sample_interval,env_j)
-        if return_ref_v:
-            ref_v = occt_map.get_ref_v(agent_s+i*sample_interval,env_j)
-            if ref_v.dim()==2:
-                short_term_path[:, i, 2] = ref_v.squeeze(dim=1)
-            elif ref_v.dim()==1:
-                short_term_path[:, i, 2] = ref_v
-            else:
-                raise ValueError(f"ref_v should be either [batch_size, 1] or [batch_size] or [1], but got {ref_v.shape}")
+    agent_s_query=torch.stack([agent_s+i*sample_interval for i in range(n_points_to_return)],dim=-1)
+    ref_pts = occt_map.get_pts(agent_s_query,env_j, line)
+    short_term_path[:, :, :2] = ref_pts
+    if return_ref_v:
+        ref_v = occt_map.get_ref_v(agent_s_query, env_j).squeeze(dim=-1)
+        short_term_path[:, :, 2] = ref_v
+    
     has_nan = torch.isnan(short_term_path).any(dim=(1, 2))
     nan_sample_indices = torch.nonzero(has_nan).squeeze(dim=1)
-    if len(nan_sample_indices):
-        print(f"包含NaN的样本索引：{nan_sample_indices}")
-        print(f"共有 {len(nan_sample_indices)} 个样本包含NaN")
-        assert True, "Some samples have NaN points in the short-term reference path!"
+    # if len(nan_sample_indices):
+    #     print(f"包含NaN的样本索引：{nan_sample_indices}")
+    #     print(f"共有 {len(nan_sample_indices)} 个样本包含NaN")
+    #     assert True, "Some samples have NaN points in the short-term reference path!"
     if agent_s.dim()==0:
         return short_term_path[0,...]
     return short_term_path
@@ -199,6 +197,14 @@ class Scenario(BaseScenario):
         return self.still_space+self.platoon_tau*platoon_vel
     
     def init_params(self, batch_dim: int, device: torch.device, **kwargs):
+        # 建议在类的__init__中初始化计时字典
+        self.reset_total_time = 0.0
+        self.reward_update_time=0.0
+        self.reset_count=0
+        self.time_records = {
+            "total": 0.0,          # 函数总耗时
+            "reset_agents_loop": 0.0,   # 10. 重置智能体循环（距离/碰撞）
+        }
         # world params
         self.device = device
         self.batch_dim = batch_dim
@@ -272,7 +278,7 @@ class Scenario(BaseScenario):
             "max_steering_angle",
             torch.deg2rad(torch.tensor(35, device=device, dtype=torch.float32)),
         )
-        self.max_acceleration = float(kwargs.get("max_acceleration", 5.0))
+        self.max_acceleration = float(kwargs.get("max_acceleration", 3.0))
         self.max_steering_rate = kwargs.pop(
             "max_steering_rate",
             torch.deg2rad(torch.tensor(35, device=device, dtype=torch.float32)),
@@ -927,8 +933,22 @@ class Scenario(BaseScenario):
                         max_acceleration=self.max_acceleration,
                         max_steering_angle=self.max_steering_angle,
                         integration="rk4",  # one of {"euler", "rk4"}
-                        steering_time_constant=0.05,# no delay
+                        steering_time_constant=0.1,# with delay
                     ),
+                    # 260104 try control front wheel angle rate, but very difficult, 
+                    # vehicle always collide with boundary, 
+                    # lead to frequent reset which slow down the training time(2 times)\
+                    # finally give up.
+                    # dynamics=DynamicKinematicBicycle(
+                    #     world,
+                    #     width=self.agent_width,
+                    #     l_f=self.l_f,
+                    #     l_r=self.l_r,
+                    #     max_steering_angle=self.max_steering_angle,
+                    #     max_steering_rate=self.max_steering_rate,
+                    #     max_acceleration=self.max_acceleration,
+                    #     integration="rk4",  # one of {"euler", "rk4"}
+                    # ),
                 )
             world.add_agent(a)
             self.followers.append(a)
@@ -999,22 +1019,31 @@ class Scenario(BaseScenario):
         :param env_index: index of the environment to reset. If None a vectorized reset should be performed
         :param agent_index: index of the agent to reset. If None all agents in the specified environment will be reset.
         """
+        # ============== 总计时开始 ==============
+        total_start = time.time()
         B = self.batch_dim
         device = self.device
+
+        # ============== 阶段1：初始化idx_mask ==============
+        stage1_start = time.time()
         if env_index is None:
             idx_mask = torch.ones(B, dtype=torch.bool, device=device)
         else:
             self._check_batch_index(env_index)  # 如果你沿用 VMAS 的检查
             idx_mask = torch.zeros(B, dtype=torch.bool, device=device)
             idx_mask[env_index] = True
-        
-        # self.road.reset_splines(env_index) #TODO: extremely slow, freezze the map for now
+
+        # ============== 阶段2：生成车队速度/间距 ==============
+        stage2_start = time.time()
         # 提前获取platoon_vel_batch和platoon_space_batch
         platoon_vel_batch = self.get_normal_tensor(self.init_vel_mean, self.init_vel_std)
         self.platoon_vel_batch = torch.clamp(platoon_vel_batch, min=0.0)
         # 1. 随机最后一辆车所在的弧长和间距
         self.platoon_space_batch = self.get_platoon_space(self.platoon_vel_batch)
         spacing = self.platoon_space_batch
+
+        # ============== 阶段3：计算最后一辆车弧长 ==============
+        stage3_start = time.time()
         s_buffer = 5.0
         if self.is_rand_arc_pos:
             last_vehicle_s = self.get_random_tensor() * self.road.get_s_max()
@@ -1022,7 +1051,9 @@ class Scenario(BaseScenario):
             last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos
         last_vehicle_s = torch.clamp(last_vehicle_s, s_buffer * torch.ones(B,device=device),
                                     self.road.get_s_max() - 2* s_buffer - (self.n_agents - 1) * torch.mean(spacing, dim=-1))
-        
+
+        # ============== 阶段4：OCCT_PLATOON核心逻辑 ==============
+        stage4_start = time.time()
         if self.task_class == TaskClass.OCCT_PLATOON:
             self.rod_len = (self.n_agents - 1) * torch.mean(spacing, dim=-1)
             self.s_rear = torch.where(idx_mask, last_vehicle_s, self.s_rear)
@@ -1030,7 +1061,6 @@ class Scenario(BaseScenario):
             s_front_new = self.s_rear + self.rod_len
             s_front_clamped = torch.clamp(s_front_new, max=self.road.get_s_max() - 1e-6)
             self.s_front = torch.where(idx_mask, s_front_clamped, self.s_front)
-
 
             p_front = self.road.get_pts(self.s_front)    # [B,2]
             p_rear = self.road.get_pts(self.s_rear)     # [B,2]
@@ -1080,9 +1110,11 @@ class Scenario(BaseScenario):
 
             # 给一个初始的 target（free 也写当前位姿，post_step 会用 mask 过滤）
             self.compute_latch_targets()
+
+        # ============== 阶段5：生成横向偏移/航向误差 ==============
+        stage5_start = time.time()
         F = self.n_followers
         # 3. 随机横向偏移（0-2）
-
         lateral_offset = torch.rand(B, F, device=device) * (self.lane_width-self.agent_width)/2 * 0  # [B, F]
         # 随机方向（左右）
         lateral_direction = torch.sign(torch.randn(B, F, device=device))  # [B, F]
@@ -1093,7 +1125,9 @@ class Scenario(BaseScenario):
         # 随机方向（正负）
         heading_direction = torch.sign(torch.randn(B, F, device=device))  # [B, F]
         heading_error = heading_error * heading_direction  # [B, F] 弧度
-        
+
+        # ============== 阶段6：计算所有车辆弧长 ==============
+        stage6_start = time.time()
         # 计算每辆车的弧长位置
         vehicle_s = torch.zeros(B, F, device=device)  # [B, F]
         if self.task_class == TaskClass.OCCT_PLATOON:
@@ -1108,8 +1142,13 @@ class Scenario(BaseScenario):
         # 确保所有车辆的弧长都在道路的有效范围内
         vehicle_s = torch.clamp(vehicle_s, max=self.road.get_s_max()[:, None].expand(-1, F) - 1e-6) #BUG FIXED: produce nan pos
 
+        # ============== 阶段7：记录agent_s ==============
+        stage7_start = time.time()
         # 251224: record arch of agents for closest ref pts
         self.observations.agent_s[env_index] = vehicle_s[env_index] #BUG FIX： asynchronous update of agent_s instead of self.observations.agent_s = vehicle_s
+
+        # ============== 阶段8：计算车辆位置/方向 ==============
+        stage8_start = time.time()
         # 计算每辆车的位置和方向
         # 获取道路坐标
         vehicle_pos = self.road.get_pts(vehicle_s)  # [B, F, 2]
@@ -1125,7 +1164,9 @@ class Scenario(BaseScenario):
         
         # 应用航向角误差
         vehicle_theta = road_theta + heading_error  # [B, F]
-        
+
+        # ============== 阶段9：设置跟随车状态 ==============
+        stage9_start = time.time()
         # 设置车辆状态
         for i, ag in enumerate(self.followers):
             if hasattr(ag.state, "pos"):
@@ -1138,6 +1179,8 @@ class Scenario(BaseScenario):
                 vy = self.platoon_vel_batch[idx_mask] * torch.sin(vehicle_theta[idx_mask, i])
                 ag.state.vel[idx_mask] = torch.stack([vx, vy], dim=-1)
 
+        # ============== 阶段10：重置智能体循环（距离/碰撞） ==============
+        stage10_start = time.time()
         agents = self.world.agents
 
         is_reset_single_agent = agent_index is not None
@@ -1164,6 +1207,7 @@ class Scenario(BaseScenario):
             else:
                 env_j = env_i
 
+            tmp_t=time.time()
             for i_agent in (
                 range(self.n_followers) #251226 revise: old version is self.n_agents
                 if not is_reset_single_agent
@@ -1185,7 +1229,10 @@ class Scenario(BaseScenario):
             self.collisions.with_agents[env_j, :, :] = False
             self.collisions.with_lanelets[env_j, :] = False
             self.collisions.with_exit_segments[env_j, :] = False
+        self.time_records["reset_agents_loop"] = time.time() - stage10_start
 
+        # ============== 阶段11：重置状态缓冲区 ==============
+        stage11_start = time.time()
         # Reset the state buffer
         self.state_buffer.reset()
         state_add = torch.cat(
@@ -1197,6 +1244,28 @@ class Scenario(BaseScenario):
             dim=-1,
         )
         self.state_buffer.add(state_add)  # Add new state
+        self.time_records["state_buffer"] = time.time() - stage11_start
+
+        # ============== 总计时结束 + 输出耗时报告 ==============
+        self.time_records["total"] = time.time() - total_start
+        self.reset_total_time += self.time_records["total"]
+        # 输出各阶段耗时（建议每调用10次函数输出一次，避免刷屏）
+        # if self.reset_count % self.batch_dim == 0 or self.time_records["total"]>0.5:
+        #     print(f"reset_world_at time:{time.time() - total_start:.6f},total time:{self.reset_total_time:.6f}s")
+        self.reset_count += 1
+        if env_index is None:
+            self._print_time_report()
+
+    def _print_time_report(self):
+        """输出各阶段耗时报告，按耗时从高到低排序"""
+        print("\n========== reset_world_at 耗时分析 ==========")
+        # 按耗时降序排序
+        sorted_records = sorted(self.time_records.items(), key=lambda x: x[1], reverse=True)
+        total = self.time_records["total"]
+        for stage, cost in sorted_records:
+            ratio = (cost / total) * 100 if total > 0 else 0
+            print(f"{stage:20s}: {cost:.6f}s ({ratio:.2f}%)")
+        print("=============================================\n")
 
     def reset_init_distances_and_short_term_ref_path(self, env_j, i_agent, agents):
         """
@@ -1204,6 +1273,7 @@ class Scenario(BaseScenario):
         and computes the positions of the four vertices of the agent. It also determines the short-term reference paths
         for the agent based on the long-term reference paths and the agent's current position.
         """
+        tmp_t=time.time()
         # Distance from the center of gravity (CG) of the agent to its reference path
         (
             self.distances.ref_paths[env_j, i_agent],
@@ -1246,6 +1316,9 @@ class Scenario(BaseScenario):
             length=agents[i_agent].shape.length,
             is_close_shape=True,
         )
+        #print(f"get_rectangle_vertices, time_cost: {time.time()-tmp_t:.6f}s")
+        tmp_t=time.time()
+
         # Distances from the four vertices of the agent to its left and right lanelet boundary
         for c_i in range(4):
             (
@@ -1274,6 +1347,8 @@ class Scenario(BaseScenario):
             ),
             dim=-1,
         )
+        #print(f"get_perpendicular_distances, time_cost: {time.time()-tmp_t:.6f}s")
+        tmp_t = time.time()
         # Get the short-term reference paths
         if self.use_frenet_ref:
             self.ref_paths_agent_related.short_term[env_j, i_agent] = \
@@ -1307,39 +1382,64 @@ class Scenario(BaseScenario):
             )
             self.ref_paths_agent_related.short_term[env_j, i_agent, :, 2] = self.init_vel_mean
 
+        #print(f"get_short_term time_cost: {time.time()-tmp_t:.6f}s")
+        tmp_t = time.time()
         if not self.is_observe_distance_to_boundaries:
             # Get nearing points on boundaries
-            (
-                self.ref_paths_agent_related.nearing_points_left_boundary[
-                    env_j, i_agent
-                ],
-                _,
-            ) = get_short_term_reference_path_simple(
-                polyline=self.ref_paths_agent_related.left_boundary[env_j, i_agent],
-                index_closest_point=self.distances.closest_point_on_left_b[
-                    env_j, i_agent
-                ],
-                n_points_to_return=self.n_points_nearing_boundary,
-                device=self.world.device,
-                sample_interval=self.sample_interval,
-                n_points_shift=1,
-            )
-            (
-                self.ref_paths_agent_related.nearing_points_right_boundary[
-                    env_j, i_agent
-                ],
-                _,
-            ) = get_short_term_reference_path_simple(
-                polyline=self.ref_paths_agent_related.right_boundary[env_j, i_agent],
-                index_closest_point=self.distances.closest_point_on_right_b[
-                    env_j, i_agent
-                ],
-                n_points_to_return=self.n_points_nearing_boundary,
-                device=self.world.device,
-                sample_interval=self.sample_interval,
-                n_points_shift=1,
-            )
-        
+            if self.use_frenet_ref:
+                self.ref_paths_agent_related.nearing_points_left_boundary[env_j, i_agent] = \
+                    get_short_term_reference_path_by_s(
+                        self.road,
+                        self.observations.agent_s[env_j, i_agent],
+                        n_points_to_return=self.n_points_nearing_boundary,
+                        device=self.world.device,
+                        sample_interval=self.sample_interval,
+                        return_ref_v=False,
+                        env_j=env_j,
+                        line="left",
+                    )
+                self.ref_paths_agent_related.nearing_points_right_boundary[env_j, i_agent] = \
+                    get_short_term_reference_path_by_s(
+                        self.road,
+                        self.observations.agent_s[env_j, i_agent],
+                        n_points_to_return=self.n_points_nearing_boundary,
+                        device=self.world.device,
+                        sample_interval=self.sample_interval,
+                        return_ref_v=False,
+                        env_j=env_j,
+                        line="right",
+                    )
+            else:
+                (
+                    self.ref_paths_agent_related.nearing_points_left_boundary[
+                        env_j, i_agent
+                    ],
+                    _,
+                ) = get_short_term_reference_path_simple(
+                    polyline=self.ref_paths_agent_related.left_boundary[env_j, i_agent],
+                    index_closest_point=self.distances.closest_point_on_left_b[
+                        env_j, i_agent
+                    ],
+                    n_points_to_return=self.n_points_nearing_boundary,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    n_points_shift=1,
+                )
+                (
+                    self.ref_paths_agent_related.nearing_points_right_boundary[
+                        env_j, i_agent
+                    ],
+                    _,
+                ) = get_short_term_reference_path_simple(
+                    polyline=self.ref_paths_agent_related.right_boundary[env_j, i_agent],
+                    index_closest_point=self.distances.closest_point_on_right_b[
+                        env_j, i_agent
+                    ],
+                    n_points_to_return=self.n_points_nearing_boundary,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    n_points_shift=1,
+                )
             #251231 exit segment initialization
             s_max_idx = self.road.get_s_max_idx()[env_j]
             if s_max_idx.dim():
@@ -2192,7 +2292,10 @@ class Scenario(BaseScenario):
         if agent_index>=self.n_followers:
             return self.rew
         # [update] mutual distances between agents, vertices of each agent, and collision matrices
+        t0=time.time()
         self.update_state_before_rewarding(agent, agent_index)
+        t1=time.time()
+        #print(f"update_state_before_rewarding, agent_index: {agent_index}, time: {t1-t0:.6f}s")
 
         # [penalty] close to lanelet boundaries
         penalty_near_boundary = (
@@ -2233,7 +2336,7 @@ class Scenario(BaseScenario):
             min=0,
         )
         penalty_change_steering = (
-            steering_change/torch.deg2rad(torch.tensor(3,device=self.device)) * self.penalties.change_steering
+            (steering_change/torch.deg2rad(torch.tensor(3,device=self.device)))**2 * self.penalties.change_steering
         )
         reward_details["penalty_change_steering"][:,agent_index] = penalty_change_steering
         self.rew += penalty_change_steering
@@ -2254,7 +2357,7 @@ class Scenario(BaseScenario):
         )
         acc_nor=0.1
         penalty_change_acc = (
-            acc_change/acc_nor * self.penalties.change_acc
+            (acc_change/acc_nor)**2 * self.penalties.change_acc
         )
         reward_details["penalty_change_acc"][:,agent_index] = penalty_change_acc
         self.rew += penalty_change_acc
@@ -2372,8 +2475,8 @@ class Scenario(BaseScenario):
             self.rew += reward_track_ref_space
         """
         
-        reward_track_ref_vel = 1 - torch.abs(error_vel) if agent_index==0 else torch.ones_like(error_vel)
-        reward_details["reward_track_ref_vel"][:,agent_index] = self.rewards.reward_track_ref_vel * reward_track_ref_vel
+        reward_track_ref_vel = 1 - self.rewards.reward_track_ref_vel* (error_vel)**2
+        reward_details["reward_track_ref_vel"][:,agent_index] =  reward_track_ref_vel
         self.rew += reward_track_ref_vel
         
         # leader_index = 0
@@ -2385,11 +2488,11 @@ class Scenario(BaseScenario):
         reward_track_ref_space = torch.zeros_like(self.platoon_space_batch,device=self.device)
         acceptable_space_agent = (torch.abs(space_errors)<space_threshold)# & (torch.abs(error_vel)<vel_threshold)
         #acceptable_reward = 1 - (0.5*error_vel/(ref_vel+1e-8)**2 + 0.125*(space_errors/(space_threshold+1e-8))**2)
-        acceptable_reward = 1 - 0.25*abs(space_errors)
+        acceptable_reward = 1 - self.rewards.reward_track_ref_space *(space_errors)**2
         nonacceptable_reward = torch.clamp(10*(abs(last_space_errors)-abs(space_errors)),min=-1.0,max=1.0)
         reward_track_ref_space[acceptable_space_agent] = acceptable_reward[acceptable_space_agent]
         reward_track_ref_space[~acceptable_space_agent] = nonacceptable_reward[~acceptable_space_agent]
-        reward_details["reward_track_ref_space"][:,agent_index] = self.rewards.reward_track_ref_space * reward_track_ref_space
+        reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
         self.rew += reward_track_ref_space
         # [reward] 横向跟踪
         ref_vector = torch.mean(ref_points_vecs,dim=1) # or ref_points_vecs[:,0,:]
@@ -2413,8 +2516,8 @@ class Scenario(BaseScenario):
         reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
         self.rew += reward_track_ref_path
 
-        REWARD_MAX_THRESHOLD = 10.0    # 奖励最大值阈值（超过则异常）
-        REWARD_MIN_THRESHOLD = -10.0   # 奖励最小值阈值（低于则异常）
+        REWARD_MAX_THRESHOLD = 1.0    # 奖励最大值阈值（超过则异常）
+        REWARD_MIN_THRESHOLD = -100.0   # 奖励最小值阈值（低于则异常）
         PRINT_DETAILED_INDEX = True     # 是否打印异常值的具体索引（True=打印，False=只打印key）
         # 遍历每个奖励项，检测异常
         for k, v in reward_details.items():
@@ -2461,10 +2564,15 @@ class Scenario(BaseScenario):
                     print(f"  异常值数量: {len(overflow_values)}")
                     print(f"  异常值索引（前10个）: {overflow_indices[0][:10].cpu().numpy() if len(overflow_indices[0])>0 else '无'}")
                     print(f"  异常值数值（前10个）: {overflow_values[:10]}")
-
+        t2=time.time()
+        #print(f"reward calc, agent_index: {agent_index}, time: {t2-t1:.6f}s")
         # [update] previous positions and short-term reference paths
         self.update_state_after_rewarding(agent_index)
+        t3=time.time()
+        #print(f"update_state_after_rewarding, agent_index: {agent_index}, time: {t3-t2:.6f}s")
 
+        self.reward_update_time += t3-t0
+        #print(f"reward_update_time_total: {self.reward_update_time:.6f}s")
         return self.rew
     def is_point_left_of_polyline(self, point, polyline):
         """
@@ -2656,7 +2764,7 @@ class Scenario(BaseScenario):
                     device=self.world.device,
                     sample_interval=self.sample_interval,
                     return_ref_v=True,
-                    
+
                 )
             # debug_dis=torch.linalg.norm(self.world.agents[agent_index].state.pos-self.ref_paths_agent_related.short_term[:,agent_index,0,:2],dim=-1)
             # if torch.mean(debug_dis) > self.lane_width/2:
@@ -2687,37 +2795,61 @@ class Scenario(BaseScenario):
 
         
         if not self.is_observe_distance_to_boundaries:
-            # Get nearing points on boundaries
-            (
-                self.ref_paths_agent_related.nearing_points_left_boundary[
-                    :, agent_index
-                ],
-                _,
-            ) = get_short_term_reference_path_simple(
-                polyline=self.ref_paths_agent_related.left_boundary[:, agent_index],
-                index_closest_point=self.distances.closest_point_on_left_b[
-                    :, agent_index
-                ],
-                n_points_to_return=self.n_points_nearing_boundary,
-                device=self.world.device,
-                sample_interval=self.sample_interval,
-                n_points_shift=-2,
-            )
-            (
-                self.ref_paths_agent_related.nearing_points_right_boundary[
-                    :, agent_index
-                ],
-                _,
-            ) = get_short_term_reference_path_simple(
-                polyline=self.ref_paths_agent_related.right_boundary[:, agent_index],
-                index_closest_point=self.distances.closest_point_on_right_b[
-                    :, agent_index
-                ],
-                n_points_to_return=self.n_points_nearing_boundary,
-                device=self.world.device,
-                sample_interval=self.sample_interval,
-                n_points_shift=-2,
-            )
+            if self.use_frenet_ref:
+                # Get nearing points on boundaries
+                self.ref_paths_agent_related.nearing_points_left_boundary[:, agent_index] = \
+                    get_short_term_reference_path_by_s(
+                    self.road,
+                    self.observations.agent_s[:, agent_index],
+                    n_points_to_return=self.n_points_nearing_boundary,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    return_ref_v=False,
+                    line='left',
+                )
+                self.ref_paths_agent_related.nearing_points_right_boundary[:, agent_index] = \
+                    get_short_term_reference_path_by_s(
+                    self.road,
+                    self.observations.agent_s[:, agent_index],
+                    n_points_to_return=self.n_points_nearing_boundary,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    return_ref_v=False,
+                    line='right',
+                )
+            else:
+                # Get nearing points on boundaries
+                (
+                    self.ref_paths_agent_related.nearing_points_left_boundary[
+                        :, agent_index
+                    ],
+                    _,
+                ) = get_short_term_reference_path_simple(
+                    polyline=self.ref_paths_agent_related.left_boundary[:, agent_index],
+                    index_closest_point=self.distances.closest_point_on_left_b[
+                        :, agent_index
+                    ],
+                    n_points_to_return=self.n_points_nearing_boundary,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    n_points_shift=-2,
+                )
+                (
+                    self.ref_paths_agent_related.nearing_points_right_boundary[
+                        :, agent_index
+                    ],
+                    _,
+                ) = get_short_term_reference_path_simple(
+                    polyline=self.ref_paths_agent_related.right_boundary[:, agent_index],
+                    index_closest_point=self.distances.closest_point_on_right_b[
+                        :, agent_index
+                    ],
+                    n_points_to_return=self.n_points_nearing_boundary,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    n_points_shift=-2,
+                )
+
     
     def done(self):
         """
@@ -2786,7 +2918,7 @@ class Scenario(BaseScenario):
             "vel": agent.state.vel,
             "vel_norm": torch.norm(agent.state.vel, dim=-1),
             "act_acc": (agent.action.u[:, 0]) if not is_action_empty else self.constants.empty_action_acc[:, agent_index],
-            "act_steer": (agent.action.u[:, 1])if not is_action_empty else self.constants.empty_action_steering[:, agent_index],
+            "act_steer": (agent.action.u[:, 1]) if not is_action_empty else self.constants.empty_action_steering[:, agent_index],
             "distance_ref": self.distances.ref_paths[:, agent_index],
             "distance_left_b": self.distances.left_boundaries[:, agent_index].min(
                 dim=-1
