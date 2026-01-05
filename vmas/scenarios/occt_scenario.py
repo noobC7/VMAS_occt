@@ -2484,7 +2484,7 @@ class Scenario(BaseScenario):
         acceptable_space_agent = (torch.abs(space_errors)<space_threshold)# & (torch.abs(error_vel)<vel_threshold)
         #acceptable_reward = 1 - (0.5*error_vel/(ref_vel+1e-8)**2 + 0.125*(space_errors/(space_threshold+1e-8))**2)
         acceptable_reward = 1 - self.rewards.reward_track_ref_space *(space_errors)**2
-        nonacceptable_reward = torch.clamp(10*(abs(last_space_errors)-abs(space_errors)),min=-1.0,max=1.0)
+        nonacceptable_reward = self.rewards.reward_track_ref_space * torch.clamp(10*(abs(last_space_errors)-abs(space_errors)),min=-1.0,max=1.0)
         reward_track_ref_space[acceptable_space_agent] = acceptable_reward[acceptable_space_agent]
         reward_track_ref_space[~acceptable_space_agent] = nonacceptable_reward[~acceptable_space_agent]
         reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
