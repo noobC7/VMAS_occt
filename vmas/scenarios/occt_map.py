@@ -587,7 +587,9 @@ class OcctCRMap(MapBase):
                     "left_vertices": [],
                     "right_vertices": []
                 }
-                if not (path_ids[0]==128 and path_ids[-1]==106):
+                # if not (path_ids[0]==128 and path_ids[-1]==106):
+                #     continue
+                if not (path_ids[0]==102 and path_ids[-1]==175):
                     continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
@@ -636,12 +638,12 @@ class OcctCRMap(MapBase):
                 coeffs = natural_cubic_spline_coeffs(center_cum_len, center_vertices)
                 center_splines = NaturalCubicSpline(coeffs)
                 center_curvature = self.compute_curvature_2d(center_splines, s, smooth_distance=10)
-                factor=0.2
+                factor=0.3
                 if self.is_constant_ref_v:
                     ref_v = self.max_ref_v * torch.ones_like(center_curvature)
                 else:
                     ref_v = torch.clamp_max(factor * 1.0 / torch.sqrt(center_curvature+1e-8)**2, self.max_ref_v) 
-                    ref_v = self.gaussian_smooth_1d(ref_v, sigma=5.0)
+                    ref_v = self.gaussian_smooth_1d(ref_v, sigma=8.0)
                 assert len(resampled_center) == len(ref_v), "重采样后的中心路径长度与参考速度长度不一致"
                 # 保存重采样后的路径数据
                 self.path_library.append({
@@ -931,13 +933,12 @@ class OcctCRMap(MapBase):
     
     def get_road_right_pts(self) -> Tensor:
         return self.batch_right_vertices 
-    
     def plot_road_debug(self):
         from commonroad.visualization.mp_renderer import MPRenderer, DynamicObstacleParams
         from matplotlib.collections import LineCollection
         from matplotlib.colors import Normalize
         import matplotlib.pyplot as plt
-
+        font_size = 16
         # 创建图形和MPRenderer
         fig1, ax1 = plt.subplots(figsize=(8, 7))  # 增加宽度以容纳颜色条
         rnd = MPRenderer(ax=ax1)
@@ -958,6 +959,7 @@ class OcctCRMap(MapBase):
         # 遍历所有路径
         for path_id, path_data in enumerate(self.path_library):
             map_name = path_data["map_name"]
+            path_ids = path_data["path_ids"]
             center_vertices = path_data["center_vertices"].detach().cpu().numpy()
             left_vertices = path_data["left_vertices"].detach().cpu().numpy()
             right_vertices = path_data["right_vertices"].detach().cpu().numpy()
@@ -986,7 +988,7 @@ class OcctCRMap(MapBase):
                 
                 # 创建颜色映射（彩虹色系）
                 norm = Normalize(vmin=ref_v.min(), vmax=ref_v.max())
-                lc = LineCollection(segments, cmap='viridis', norm=norm, linewidth=linewidth, linestyle='--', zorder=20)
+                lc = LineCollection(segments, cmap='viridis', norm=norm, linewidth=linewidth, linestyle='--', zorder=19)
                 
                 # 根据ref_v为线段分配颜色
                 lc.set_array(ref_v)
@@ -995,16 +997,16 @@ class OcctCRMap(MapBase):
                 line = rnd.ax.add_collection(lc)
                 
                 # 添加颜色条
-                cbar = fig1.colorbar(line, ax=ax1, shrink=0.8, pad=0.05)
-                cbar.set_label('Reference Velocity (m/s)', fontsize=16)
+                cbar = fig1.colorbar(line, ax=ax1, shrink=0.7, pad=0.05)
+                cbar.set_label('Reference Velocity (m/s)', fontsize=font_size)
                 cbar.ax.tick_params(labelsize=14)
                 
                 # 设置坐标轴
-                rnd.ax.set_xlabel("x/m", fontsize=20)
-                rnd.ax.set_ylabel("y/m", fontsize=20)
+                rnd.ax.set_xlabel("x/m", fontsize=font_size)
+                rnd.ax.set_ylabel("y/m", fontsize=font_size)
                 rnd.ax.tick_params(axis='both', direction='in', labelsize=16, top=False, right=False)
-                rnd.ax.set_title(f"Path {path_id + 1}, Width=({min(lane_width):.2f},{np.mean(lane_width):.2f},{max(lane_width):.2f})m, Len={s[-1]:.2f}m", fontsize=14) 
-                
+                rnd.ax.set_title(f"Path {path_id + 1}, Width=({min(lane_width):.2f},{np.mean(lane_width):.2f},{max(lane_width):.2f})m, Len={s[-1]:.2f}m\npath_ids={path_ids}",
+                                  fontsize=font_size, zorder=20) 
                 # 暂停以显示
                 plt.pause(0.01)
                 
@@ -1020,286 +1022,12 @@ class OcctCRMap(MapBase):
                 ax2.plot(s, ref_v, 'b', label='Reference Velocity', zorder=20)
                 ax2.set_xlabel("s/m", fontsize=20)
                 ax2.set_ylabel("v/m/s", fontsize=20)
-                ax2.tick_params(axis='both', direction='in', labelsize=16, top=False, right=False)
-                ax2.set_title(f"Path {path_id + 1}: Reference Velocity", fontsize=18)
+                ax2.tick_params(axis='both', direction='in', labelsize=font_size, top=False, right=False)
+                ax2.set_title(f"Path {path_id + 1}: Reference Velocity", fontsize=font_size)
                 ax2.legend(fontsize=14)
                 plt.pause(0.01)
                 fig2_path = f"{self.vis_dir}/fig2_{path_id:04d}_{i:04d}.svg"
                 fig2.savefig(fig2_path, dpi=300, format="svg", bbox_inches='tight')
-                
-    # def plot_road_debug(self):
-    #     from commonroad.visualization.mp_renderer import MPRenderer, DynamicObstacleParams
-
-    #     fig1, ax1 = plt.subplots(figsize=(7, 7))
-    #     rnd = MPRenderer(ax=ax1)
-    #     rnd.draw_params.dynamic_obstacle.draw_icon = True
-    #     rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
-    #     rnd.draw_params.dynamic_obstacle.show_label = False
-    #     rnd.draw_params.dynamic_obstacle.state.draw_arrow=False
-    #     rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
-    #     rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD" #darkgreen
-    #     ego_params = DynamicObstacleParams()
-    #     ego_params.draw_icon = True
-    #     ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
-    #     ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400" #mediumblue
-    #     ego_params.vehicle_shape.occupancy.shape.zorder = 20
-    #     #for name, scenario in self.scenario_library:
-        
-    #     for path_id, path_data in enumerate(self.path_library):
-    #         map_name=path_data["map_name"]
-    #         center_vertices=path_data["center_vertices"]
-    #         left_vertices=path_data["left_vertices"]
-    #         right_vertices=path_data["right_vertices"]
-    #         ref_v=path_data["ref_v"]
-                
-    #         scenario=self.scenario_library[map_name]
-    #         for i in range(0,1):
-    #             rnd.draw_params.time_begin=i
-    #             rnd.draw_params.time_end=i
-    #             ego_params.time_begin = i
-    #             ego_params.time_end=i
-    #             scenario.draw(rnd)
-    #             rnd.render(show=True)
-
-    #             rnd.ax.plot(center_vertices[:, 0], center_vertices[:, 1], 'purple',linestyle='--', label='Road Center Line',zorder=20)
-    #             rnd.ax.plot(left_vertices[:, 0], left_vertices[:, 1], 'r', label='Left Boundary',zorder=20)
-    #             rnd.ax.plot(right_vertices[:, 0], right_vertices[:, 1], 'b', label='Right Boundary',zorder=20)
-    #             rnd.ax.set_xlabel("x/m",fontsize=20,)
-    #             rnd.ax.set_ylabel("y/m",fontsize=20,)
-    #             rnd.ax.tick_params(axis='both', direction='in',labelsize=16, top=False, right=False)
-    #             #rnd.ax.set_title(f"scenario {scenario_id}")
-                
-    #             plt.pause(0.0001)
-    #             fig1_path = f"{self.vis_dir}/fig1_{path_id:04d}_{i:04d}.svg"
-    #             fig1.savefig(fig1_path,dpi=300,format="svg")
-                
-    
-    # def simulate(self):
-
-    #     road = OcctCRMap(batch_dim=1, device=device)
-    #     hv_ref=MapCcosyRef(self.cfg)
-    #     for target_dict in target_scenario_dict[1:2]:
-    #         scenario_id=target_dict["scenario_id"]
-    #         scenario=self.interactive_scenarios[scenario_id]
-    #         ego_id=target_dict["ego_id"]
-    #         #scenario=self.scenario_filter(scenario,include_ids=[162,171,173]+[ego_id])
-    #         time_offset=target_dict["time_offset"]
-    #         goal_pos=target_dict["goal_pos"]
-    #         focus_sv_ids=target_dict["focus_sv_ids"]
-    #         ego_abc_str = hv_ref.classify_obs_route(scenario.obstacle_by_id(ego_id))#next(k for k, v in self.interactive_id_pairs[scenario_id].items() if v == ego_id)
-    #         self.init_hv_planners(scenario,time_offset,ego_id)
-    #         ev_shadow=scenario.obstacle_by_id(ego_id)    
-    #         ego_ref_v=target_dict.get("ref_v",4)
-    #         from map_ccosy_ref_ego import MapCcosyRefEgo
-    #         ego_ref=MapCcosyRefEgo(self.cfg)
-    #         ego_planner=EVPlanner(cfg=self.cfg,
-    #                               scenario=scenario,
-    #                               dt=0.1,
-    #                               raw_obs=ev_shadow,
-    #                               ref_v=ego_ref_v,
-    #                               simulator=self,
-    #                               abc_str=ego_abc_str,
-    #                               hv_ref=ego_ref,
-    #                               goal_pos=goal_pos,
-    #                               time_offset=time_offset,
-    #                               fix_sv_num=True)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
-    #         self.ego_vehicle_id=ego_planner.vehicle_id
-    #         self.planners[self.ego_vehicle_id]=ego_planner
-    #         raw_obs_dict={obs.obstacle_id:obs for obs in scenario.obstacles}
-    #         raw_obs_dict.update({self.ego_vehicle_id:ev_shadow})
-    #         scenario.remove_obstacle(ev_shadow)
-    #         fig1, ax1 = plt.subplots(figsize=(7, 7))
-    #         fig_vel, ax_vel = plt.subplots(3,1, figsize=(6,10))
-            
-    #         fig2, ax_list = plt.subplots(3,2, figsize=(10,12), sharex=True)
-    #         rnd = MPRenderer(plot_limits=target_dict["plot_limits"],ax=ax1)
-    #         rnd.draw_params.dynamic_obstacle.draw_icon = True
-    #         rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
-    #         rnd.draw_params.dynamic_obstacle.show_label = False
-    #         rnd.draw_params.dynamic_obstacle.state.draw_arrow=False
-    #         rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
-    #         rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD" #darkgreen
-    #         ego_params = DynamicObstacleParams()
-    #         ego_params.draw_icon = True
-    #         ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
-    #         ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400" #mediumblue
-    #         ego_params.vehicle_shape.occupancy.shape.zorder = 20
-    #         interact_params=DynamicObstacleParams()
-    #         interact_params.draw_icon = True
-    #         interact_params.vehicle_shape.occupancy.shape.facecolor = "white"
-    #         interact_params.vehicle_shape.occupancy.shape.edgecolor = "#A52A2A" #mediumblue
-    #         interact_params.vehicle_shape.occupancy.shape.zorder = 20
-    #         start_time_step=ego_planner.start_time_step
-    #         end_time_step=ego_planner.end_time_step
-    #         for i in range(start_time_step+time_offset,end_time_step):
-    #             t0=time.time()
-    #             plt.figure(fig1.number)
-    #             for planner in self.planners.values():
-    #                 planner.step(i)
-    #             rnd.draw_params.time_begin=i
-    #             rnd.draw_params.time_end=i
-    #             ego_params.time_begin = i
-    #             ego_params.time_end=i
-    #             interact_params.time_begin = i
-    #             interact_params.time_end=i
-    #             scenario.draw(rnd)
-    #             ego_planner.vehicle.draw(rnd,draw_params=ego_params)
-    #             if hasattr(ego_planner,"objective"):
-    #                 for kcv in ego_planner.objective.top_obs_ids:
-    #                     scenario.obstacle_by_id(kcv).draw(rnd,draw_params=interact_params)
-    #             rnd.render(show=True)
-    #             rnd.ax.set_xlabel("x/m",fontsize=20,)
-    #             rnd.ax.set_ylabel("y/m",fontsize=20,)
-    #             rnd.ax.tick_params(axis='both', direction='in',labelsize=16, top=False, right=False)
-    #             #rnd.ax.set_title(f"scenario {scenario_id}")
-    #             for hv_id,hv_planner in self.planners.items():
-    #                 hv_planner.draw_planning_result(ax1,i)
-    #             ego_planner.draw_prediction_result(ax1,i)
-    #             ego_planner.draw_attention_vehicle(ax1,i)
-    #             plt.figure(fig2.number)
-    #             if hasattr(ego_planner,"data_recorder"):
-    #                 ego_planner.data_recorder.plot_sv_state(type(ego_planner)==EVPlanner,focus_sv_ids,start_time_step+time_offset,ax_list,i,600)
-    #                 self.plot_sv_gt_vel(ego_ref_v,focus_sv_ids,start_time_step+time_offset, ax_list[0,0], i, N=600)
-    #                 plt.figure(fig_vel.number)
-    #                 specific_vehicle_ids=[165,168]
-    #                 if False and type(ego_planner)==EVPlanner:
-    #                     ego_planner.data_recorder.plot_velocity_trajectories(ax_vel,i,specific_vehicle_ids)
-    #                     self.plot_hv_vel_traj(ax_vel,specific_vehicle_ids)
-    #             if SHOW_DEBUG:
-    #                 plt.figure(fig1.number)
-    #                 self.plot_obstacle_id(i,scenario,ax1)
-    #             plt.pause(0.0001)
-    #             # 保存三张图为临时文件
-    #             if SAVE_FIG:
-    #                 fig1_path = f"{FIG_SAVE_PATH}/fig1_{i:04d}.svg"
-    #                 fig2_path = f"{FIG_SAVE_PATH}/fig2_{i:04d}.png"
-    #                 fig_vel_path = f"{FIG_SAVE_PATH}/fig_vel_{i:04d}.png"
-    #                 fig1.savefig(fig1_path,dpi=300,format="svg")
-    #                 fig2.savefig(fig2_path,dpi=300)
-    #                 fig_vel.savefig(fig_vel_path,dpi=300)
-                
-    #             if ego_planner.is_finished:
-                    
-    #                 break
-
-    #             plt.pause(0.01)
-    #             t1=time.time()
-    #         plt.pause(1)
-    #         plt.close()
-
-# def ref_path_gen(self):
-
-#     road = OcctCRMap(batch_dim=1, device=device)
-#     hv_ref=MapCcosyRef(self.cfg)
-#     for target_dict in target_scenario_dict[1:2]:
-#         scenario_id=target_dict["scenario_id"]
-#         scenario=self.interactive_scenarios[scenario_id]
-#         ego_id=target_dict["ego_id"]
-#         #scenario=self.scenario_filter(scenario,include_ids=[162,171,173]+[ego_id])
-#         time_offset=target_dict["time_offset"]
-#         goal_pos=target_dict["goal_pos"]
-#         focus_sv_ids=target_dict["focus_sv_ids"]
-#         ego_abc_str = hv_ref.classify_obs_route(scenario.obstacle_by_id(ego_id))#next(k for k, v in self.interactive_id_pairs[scenario_id].items() if v == ego_id)
-#         self.init_hv_planners(scenario,time_offset,ego_id)
-#         ev_shadow=scenario.obstacle_by_id(ego_id)    
-#         ego_ref_v=target_dict.get("ref_v",4)
-#         from map_ccosy_ref_ego import MapCcosyRefEgo
-#         ego_ref=MapCcosyRefEgo(self.cfg)
-#         ego_planner=EVPlanner(cfg=self.cfg,
-#                                 scenario=scenario,
-#                                 dt=0.1,
-#                                 raw_obs=ev_shadow,
-#                                 ref_v=ego_ref_v,
-#                                 simulator=self,
-#                                 abc_str=ego_abc_str,
-#                                 hv_ref=ego_ref,
-#                                 goal_pos=goal_pos,
-#                                 time_offset=time_offset,
-#                                 fix_sv_num=True)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
-#         self.ego_vehicle_id=ego_planner.vehicle_id
-#         self.planners[self.ego_vehicle_id]=ego_planner
-#         raw_obs_dict={obs.obstacle_id:obs for obs in scenario.obstacles}
-#         raw_obs_dict.update({self.ego_vehicle_id:ev_shadow})
-#         scenario.remove_obstacle(ev_shadow)
-#         fig1, ax1 = plt.subplots(figsize=(7, 7))
-#         fig_vel, ax_vel = plt.subplots(3,1, figsize=(6,10))
-        
-#         fig2, ax_list = plt.subplots(3,2, figsize=(10,12), sharex=True)
-#         rnd = MPRenderer(plot_limits=target_dict["plot_limits"],ax=ax1)
-#         rnd.draw_params.dynamic_obstacle.draw_icon = True
-#         rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
-#         rnd.draw_params.dynamic_obstacle.show_label = False
-#         rnd.draw_params.dynamic_obstacle.state.draw_arrow=False
-#         rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
-#         rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD" #darkgreen
-#         ego_params = DynamicObstacleParams()
-#         ego_params.draw_icon = True
-#         ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
-#         ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400" #mediumblue
-#         ego_params.vehicle_shape.occupancy.shape.zorder = 20
-#         interact_params=DynamicObstacleParams()
-#         interact_params.draw_icon = True
-#         interact_params.vehicle_shape.occupancy.shape.facecolor = "white"
-#         interact_params.vehicle_shape.occupancy.shape.edgecolor = "#A52A2A" #mediumblue
-#         interact_params.vehicle_shape.occupancy.shape.zorder = 20
-#         start_time_step=ego_planner.start_time_step
-#         end_time_step=ego_planner.end_time_step
-#         for i in range(start_time_step+time_offset,end_time_step):
-#             t0=time.time()
-#             plt.figure(fig1.number)
-#             for planner in self.planners.values():
-#                 planner.step(i)
-#             rnd.draw_params.time_begin=i
-#             rnd.draw_params.time_end=i
-#             ego_params.time_begin = i
-#             ego_params.time_end=i
-#             interact_params.time_begin = i
-#             interact_params.time_end=i
-#             scenario.draw(rnd)
-#             ego_planner.vehicle.draw(rnd,draw_params=ego_params)
-#             if hasattr(ego_planner,"objective"):
-#                 for kcv in ego_planner.objective.top_obs_ids:
-#                     scenario.obstacle_by_id(kcv).draw(rnd,draw_params=interact_params)
-#             rnd.render(show=True)
-#             rnd.ax.set_xlabel("x/m",fontsize=20,)
-#             rnd.ax.set_ylabel("y/m",fontsize=20,)
-#             rnd.ax.tick_params(axis='both', direction='in',labelsize=16, top=False, right=False)
-#             #rnd.ax.set_title(f"scenario {scenario_id}")
-#             for hv_id,hv_planner in self.planners.items():
-#                 hv_planner.draw_planning_result(ax1,i)
-#             ego_planner.draw_prediction_result(ax1,i)
-#             ego_planner.draw_attention_vehicle(ax1,i)
-#             plt.figure(fig2.number)
-#             if hasattr(ego_planner,"data_recorder"):
-#                 ego_planner.data_recorder.plot_sv_state(type(ego_planner)==EVPlanner,focus_sv_ids,start_time_step+time_offset,ax_list,i,600)
-#                 self.plot_sv_gt_vel(ego_ref_v,focus_sv_ids,start_time_step+time_offset, ax_list[0,0], i, N=600)
-#                 plt.figure(fig_vel.number)
-#                 specific_vehicle_ids=[165,168]
-#                 if False and type(ego_planner)==EVPlanner:
-#                     ego_planner.data_recorder.plot_velocity_trajectories(ax_vel,i,specific_vehicle_ids)
-#                     self.plot_hv_vel_traj(ax_vel,specific_vehicle_ids)
-#             if SHOW_DEBUG:
-#                 plt.figure(fig1.number)
-#                 self.plot_obstacle_id(i,scenario,ax1)
-#             plt.pause(0.0001)
-#             # 保存三张图为临时文件
-#             if SAVE_FIG:
-#                 fig1_path = f"{FIG_SAVE_PATH}/fig1_{i:04d}.svg"
-#                 fig2_path = f"{FIG_SAVE_PATH}/fig2_{i:04d}.png"
-#                 fig_vel_path = f"{FIG_SAVE_PATH}/fig_vel_{i:04d}.png"
-#                 fig1.savefig(fig1_path,dpi=300,format="svg")
-#                 fig2.savefig(fig2_path,dpi=300)
-#                 fig_vel.savefig(fig_vel_path,dpi=300)
-            
-#             if ego_planner.is_finished:
-#                 break
-
-#             plt.pause(0.01)
-#             t1=time.time()
-#         plt.pause(1)
-#         plt.close()
 # try separate each path, but more time cost, deprecated
 class OcctCRMapNew(MapBase):
     def __init__(
@@ -1787,105 +1515,17 @@ class OcctCRMapNew(MapBase):
         return torch.stack([
             self.path_library[self.batch_id[i].item()]["right_vertices"] for i in range(self.batch_dim)
         ], dim=0)
-    def plot_road_debug(self):
-        from commonroad.visualization.mp_renderer import MPRenderer, DynamicObstacleParams
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import Normalize
-        import matplotlib.pyplot as plt
 
-        # 创建图形和MPRenderer
-        fig1, ax1 = plt.subplots(figsize=(8, 7))  # 增加宽度以容纳颜色条
-        rnd = MPRenderer(ax=ax1)
-        fig2, ax2 = plt.subplots(figsize=(8, 7))
-        # 设置渲染参数
-        rnd.draw_params.dynamic_obstacle.draw_icon = True
-        rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
-        rnd.draw_params.dynamic_obstacle.show_label = False
-        rnd.draw_params.dynamic_obstacle.state.draw_arrow=False
-        rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
-        rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD"  # darkblue
-        ego_params = DynamicObstacleParams()
-        ego_params.draw_icon = True
-        ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
-        ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400"  # darkgreen
-        ego_params.vehicle_shape.occupancy.shape.zorder = 20
-        
-        # 遍历所有路径
-        for path_id, path_data in enumerate(self.path_library):
-            map_name = path_data["map_name"]
-            center_vertices = path_data["center_vertices"].detach().cpu().numpy()
-            left_vertices = path_data["left_vertices"].detach().cpu().numpy()
-            right_vertices = path_data["right_vertices"].detach().cpu().numpy()
-            ref_v = path_data["ref_v"].detach().cpu().numpy()
-            s = path_data["s"].detach().cpu().numpy()
-            lane_width = path_data["lane_width"]
-            # 获取场景并绘制
-            scenario = self.scenario_library[map_name]
-            for i in range(0, 1):
-                plt.figure(fig1)
-                rnd.draw_params.time_begin = i
-                rnd.draw_params.time_end = i
-                ego_params.time_begin = i
-                ego_params.time_end = i
-                scenario.draw(rnd)
-                rnd.render(show=True)
-                linewidth = 0.3
-                # 绘制左右边界（保持原有颜色）
-                rnd.ax.scatter(left_vertices[:, 0], left_vertices[:, 1], s = 0.5, c = 'r', label='Left Boundary', zorder=20, linewidth=linewidth)
-                rnd.ax.scatter(right_vertices[:, 0], right_vertices[:, 1], s = 0.5, c = 'b', label='Right Boundary', zorder=20, linewidth=linewidth)
-                
-                # 绘制带颜色映射的中心线
-                # 准备线段集合
-                points = center_vertices.reshape(-1, 1, 2)
-                segments = np.concatenate([points[:-1], points[1:]], axis=1)
-                
-                # 创建颜色映射（彩虹色系）
-                norm = Normalize(vmin=ref_v.min(), vmax=ref_v.max())
-                lc = LineCollection(segments, cmap='viridis', norm=norm, linewidth=linewidth, linestyle='--', zorder=20)
-                
-                # 根据ref_v为线段分配颜色
-                lc.set_array(ref_v)
-                
-                # 添加到轴上
-                line = rnd.ax.add_collection(lc)
-                
-                # 添加颜色条
-                cbar = fig1.colorbar(line, ax=ax1, shrink=0.8, pad=0.05)
-                cbar.set_label('Reference Velocity (m/s)', fontsize=16)
-                cbar.ax.tick_params(labelsize=14)
-                
-                # 设置坐标轴
-                rnd.ax.set_xlabel("x/m", fontsize=20)
-                rnd.ax.set_ylabel("y/m", fontsize=20)
-                rnd.ax.tick_params(axis='both', direction='in', labelsize=16, top=False, right=False)
-                rnd.ax.set_title(f"Path {path_id + 1}, Width=({min(lane_width):.2f},{np.mean(lane_width):.2f},{max(lane_width):.2f})m, Len={s[-1]:.2f}m", fontsize=14) 
-                
-                # 暂停以显示
-                plt.pause(0.01)
-                
-                # 保存图像
-                fig1_path = f"{self.vis_dir}/fig1_{path_id:04d}_{i:04d}.svg"
-                fig1.savefig(fig1_path, dpi=300, format="svg", bbox_inches='tight')
-                
-                # 清除颜色条和中心线，准备下一个路径
-                cbar.remove()
-                line.remove()
-                plt.figure(fig2)
-                ax2.clear()
-                ax2.plot(s, ref_v, 'b', label='Reference Velocity', zorder=20)
-                ax2.set_xlabel("s/m", fontsize=20)
-                ax2.set_ylabel("v/m/s", fontsize=20)
-                ax2.tick_params(axis='both', direction='in', labelsize=16, top=False, right=False)
-                ax2.set_title(f"Path {path_id + 1}: Reference Velocity", fontsize=18)
-                ax2.legend(fontsize=14)
-                plt.pause(0.01)
-                fig2_path = f"{self.vis_dir}/fig2_{path_id:04d}_{i:04d}.svg"
-                fig2.savefig(fig2_path, dpi=300, format="svg", bbox_inches='tight')
-                
 if __name__ == "__main__":
     device = torch.device("cuda")
     # road = OcctMap(batch_dim=1, device=device)
     # road.plot_road_debug()
 
-    road = OcctCRMap(batch_dim=200, cr_map_dir="vmas/scenarios_data/cr_maps/debug",max_ref_v=5,min_lane_width=3, device=device, sample_gap=1, is_constant_ref_v=True)
+    road = OcctCRMap(batch_dim=200, 
+                     cr_map_dir="vmas/scenarios_data/cr_maps/debug",
+                     max_ref_v=15/3.6 ,
+                     min_lane_width=3, 
+                     device=device, 
+                     sample_gap=1, 
+                     is_constant_ref_v=False)
     road.plot_road_debug()
