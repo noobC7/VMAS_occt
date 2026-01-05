@@ -1361,11 +1361,6 @@ class Scenario(BaseScenario):
                     return_ref_v=True,
                     env_j=env_j
                 )
-            # check
-            # pos_tmp = agents[i_agent].state.pos[env_j, :]
-            # ref_tmp = self.road.get_pts(self.observations.agent_s[env_j, i_agent],env_j)
-            # dis_tmp = torch.linalg.norm(ref_tmp-pos_tmp,dim=-1)
-            # print(f"reset_init_distances_and_short_term_ref_path,dis_tmp: {torch.mean(dis_tmp)}")
         else:
             (
                 self.ref_paths_agent_related.short_term[env_j, i_agent, :, 0:2],
@@ -2660,11 +2655,11 @@ class Scenario(BaseScenario):
                     is_return_points=False,
                 ).to(self.device)  # [batch_dim]
                 is_left_outside_boundary = self.is_point_left_of_polyline(
-                    point=agent.state.pos,
+                    point=self.world.agents[a_i].state.pos,
                     polyline=self.ref_paths_agent_related.nearing_points_left_boundary[:, a_i],
                 ).to(self.device)
                 is_right_outside_boundary = ~self.is_point_left_of_polyline(
-                    point=agent.state.pos,
+                    point=self.world.agents[a_i].state.pos,
                     polyline=self.ref_paths_agent_related.nearing_points_right_boundary[:, a_i],
                 ).to(self.device)
                 self.collisions.with_lanelets[
@@ -2765,19 +2760,6 @@ class Scenario(BaseScenario):
                     sample_interval=self.sample_interval,
                     return_ref_v=True,
 
-                )
-            # debug_dis=torch.linalg.norm(self.world.agents[agent_index].state.pos-self.ref_paths_agent_related.short_term[:,agent_index,0,:2],dim=-1)
-            # if torch.mean(debug_dis) > self.lane_width/2:
-            #     print(f"update_state_after_rewarding,debug_dis:{torch.mean(debug_dis)}")
-            self.ref_paths_agent_related.short_term[:, agent_index] = \
-                get_short_term_reference_path_by_s(
-                    self.road,
-                    self.observations.agent_s[:, agent_index],
-                    n_points_to_return=self.n_points_short_term,
-                    device=self.world.device,
-                    sample_interval=self.sample_interval,
-                    return_ref_v=True,
-                    
                 )
         else:
             (
