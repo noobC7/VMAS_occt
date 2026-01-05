@@ -2505,14 +2505,14 @@ class Scenario(BaseScenario):
         reward_track_ref_heading = self.rewards.reward_track_ref_heading * \
                                    (constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b)
         reward_track_ref_heading = 1 - self.rewards.reward_track_ref_heading * \
-                                   torch.abs(torch.acos(torch.clamp(torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0))/max_delta_angle)
+                                   torch.abs(torch.acos(torch.clamp(
+                                       torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0
+                                       ))/max_delta_angle)
         reward_details["reward_track_ref_heading"][:,agent_index] =  reward_track_ref_heading
         self.rew += reward_track_ref_heading
 
-        reward_track_ref_path = (
-            1 - self.distances.ref_paths[:, agent_index]
-            / (0.5*self.lane_width)
-            ) * self.rewards.reward_track_ref_path
+        reward_track_ref_path = 1 - (
+            self.distances.ref_paths[:, agent_index] / (0.5*self.lane_width)) * self.rewards.reward_track_ref_path
         reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
         self.rew += reward_track_ref_path
 
@@ -2931,7 +2931,7 @@ class Scenario(BaseScenario):
             "mean_error_space": agent_error_space.mean(-1),
             "error_space": agent_error_space,
             "error_vel": self.observations.error_vel[:, agent_index],
-            "ref_vel": self.ref_paths_agent_related.short_term[:, :, 0, 2],
+            "ref_vel": self.ref_paths_agent_related.short_term[:, agent_index, 0, 2],
             **agent_reward_details,
             }
         
