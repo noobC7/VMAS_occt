@@ -60,40 +60,6 @@ class MapBase(ABC):
         normal_vec = self.get_normal_vector(s)
         normal_theta = torch.atan2(normal_vec[..., 1], normal_vec[..., 0])
         return normal_theta
-    def solve_delta_s(self, s_front: Tensor, L: Tensor, *, max_iter: int = 50, tol: float = 1e-3) -> Tuple[Tensor, Tensor]:
-        """
-        固定弦长二分法求弧长。
-        input:
-            s_front: [B] 前端点弧长
-            L:       [B] 固定弦长（货物长度）
-        return:
-            delta_s:        [B] 解出的 Δs (>=0)
-            infeasible:     [B] 是否无解（弦长过短）
-        """
-        # 预计算前端点坐标
-        lo = torch.zeros_like(s_front) 
-        p_f = self.get_pts(s_front)
-        p_r_hi = self.get_pts(lo) 
-        chord_max = torch.linalg.norm(p_f - p_r_hi, dim=-1)
-        infeasible = (chord_max + 1e-6) < L 
-        
-        hi = s_front
-        for _ in range(max_iter):
-            interval_length = hi - lo
-            
-            if torch.all(interval_length < tol):
-                break
-            
-            mid = 0.5 * (lo + hi)                                             # [B]
-            p_r = self.get_pts(s_front - mid)                                  # [B,2]
-            chord = torch.linalg.norm(p_f - p_r, dim=-1)                      # [B]
-            go_left = chord > L                                               # [B]
-            hi = torch.where(go_left, mid, hi)
-            lo = torch.where(go_left, lo, mid)
-        
-        delta_s = 0.5 * (lo + hi) 
-        delta_s = torch.where(infeasible, torch.zeros_like(delta_s), delta_s)
-        return delta_s, infeasible
     
 class OcctMap(MapBase):
     def __init__(self,
@@ -897,6 +863,19 @@ class OcctCRMap(MapBase):
         return smooth_curvature
     
     def get_pts(self, s: Tensor, env_j: int = None, line: str = "center") -> Tensor:
+        """_summary_
+
+        Args:
+            s (Tensor): arc tensor
+            env_j (int, optional): Env index. Defaults to None.
+            line (str, optional): Defaults to "center".
+
+            case1: s.dim()==0 or s.dim()==1, get pts for env_j if env_j is not None, else get pts for all envs
+            case2: s.dim()==2, get pts for batch
+
+        Returns:
+            Tensor: _description_
+        """
         if line == "center":
             p = self.center_splines.evaluate(s)
         elif line == "left":
@@ -906,9 +885,9 @@ class OcctCRMap(MapBase):
         else:
             raise ValueError(f"未知的line参数: {line}")
         if s.dim()==0 or s.dim()==1:
-            # get pts for env_j
-            assert env_j is not None, "当s的维度为0时，env_j不能为空"
-            return p[env_j]
+            if env_j:
+                return p[env_j]
+            return p
         if s.dim()==2:
             # get pts for batch
             assert self.batch_dim == s.shape[0], "s的批量维度必须与样条批量维度一致"
@@ -950,6 +929,40 @@ class OcctCRMap(MapBase):
     
     def get_road_right_pts(self) -> Tensor:
         return self.batch_right_vertices 
+    def solve_delta_s(self, s_front: Tensor, L: Tensor, *, max_iter: int = 50, tol: float = 1e-3) -> Tuple[Tensor, Tensor]:
+        """
+        固定弦长二分法求弧长。
+        input:
+            s_front: [B] 前端点弧长
+            L:       [B] 固定弦长（货物长度）
+        return:
+            delta_s:        [B] 解出的 Δs (>=0)
+            infeasible:     [B] 是否无解（弦长过短）
+        """
+        # 预计算前端点坐标
+        lo = torch.zeros_like(s_front) 
+        p_f = self.get_pts(s_front[:,None]).squeeze(1)
+        p_r_hi = self.get_pts(lo[:,None]).squeeze(1) 
+        chord_max = torch.linalg.norm(p_f - p_r_hi, dim=-1)
+        infeasible = (chord_max + 1e-6) < L 
+        
+        hi = s_front
+        for _ in range(max_iter):
+            interval_length = hi - lo
+            
+            if torch.all(interval_length < tol):
+                break
+            
+            mid = 0.5 * (lo + hi)                                             # [B]
+            p_r = self.get_pts((s_front - mid)[:,None]).squeeze(1)                                # [B,2]
+            chord = torch.linalg.norm(p_f - p_r, dim=-1)                      # [B]
+            go_left = chord > L                                               # [B]
+            hi = torch.where(go_left, mid, hi)
+            lo = torch.where(go_left, lo, mid)
+        
+        delta_s = 0.5 * (lo + hi) 
+        delta_s = torch.where(infeasible, torch.zeros_like(delta_s), delta_s)
+        return delta_s, infeasible
     def plot_road_debug(self):
         from commonroad.visualization.mp_renderer import MPRenderer, DynamicObstacleParams
         from matplotlib.collections import LineCollection

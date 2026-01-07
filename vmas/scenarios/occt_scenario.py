@@ -208,7 +208,7 @@ class Scenario(BaseScenario):
         # world params
         self.device = device
         self.batch_dim = batch_dim
-        self.task_class=kwargs.pop("task_class", TaskClass.SIMPLE_PLATOON)
+        self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
         self.n_agents=kwargs.pop("n_agents", 3)
         # platoon params
@@ -1016,6 +1016,42 @@ class Scenario(BaseScenario):
         获取OCCT CR地图路径数量
         """
         return len(self.road.path_library)
+    def get_front_rear_pts(self, s_front: Tensor, s_rear: Tensor, env_index: Optional[int] = None) -> Tuple[Tensor, Tensor]:
+        """
+        获取牵引车和末尾车的坐标
+        input:
+            s_front: [B] 牵引车弧长
+            s_rear:  [B] 末尾车弧长
+        return:
+            p_front: [B,2] 牵引车坐标
+            p_rear:  [B,2] 末尾车坐标
+        """
+        front_rear_s = torch.stack([s_front, s_rear], dim=-1)
+        front_rear_pts = self.road.get_pts(front_rear_s, env_index)    # [B,2]
+        p_front = front_rear_pts[:,0,:]    # [B,2,2]
+        p_rear = front_rear_pts[:,1,:]    # [B,2,2]
+        return p_front, p_rear
+    def get_front_rear_tangent(self, s_front: Tensor, s_rear: Tensor, env_index: Optional[int] = None) -> Tuple[Tensor, Tensor]:
+        """
+        获取牵引车和末尾车的切线向量
+        input:
+            s_front: [B] 牵引车弧长
+            s_rear:  [B] 末尾车弧长
+        return:
+            p_front: [B,2] 牵引车切线向量
+            p_rear:  [B,2] 末尾车切线向量
+        """
+        s = torch.stack([s_front, s_rear], dim=-1)
+        """计算道路上弧长s处的切线方向角"""
+        assert s.dim()==2 # shape=[batch_dim,2]
+        epsilon = 1e-3  # 小扰动值
+        max_s = (self.road.get_s_max() - 1e-6)[:,None].expand(-1,2)
+        s_plus = torch.clamp(s + epsilon, max=max_s)
+        pos_plus = self.road.get_pts(s_plus)  # [B,2]
+        pos = self.road.get_pts(s)  # [B,2]
+        tangent_vec = pos_plus - pos
+        tangent_theta = torch.atan2(tangent_vec[..., 1], tangent_vec[..., 0])
+        return tangent_theta
     def reset_world_at(self, env_index: Optional[int] = None, agent_index: Optional[int] = None):
         """
         This function resets the world at the specified env_index and the specified agent_index.
@@ -1067,9 +1103,7 @@ class Scenario(BaseScenario):
             s_front_new = self.s_rear + self.rod_len
             s_front_clamped = torch.clamp(s_front_new, max=self.road.get_s_max() - 1e-6)
             self.s_front = torch.where(idx_mask, s_front_clamped, self.s_front)
-
-            p_front = self.road.get_pts(self.s_front)    # [B,2]
-            p_rear = self.road.get_pts(self.s_rear)     # [B,2]
+            p_front, p_rear = self.get_front_rear_pts(self.s_front, self.s_rear, env_index)
             rod_vec = (p_front - p_rear)           # [B,2]
             rod_theta = torch.atan2(rod_vec[:, 1], rod_vec[:, 0])  # [B]
         
@@ -1092,8 +1126,9 @@ class Scenario(BaseScenario):
                     agent.state.vel[idx_mask] = torch.stack([vx, vy], dim=-1)
             
             # 计算道路切线方向而不是使用货物方向
-            front_theta = self.road_tangent(self.s_front)
-            rear_theta = self.road_tangent(self.s_rear)
+            front_rear_theta = self.road.get_tangent_heading(torch.stack([self.s_front, self.s_rear], dim=-1))
+            front_theta = front_rear_theta[:,0]
+            rear_theta = front_rear_theta[:,1]
             
             # 设置牵引车初始位姿 - 修改：传递完整张量，不再提前过滤
             _set_pose(self.tractor_front, p_front, front_theta, self.platoon_vel_batch)
@@ -1513,8 +1548,7 @@ class Scenario(BaseScenario):
         self.infeasible_mask = infeasible    # 你后面可据此降速/强制 undock，加惩罚等
 
         # ---- 3) 端点坐标与杆朝向 ----
-        p_front = self.road.get_pts(s_front)                                         # [B,2]
-        p_rear  = self.road.get_pts(s_rear)                                          # [B,2]
+        p_front, p_rear = self.get_front_rear_pts(s_front, s_rear) # ([B,2], [B,2])
         rod_vec = p_front - p_rear                                             # [B,2]
         theta_rod = torch.atan2(rod_vec[:, 1], rod_vec[:, 0])                  # [B]
 
@@ -1569,11 +1603,11 @@ class Scenario(BaseScenario):
                 mask=docked_mask,                   # [B]
             )
         # 更新牵引车位置以跟随货物（修改后的版本）
-        p_front = self.road.get_pts(self.s_front)    # [B,2]
-        p_rear  = self.road.get_pts(self.s_rear)     # [B,2]
+        p_front, p_rear = self.get_front_rear_pts(self.s_front, self.s_rear)
         # 计算道路切线方向而不是使用货物方向
-        front_theta = self.road_tangent(self.s_front)
-        rear_theta = self.road_tangent(self.s_rear)
+        front_rear_theta = self.road.get_tangent_heading(torch.stack([self.s_front, self.s_rear], dim=-1))
+        front_theta = front_rear_theta[:,0]
+        rear_theta = front_rear_theta[:,1]
         rod_theta = torch.atan2(p_front[:,1]-p_rear[:,1], p_front[:,0]-p_rear[:,0])  # [B]
         
         # 分别为前后牵引车设置各自的道路切线方向
@@ -1594,18 +1628,6 @@ class Scenario(BaseScenario):
 
         # 计时器（可用于奖励）：每步给 docked 的样本累加 dt
         self.dock_timer += self.dock_state.to(self.dock_timer.dtype) * self.dt
-    # 添加一个方法来计算道路切线方向
-    def road_tangent(self, s: Tensor) -> Tensor:
-        """计算道路上弧长s处的切线方向角"""
-        # 使用小扰动法计算切线方向
-        epsilon = 1e-3  # 小扰动值
-        s_plus = torch.clamp(s + epsilon, max=self.road.get_s_max() - 1e-6)
-        pos_plus = self.road.get_pts(s_plus)  # [B,2]
-        pos = self.road.get_pts(s)  # [B,2]
-        tangent_vec = pos_plus - pos
-        # 计算切线方向角（弧度）
-        tangent_theta = torch.atan2(tangent_vec[:, 1], tangent_vec[:, 0])
-        return tangent_theta
 
     def compute_latch_targets(self):
         """
@@ -2290,14 +2312,15 @@ class Scenario(BaseScenario):
         # Get the index of the current agent
         agent_index = self.world.agents.index(agent)
         # we exclude the front vehicle and end vehicle
-        if agent_index>=self.n_followers:
-            return self.rew
         # [update] mutual distances between agents, vertices of each agent, and collision matrices
         t0=time.time()
         self.update_state_before_rewarding(agent, agent_index)
         t1=time.time()
         #print(f"update_state_before_rewarding, agent_index: {agent_index}, time: {t1-t0:.6f}s")
 
+        if agent_index>=self.n_followers:
+            self.update_state_after_rewarding(agent_index)
+            return self.rew
         # [penalty] close to lanelet boundaries
         penalty_near_boundary = (
             exponential_decreasing_fcn(
@@ -2628,7 +2651,7 @@ class Scenario(BaseScenario):
             self.collisions.with_lanelets[:] = False  # Reset
             self.collisions.with_exit_segments[:] = False  # Reset
             
-            for a_i in range(self.n_agents):
+            for a_i in range(self.n_followers):
                 self.vertices[:, a_i] = get_rectangle_vertices(
                     center=self.world.agents[a_i].state.pos,
                     yaw=self.world.agents[a_i].state.rot,
@@ -2755,7 +2778,8 @@ class Scenario(BaseScenario):
                 dim=-1,
             )
             self.state_buffer.add(state_add)
-        
+        if agent_index >= self.n_followers:
+            return
         if self.use_frenet_ref:
             self.ref_paths_agent_related.short_term[:, agent_index] = \
                 get_short_term_reference_path_by_s(
@@ -2995,96 +3019,91 @@ class Scenario(BaseScenario):
         #     geom.add_attr(xform)
         #     geoms.append(geom)
 
-        if hasattr(self, "followers"):
-            for agent_i, ag in enumerate(self.followers):
-                pos = ag.state.pos[env_index].detach().cpu().tolist()
-                # 中心黑点
-                dot = rendering.make_circle(radius=0.12, filled=True)
-                xf = rendering.Transform()
-                dot.add_attr(xf)
-                xf.set_translation(float(pos[0]), float(pos[1]))
-                dot.set_color(*Color.BLACK.value)  # 黑点
-                geoms.append(dot)
-                # 绘制short_term参考轨迹
-                if hasattr(self, "ref_paths_agent_related") and hasattr(self.ref_paths_agent_related, "short_term"):
-                    # 确保short_term数组维度正确
-                    short_term_path = self.ref_paths_agent_related.short_term[env_index, agent_i]
-                    if torch.linalg.norm(ag.state.pos[env_index]-short_term_path[0,:2])>0.5:
-                        a=1
-                        pass
-                    if short_term_path.shape[0] > 1:  # 确保有足够的点
-                        # 绘制轨迹线
-                        geom = rendering.PolyLine(
-                            v=[(float(p[0]), float(p[1])) for p in short_term_path.detach().cpu().tolist()],
-                            close=False
-                        )
-                        xform = rendering.Transform()
-                        geom.add_attr(xform)
-                        geom.set_color(*self.world.agents[agent_i].color)
-                        geoms.append(geom)
-                        
-                        # 绘制轨迹点
-                        for p in short_term_path:
-                            circle = rendering.make_circle(radius=0.2, filled=True)
-                            xform = rendering.Transform()
-                            circle.add_attr(xform)
-                            xform.set_translation(float(p[0]), float(p[1]))
-                            circle.set_color(*self.world.agents[agent_i].color)
-                            geoms.append(circle)
-                if not self.is_observe_distance_to_boundaries:
-                    # Visualize nearing points on boundaries
-                    # Left boundary
+        for agent_i, ag in enumerate(self.followers):
+            pos = ag.state.pos[env_index].detach().cpu().tolist()
+            # 中心黑点
+            dot = rendering.make_circle(radius=0.12, filled=True)
+            xf = rendering.Transform()
+            dot.add_attr(xf)
+            xf.set_translation(float(pos[0]), float(pos[1]))
+            dot.set_color(*Color.BLACK.value)  # 黑点
+            geoms.append(dot)
+            # 绘制short_term参考轨迹
+            if hasattr(self, "ref_paths_agent_related") and hasattr(self.ref_paths_agent_related, "short_term"):
+                # 确保short_term数组维度正确
+                short_term_path = self.ref_paths_agent_related.short_term[env_index, agent_i]
+                if short_term_path.shape[0] > 1:  # 确保有足够的点
+                    # 绘制轨迹线
                     geom = rendering.PolyLine(
-                        v=self.ref_paths_agent_related.nearing_points_left_boundary[
-                            env_index, agent_i
-                        ],
-                        close=False,
+                        v=[(float(p[0]), float(p[1])) for p in short_term_path.detach().cpu().tolist()],
+                        close=False
                     )
                     xform = rendering.Transform()
                     geom.add_attr(xform)
-                    geom.set_linewidth(2)
                     geom.set_color(*self.world.agents[agent_i].color)
                     geoms.append(geom)
-
-                    for i_p in self.ref_paths_agent_related.nearing_points_left_boundary[
-                        env_index, agent_i
-                    ]:
+                    
+                    # 绘制轨迹点
+                    for p in short_term_path:
                         circle = rendering.make_circle(radius=0.2, filled=True)
                         xform = rendering.Transform()
                         circle.add_attr(xform)
-                        xform.set_translation(i_p[0], i_p[1])
+                        xform.set_translation(float(p[0]), float(p[1]))
                         circle.set_color(*self.world.agents[agent_i].color)
                         geoms.append(circle)
+            if not self.is_observe_distance_to_boundaries:
+                # Visualize nearing points on boundaries
+                # Left boundary
+                geom = rendering.PolyLine(
+                    v=self.ref_paths_agent_related.nearing_points_left_boundary[
+                        env_index, agent_i
+                    ],
+                    close=False,
+                )
+                xform = rendering.Transform()
+                geom.add_attr(xform)
+                geom.set_linewidth(2)
+                geom.set_color(*self.world.agents[agent_i].color)
+                geoms.append(geom)
 
-                    # Right boundary
-                    geom = rendering.PolyLine(
-                        v=self.ref_paths_agent_related.nearing_points_right_boundary[
-                            env_index, agent_i
-                        ],
-                        close=False,
-                    )
+                for i_p in self.ref_paths_agent_related.nearing_points_left_boundary[
+                    env_index, agent_i
+                ]:
+                    circle = rendering.make_circle(radius=0.2, filled=True)
                     xform = rendering.Transform()
-                    geom.add_attr(xform)
-                    geom.set_linewidth(2)
-                    geom.set_color(*self.world.agents[agent_i].color)
-                    geoms.append(geom)
+                    circle.add_attr(xform)
+                    xform.set_translation(i_p[0], i_p[1])
+                    circle.set_color(*self.world.agents[agent_i].color)
+                    geoms.append(circle)
 
-                    for i_p in self.ref_paths_agent_related.nearing_points_right_boundary[
+                # Right boundary
+                geom = rendering.PolyLine(
+                    v=self.ref_paths_agent_related.nearing_points_right_boundary[
                         env_index, agent_i
-                    ]:
-                        circle = rendering.make_circle(radius=0.2, filled=True)
-                        xform = rendering.Transform()
-                        circle.add_attr(xform)
-                        xform.set_translation(i_p[0], i_p[1])
-                        circle.set_color(*self.world.agents[agent_i].color)
-                        geoms.append(circle)
+                    ],
+                    close=False,
+                )
+                xform = rendering.Transform()
+                geom.add_attr(xform)
+                geom.set_linewidth(2)
+                geom.set_color(*self.world.agents[agent_i].color)
+                geoms.append(geom)
+
+                for i_p in self.ref_paths_agent_related.nearing_points_right_boundary[
+                    env_index, agent_i
+                ]:
+                    circle = rendering.make_circle(radius=0.2, filled=True)
+                    xform = rendering.Transform()
+                    circle.add_attr(xform)
+                    xform.set_translation(i_p[0], i_p[1])
+                    circle.set_color(*self.world.agents[agent_i].color)
+                    geoms.append(circle)
         # ---------- 3) 超大件（杆 + 锚点） ----------
         if self.task_class==TaskClass.OCCT_PLATOON:
             # 端点坐标
-            p_front = self.road.get_pts(self.s_front)[env_index]  # [2]
-            p_rear  = self.road.get_pts(self.s_rear)[env_index]   # [2]
-            pf = p_front.detach().cpu()
-            pr = p_rear.detach().cpu()
+            p_front, p_rear = self.get_front_rear_pts(self.s_front, self.s_rear, env_index)
+            pf = p_front[0].detach().cpu() # only one env
+            pr = p_rear[0].detach().cpu() # only one env
             rod = pf - pr
             rod_len = torch.linalg.norm(rod).item() + 1e-9
             t_hat = (rod / rod_len)            # 切向
@@ -3218,5 +3237,5 @@ if __name__ == "__main__":
         control_two_agents=True,
         display_info=True,
         seed=None,
-        agent_index_focus=2,
+        agent_index_focus=0,
     )
