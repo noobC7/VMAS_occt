@@ -334,7 +334,8 @@ class OcctCRMap(MapBase):
                  min_lane_width: float = 2.1,
                  min_lane_len: float = 70,
                  max_ref_v: float = 20/3.6,
-                 is_constant_ref_v: bool = False): # 采样间隔
+                 is_constant_ref_v: bool = False,
+                 eval_mode: bool = False): # 采样间隔
         """
         初始化道路类，使用CommonRoad地图并基于torchcubicspline实现路径表示
         
@@ -353,6 +354,7 @@ class OcctCRMap(MapBase):
         self.min_lane_len = min_lane_len
         self.max_ref_v = max_ref_v # max ref vel in m/s
         self.is_constant_ref_v = is_constant_ref_v # if True, then ref_v is constant and equal to max_ref_v
+        self.eval_mode = eval_mode # if True, then the batch id is in order and fixed
         self.start_end_distance_threshold = 25 # 起始点和结束点的距离阈值，小于该阈值的路径会被过滤
         
         # 初始化路径库
@@ -367,7 +369,6 @@ class OcctCRMap(MapBase):
         self._cr_map_process(cr_map_dir)
         
         print(f"[OcctCRMap]共{len(self.path_library)}条路径数据,最长为{self.max_path_length:.2f}米,顶点有{len(self.max_path_s_list)}个,平均宽度为{self.get_lane_width():.2f}米")
-        
         # 确保有路径数据
         if len(self.path_library) == 0:
             raise ValueError("No paths found in the provided CommonRoad map directory")
@@ -587,9 +588,20 @@ class OcctCRMap(MapBase):
                     "left_vertices": [],
                     "right_vertices": []
                 }
-                # if not (path_ids[0]==128 and path_ids[-1]==106):
+                # if not((path_ids[0]==128 and path_ids[-1]==106) or \
+                #    (path_ids[0]==102 and path_ids[-1]==175) or \
+                #    (path_ids[0]==189 and path_ids[-1]==175)):
+                # # if not(path_ids[0]==128 and path_ids[-1]==106):
+                # # if not((path_ids[0]==128 and path_ids[-1]==106) or \
+                # #    (path_ids[0]==102 and path_ids[-1]==175)):
                 #     continue
-                if not (path_ids[0]==102 and path_ids[-1]==175):
+                if ((path_ids[0]==100 and path_ids[-1]==129) or \
+                   (path_ids[0]==108 and path_ids[-1]==166) or \
+                   (path_ids[0]==128 and path_ids[-1]==106) or \
+                    (path_ids[0]==189 and path_ids[-1]==103)):
+                # if not(path_ids[0]==128 and path_ids[-1]==106):
+                # if not((path_ids[0]==128 and path_ids[-1]==106) or \
+                #    (path_ids[0]==102 and path_ids[-1]==175)):
                     continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
@@ -712,12 +724,15 @@ class OcctCRMap(MapBase):
         使用torchcubicspline初始化路径样条
         """
         start_time=time.time()
-        print(f"开始reset_splines, env_index: {env_index}")
-        if env_index:
-            self.batch_id[env_index] = torch.randint(0, len(self.path_library), (1,), device=self.device)
+        #print(f"开始reset_splines, env_index: {env_index}")
+        if self.eval_mode:
+            assert self.batch_dim==len(self.path_library), f"batch_dim(got {self.batch_dim}) must equal to len(self.path_library)(got {len(self.path_library)})"
+            self.batch_id = torch.arange(0, len(self.path_library), dtype=torch.int64, device=self.device)
         else:
-            self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
-        
+            if env_index:
+                self.batch_id[env_index] = torch.randint(0, len(self.path_library), (1,), device=self.device)
+            else:
+                self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
         # 准备batch数据
         B = self.batch_dim
         max_path_pts_num = len(self.max_path_s_list)
@@ -774,7 +789,7 @@ class OcctCRMap(MapBase):
         coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_ref_v)
         self.ref_v_splines = NaturalCubicSpline(coeffs)
         end_time=time.time()
-        print(f"结束reset_splines, cost time: {end_time-start_time}")
+        #print(f"结束reset_splines, cost time: {end_time-start_time}")
 
     def compute_curvature_2d(
         self, 
@@ -921,9 +936,11 @@ class OcctCRMap(MapBase):
     
     def get_s_max(self) -> Tensor:
         return self.batch_s_max
-    def get_s_max_idx(self) -> Tensor:
+    def get_s_max_idx(self, env_j: int = None) -> Tensor:
         s_max_mask = ~torch.isnan(self.batch_s)
         s_max_idx = self.batch_s.shape[1] - 1 - torch.argmax(torch.flip(s_max_mask.int(), dims=[1]), dim=1)
+        if env_j is not None:
+            s_max_idx = s_max_idx[env_j]
         return s_max_idx
     def get_road_center_pts(self) -> Tensor:
         return self.batch_center_vertices
@@ -1029,492 +1046,492 @@ class OcctCRMap(MapBase):
                 fig2_path = f"{self.vis_dir}/fig2_{path_id:04d}_{i:04d}.svg"
                 fig2.savefig(fig2_path, dpi=300, format="svg", bbox_inches='tight')
 # try separate each path, but more time cost, deprecated
-class OcctCRMapNew(MapBase):
-    def __init__(
-        self,
-        batch_dim: int,
-        device: torch.device,
-        cr_map_dir: str = "vmas/scenarios_data/cr_maps/debug",
-        sample_gap: float = 1,
-        min_lane_width: float = 2.1,
-        min_lane_len: float = 70,
-        max_ref_v: float = 20/3.6,
-        is_constant_ref_v: bool = False
-    ):
-        """
-        初始化道路类，预生成所有路径的样条并缓存
-        """
-        self.device = device
-        self.batch_dim = batch_dim
-        self.cr_map_dir = cr_map_dir
-        self.vis_dir = os.path.join(cr_map_dir, "vis")
-        os.makedirs(self.vis_dir, exist_ok=True)
-        self.sample_gap = sample_gap
-        self.min_lane_width = min_lane_width
-        self.min_lane_len = min_lane_len
-        self.max_ref_v = max_ref_v
-        self.is_constant_ref_v = is_constant_ref_v
-        self.start_end_distance_threshold = 25
+# class OcctCRMapNew(MapBase):
+#     def __init__(
+#         self,
+#         batch_dim: int,
+#         device: torch.device,
+#         cr_map_dir: str = "vmas/scenarios_data/cr_maps/debug",
+#         sample_gap: float = 1,
+#         min_lane_width: float = 2.1,
+#         min_lane_len: float = 70,
+#         max_ref_v: float = 20/3.6,
+#         is_constant_ref_v: bool = False
+#     ):
+#         """
+#         初始化道路类，预生成所有路径的样条并缓存
+#         """
+#         self.device = device
+#         self.batch_dim = batch_dim
+#         self.cr_map_dir = cr_map_dir
+#         self.vis_dir = os.path.join(cr_map_dir, "vis")
+#         os.makedirs(self.vis_dir, exist_ok=True)
+#         self.sample_gap = sample_gap
+#         self.min_lane_width = min_lane_width
+#         self.min_lane_len = min_lane_len
+#         self.max_ref_v = max_ref_v
+#         self.is_constant_ref_v = is_constant_ref_v
+#         self.start_end_distance_threshold = 25
 
-        # 路径库（缓存所有路径的原始数据+预生成的样条）
-        self.path_library = []
-        self.scenario_library = dict[str, Scenario]()
-        self.max_path_length = 0.0
-        self.max_path_s_list = None
+#         # 路径库（缓存所有路径的原始数据+预生成的样条）
+#         self.path_library = []
+#         self.scenario_library = dict[str, Scenario]()
+#         self.max_path_length = 0.0
+#         self.max_path_s_list = None
 
-        # 批量管理变量（列表形式，长度=batch_dim）
-        self.batch_id = torch.zeros(self.batch_dim, dtype=torch.int64, device=self.device)
-        self.batch_map_name = [None] * self.batch_dim
-        self.batch_s_max = torch.zeros(self.batch_dim, device=self.device)
+#         # 批量管理变量（列表形式，长度=batch_dim）
+#         self.batch_id = torch.zeros(self.batch_dim, dtype=torch.int64, device=self.device)
+#         self.batch_map_name = [None] * self.batch_dim
+#         self.batch_s_max = torch.zeros(self.batch_dim, device=self.device)
         
-        # 核心：每个batch对应一个预生成的样条实例（列表）
-        self.center_splines = [None] * self.batch_dim
-        self.left_splines = [None] * self.batch_dim
-        self.right_splines = [None] * self.batch_dim
-        self.ref_v_splines = [None] * self.batch_dim
+#         # 核心：每个batch对应一个预生成的样条实例（列表）
+#         self.center_splines = [None] * self.batch_dim
+#         self.left_splines = [None] * self.batch_dim
+#         self.right_splines = [None] * self.batch_dim
+#         self.ref_v_splines = [None] * self.batch_dim
 
-        # 一次性处理地图并预生成所有路径的样条
-        self._cr_map_process(cr_map_dir)
-        print(
-            f"[OcctCRMap]共{len(self.path_library)}条路径数据,"
-            f"最长为{self.max_path_length:.2f}米,"
-            f"平均宽度为{self.get_lane_width():.2f}米"
-        )
+#         # 一次性处理地图并预生成所有路径的样条
+#         self._cr_map_process(cr_map_dir)
+#         print(
+#             f"[OcctCRMap]共{len(self.path_library)}条路径数据,"
+#             f"最长为{self.max_path_length:.2f}米,"
+#             f"平均宽度为{self.get_lane_width():.2f}米"
+#         )
         
-        if len(self.path_library) == 0:
-            raise ValueError("No paths found in the provided CommonRoad map directory")
-        self.reset_splines()
+#         if len(self.path_library) == 0:
+#             raise ValueError("No paths found in the provided CommonRoad map directory")
+#         self.reset_splines()
 
-    def get_lane_width(self, type="mean") -> float:
-        lane_widths = torch.hstack([
-            torch.tensor(path["lane_width"], device=self.device) 
-            for path in self.path_library
-        ])
-        if type == "mean":
-            return lane_widths.mean().item()
-        elif type == "min":
-            return lane_widths.min().item()
-        elif type == "max":
-            return lane_widths.max().item()
-        else:
-            raise ValueError(f"type must be 'mean','min' or 'max', but got {type}")
+#     def get_lane_width(self, type="mean") -> float:
+#         lane_widths = torch.hstack([
+#             torch.tensor(path["lane_width"], device=self.device) 
+#             for path in self.path_library
+#         ])
+#         if type == "mean":
+#             return lane_widths.mean().item()
+#         elif type == "min":
+#             return lane_widths.min().item()
+#         elif type == "max":
+#             return lane_widths.max().item()
+#         else:
+#             raise ValueError(f"type must be 'mean','min' or 'max', but got {type}")
 
-    def _get_cum_len(self, vertices: Tensor) -> Tensor:
-        if isinstance(vertices, np.ndarray):
-            vertices = torch.tensor(vertices, device=self.device)
-        seg = vertices[1:] - vertices[:-1]
-        seg_len = torch.linalg.norm(seg, dim=-1)
-        cum_len = torch.cat([torch.zeros(1, device=self.device), torch.cumsum(seg_len, dim=0)])
-        return cum_len
+#     def _get_cum_len(self, vertices: Tensor) -> Tensor:
+#         if isinstance(vertices, np.ndarray):
+#             vertices = torch.tensor(vertices, device=self.device)
+#         seg = vertices[1:] - vertices[:-1]
+#         seg_len = torch.linalg.norm(seg, dim=-1)
+#         cum_len = torch.cat([torch.zeros(1, device=self.device), torch.cumsum(seg_len, dim=0)])
+#         return cum_len
 
-    def _resample_path(self, vertices: Tensor) -> Tuple[Tensor, Tensor]:
-        original_s = self._get_cum_len(vertices)
-        s_max = original_s[-1]
-        M = max(2, int(torch.floor(s_max / self.sample_gap)))
-        s = torch.linspace(0.0, s_max, M, device=self.device)
+#     def _resample_path(self, vertices: Tensor) -> Tuple[Tensor, Tensor]:
+#         original_s = self._get_cum_len(vertices)
+#         s_max = original_s[-1]
+#         M = max(2, int(torch.floor(s_max / self.sample_gap)))
+#         s = torch.linspace(0.0, s_max, M, device=self.device)
         
-        idx = torch.searchsorted(original_s, s, right=True) - 1
-        idx = torch.clamp(idx, 0, len(original_s) - 2)
+#         idx = torch.searchsorted(original_s, s, right=True) - 1
+#         idx = torch.clamp(idx, 0, len(original_s) - 2)
         
-        s0 = original_s[idx]
-        s1 = original_s[idx + 1]
-        p0 = vertices[idx]
-        p1 = vertices[idx + 1]
+#         s0 = original_s[idx]
+#         s1 = original_s[idx + 1]
+#         p0 = vertices[idx]
+#         p1 = vertices[idx + 1]
         
-        alpha = (s - s0) / (s1 - s0 + 1e-8)
-        resampled_vertices = p0 + alpha.unsqueeze(1) * (p1 - p0)
+#         alpha = (s - s0) / (s1 - s0 + 1e-8)
+#         resampled_vertices = p0 + alpha.unsqueeze(1) * (p1 - p0)
         
-        return resampled_vertices, s
+#         return resampled_vertices, s
 
-    def get_s_max_idx(self) -> Tensor:
-        return torch.argmax(self.batch_s_max)
+#     def get_s_max_idx(self) -> Tensor:
+#         return torch.argmax(self.batch_s_max)
     
-    def _enrich_vertices_sampling(self, center_vertices, left_vertices, right_vertices):
-        center_seg_lengths = np.linalg.norm(center_vertices[1:] - center_vertices[:-1], axis=1)
-        if np.max(center_seg_lengths) > 2 * self.sample_gap:
-            center_length = self._get_cum_len(center_vertices)
-            sample_num = max(2, int(torch.floor(center_length[-1] / self.sample_gap)))
-            resampled_vertices = [np.zeros((sample_num, 2)), np.zeros((sample_num, 2)), np.zeros((sample_num, 2))]
+#     def _enrich_vertices_sampling(self, center_vertices, left_vertices, right_vertices):
+#         center_seg_lengths = np.linalg.norm(center_vertices[1:] - center_vertices[:-1], axis=1)
+#         if np.max(center_seg_lengths) > 2 * self.sample_gap:
+#             center_length = self._get_cum_len(center_vertices)
+#             sample_num = max(2, int(torch.floor(center_length[-1] / self.sample_gap)))
+#             resampled_vertices = [np.zeros((sample_num, 2)), np.zeros((sample_num, 2)), np.zeros((sample_num, 2))]
             
-            for resampled, vertices in zip(resampled_vertices, [center_vertices, left_vertices, right_vertices]):
-                segment_lengths = np.linalg.norm(np.diff(vertices, axis=0), axis=1)
-                cum_lengths = np.zeros(len(vertices))
-                cum_lengths[1:] = np.cumsum(segment_lengths)
-                target_s = np.linspace(0, cum_lengths[-1], sample_num)
-                for i in range(2):
-                    resampled[:, i] = np.interp(target_s, cum_lengths, vertices[:, i])
-            return resampled_vertices[0], resampled_vertices[1], resampled_vertices[2]
-        return center_vertices, left_vertices, right_vertices
+#             for resampled, vertices in zip(resampled_vertices, [center_vertices, left_vertices, right_vertices]):
+#                 segment_lengths = np.linalg.norm(np.diff(vertices, axis=0), axis=1)
+#                 cum_lengths = np.zeros(len(vertices))
+#                 cum_lengths[1:] = np.cumsum(segment_lengths)
+#                 target_s = np.linspace(0, cum_lengths[-1], sample_num)
+#                 for i in range(2):
+#                     resampled[:, i] = np.interp(target_s, cum_lengths, vertices[:, i])
+#             return resampled_vertices[0], resampled_vertices[1], resampled_vertices[2]
+#         return center_vertices, left_vertices, right_vertices
 
-    def _detect_loop(self, points: List[Tuple[float, float]], tol: float = 1.0) -> Tuple[bool, List[Tuple[int, int]]]:
-        n = len(points)
-        if n < 4:
-            return False, []
+#     def _detect_loop(self, points: List[Tuple[float, float]], tol: float = 1.0) -> Tuple[bool, List[Tuple[int, int]]]:
+#         n = len(points)
+#         if n < 4:
+#             return False, []
         
-        points_array = np.array(points)
-        loop_pairs = []
+#         points_array = np.array(points)
+#         loop_pairs = []
         
-        for i in range(n - 3):
-            for j in range(i + 3, n):
-                distance = np.linalg.norm(points_array[i] - points_array[j])
-                if distance <= tol:
-                    loop_pairs.append((i, j))
+#         for i in range(n - 3):
+#             for j in range(i + 3, n):
+#                 distance = np.linalg.norm(points_array[i] - points_array[j])
+#                 if distance <= tol:
+#                     loop_pairs.append((i, j))
         
-        return len(loop_pairs) > 0, loop_pairs
+#         return len(loop_pairs) > 0, loop_pairs
 
-    def _cr_map_process(self, map_dir: str) -> None:
-        """
-        核心修改：处理地图时预生成所有路径的样条并缓存到path_library
-        """
-        dump_file = os.path.join(self.cr_map_dir, "map_data_with_splines.pkl")
-        # 优先加载缓存（包含预生成的样条）
-        if os.path.exists(dump_file):
-            self.scenario_library, self.path_library, self.max_path_length, self.max_path_s_list = pickle.load(
-                open(dump_file, "rb")
-            )
-            self.max_path_length = self.max_path_length.to(self.device)
-            self.max_path_s_list = self.max_path_s_list.to(self.device)
-            return
+#     def _cr_map_process(self, map_dir: str) -> None:
+#         """
+#         核心修改：处理地图时预生成所有路径的样条并缓存到path_library
+#         """
+#         dump_file = os.path.join(self.cr_map_dir, "map_data_with_splines.pkl")
+#         # 优先加载缓存（包含预生成的样条）
+#         if os.path.exists(dump_file):
+#             self.scenario_library, self.path_library, self.max_path_length, self.max_path_s_list = pickle.load(
+#                 open(dump_file, "rb")
+#             )
+#             self.max_path_length = self.max_path_length.to(self.device)
+#             self.max_path_s_list = self.max_path_s_list.to(self.device)
+#             return
         
-        map_files = glob.glob(os.path.join(map_dir, "**/*.xml"), recursive=True)
-        print(f"找到 {len(map_files)} 个地图文件:")
-        for i, map_file in enumerate(map_files):
-            print(f"  {i+1}. {os.path.basename(map_file)}")
+#         map_files = glob.glob(os.path.join(map_dir, "**/*.xml"), recursive=True)
+#         print(f"找到 {len(map_files)} 个地图文件:")
+#         for i, map_file in enumerate(map_files):
+#             print(f"  {i+1}. {os.path.basename(map_file)}")
         
-        for map_file in map_files:
-            map_name = os.path.basename(map_file)
-            print(f"\n处理地图: {map_name}")
+#         for map_file in map_files:
+#             map_name = os.path.basename(map_file)
+#             print(f"\n处理地图: {map_name}")
             
-            scenario = get_cr_scenario(map_file)
-            self.scenario_library[map_name] = scenario
-            lanelets = scenario.lanelet_network.lanelets
-            start_lanelets = [lanelet for lanelet in lanelets if not lanelet.predecessor]
+#             scenario = get_cr_scenario(map_file)
+#             self.scenario_library[map_name] = scenario
+#             lanelets = scenario.lanelet_network.lanelets
+#             start_lanelets = [lanelet for lanelet in lanelets if not lanelet.predecessor]
             
-            path_id_library = []
-            for start_lanelet in start_lanelets:
-                queue = deque()
-                queue.append([start_lanelet.lanelet_id])
+#             path_id_library = []
+#             for start_lanelet in start_lanelets:
+#                 queue = deque()
+#                 queue.append([start_lanelet.lanelet_id])
                 
-                while queue:
-                    current_path = queue.popleft()
-                    current_lanelet_id = current_path[-1]
-                    current_lanelet = scenario.lanelet_network.find_lanelet_by_id(current_lanelet_id)
+#                 while queue:
+#                     current_path = queue.popleft()
+#                     current_lanelet_id = current_path[-1]
+#                     current_lanelet = scenario.lanelet_network.find_lanelet_by_id(current_lanelet_id)
                     
-                    if not current_lanelet.successor:
-                        path_id_library.append(current_path)
-                    else:
-                        for successor_id in current_lanelet.successor:
-                            if successor_id not in current_path:
-                                new_path = current_path.copy()
-                                new_path.append(successor_id)
-                                queue.append(new_path)
+#                     if not current_lanelet.successor:
+#                         path_id_library.append(current_path)
+#                     else:
+#                         for successor_id in current_lanelet.successor:
+#                             if successor_id not in current_path:
+#                                 new_path = current_path.copy()
+#                                 new_path.append(successor_id)
+#                                 queue.append(new_path)
             
-            print(f"找到 {len(path_id_library)} 条路径:")
-            for i, path in enumerate(path_id_library):
-                print(f"  路径 {i+1}: {path}")
+#             print(f"找到 {len(path_id_library)} 条路径:")
+#             for i, path in enumerate(path_id_library):
+#                 print(f"  路径 {i+1}: {path}")
             
-            for path_ids in path_id_library:
-                if not (path_ids[0] == 128 and path_ids[-1] == 106):
-                    continue
+#             for path_ids in path_id_library:
+#                 if not (path_ids[0] == 128 and path_ids[-1] == 106):
+#                     continue
                 
-                path_data = {"center_vertices": [], "left_vertices": [], "right_vertices": []}
-                for i, lanelet_id in enumerate(path_ids):
-                    lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
-                    center_vertices = lanelet.center_vertices
-                    left_vertices = lanelet.left_vertices
-                    right_vertices = lanelet.right_vertices
+#                 path_data = {"center_vertices": [], "left_vertices": [], "right_vertices": []}
+#                 for i, lanelet_id in enumerate(path_ids):
+#                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
+#                     center_vertices = lanelet.center_vertices
+#                     left_vertices = lanelet.left_vertices
+#                     right_vertices = lanelet.right_vertices
                     
-                    center_vertices, left_vertices, right_vertices = self._enrich_vertices_sampling(
-                        center_vertices, left_vertices, right_vertices
-                    )
+#                     center_vertices, left_vertices, right_vertices = self._enrich_vertices_sampling(
+#                         center_vertices, left_vertices, right_vertices
+#                     )
                     
-                    slice_range = slice(None) if i == len(path_ids) - 1 else slice(-1)
-                    for key, vertices in zip(
-                        ["center_vertices", "left_vertices", "right_vertices"],
-                        [center_vertices, left_vertices, right_vertices]
-                    ):
-                        path_data[key].extend([v.tolist() for v in vertices[slice_range]])
+#                     slice_range = slice(None) if i == len(path_ids) - 1 else slice(-1)
+#                     for key, vertices in zip(
+#                         ["center_vertices", "left_vertices", "right_vertices"],
+#                         [center_vertices, left_vertices, right_vertices]
+#                     ):
+#                         path_data[key].extend([v.tolist() for v in vertices[slice_range]])
                 
-                # 基础过滤
-                lane_width = [np.linalg.norm(left_vertices[i] - right_vertices[i]) for i in range(len(center_vertices))]
-                center_vertices = torch.tensor(path_data["center_vertices"], device=self.device, dtype=torch.float32)
-                center_cum_len = self._get_cum_len(center_vertices)
+#                 # 基础过滤
+#                 lane_width = [np.linalg.norm(left_vertices[i] - right_vertices[i]) for i in range(len(center_vertices))]
+#                 center_vertices = torch.tensor(path_data["center_vertices"], device=self.device, dtype=torch.float32)
+#                 center_cum_len = self._get_cum_len(center_vertices)
                 
-                if (
-                    min(lane_width) < self.min_lane_width
-                    or center_cum_len[-1] < self.min_lane_len
-                    or torch.linalg.norm(center_vertices[0] - center_vertices[-1]) < self.start_end_distance_threshold
-                ):
-                    continue
+#                 if (
+#                     min(lane_width) < self.min_lane_width
+#                     or center_cum_len[-1] < self.min_lane_len
+#                     or torch.linalg.norm(center_vertices[0] - center_vertices[-1]) < self.start_end_distance_threshold
+#                 ):
+#                     continue
                 
-                # 重采样路径
-                resampled_center, s = self._resample_path(center_vertices)
-                is_loop, _ = self._detect_loop(resampled_center.tolist())
-                if is_loop:
-                    continue
+#                 # 重采样路径
+#                 resampled_center, s = self._resample_path(center_vertices)
+#                 is_loop, _ = self._detect_loop(resampled_center.tolist())
+#                 if is_loop:
+#                     continue
                 
-                # 预生成左/右边界样条并插值重采样点
-                coeffs_left = natural_cubic_spline_coeffs(center_cum_len, torch.tensor(path_data["left_vertices"], device=self.device))
-                left_spline = NaturalCubicSpline(coeffs_left)
-                resampled_left = left_spline.evaluate(s)
+#                 # 预生成左/右边界样条并插值重采样点
+#                 coeffs_left = natural_cubic_spline_coeffs(center_cum_len, torch.tensor(path_data["left_vertices"], device=self.device))
+#                 left_spline = NaturalCubicSpline(coeffs_left)
+#                 resampled_left = left_spline.evaluate(s)
                 
-                coeffs_right = natural_cubic_spline_coeffs(center_cum_len, torch.tensor(path_data["right_vertices"], device=self.device))
-                right_spline = NaturalCubicSpline(coeffs_right)
-                resampled_right = right_spline.evaluate(s)
+#                 coeffs_right = natural_cubic_spline_coeffs(center_cum_len, torch.tensor(path_data["right_vertices"], device=self.device))
+#                 right_spline = NaturalCubicSpline(coeffs_right)
+#                 resampled_right = right_spline.evaluate(s)
                 
-                resampled_lane_width = [
-                    torch.linalg.norm(resampled_left[i] - resampled_right[i]) 
-                    for i in range(len(resampled_center))
-                ]
+#                 resampled_lane_width = [
+#                     torch.linalg.norm(resampled_left[i] - resampled_right[i]) 
+#                     for i in range(len(resampled_center))
+#                 ]
                 
-                # 预生成中心路径样条（用于计算曲率）
-                coeffs_center = natural_cubic_spline_coeffs(s, resampled_center)
-                center_spline = NaturalCubicSpline(coeffs_center)
+#                 # 预生成中心路径样条（用于计算曲率）
+#                 coeffs_center = natural_cubic_spline_coeffs(s, resampled_center)
+#                 center_spline = NaturalCubicSpline(coeffs_center)
                 
-                # 计算参考速度
-                center_curvature = self.compute_curvature_2d(center_spline, s, smooth_distance=10)
-                if self.is_constant_ref_v:
-                    ref_v = self.max_ref_v * torch.ones_like(center_curvature)
-                else:
-                    factor = 0.2
-                    ref_v = torch.clamp_max(factor / torch.sqrt(center_curvature + 1e-8) ** 2, self.max_ref_v)
-                    ref_v = self.gaussian_smooth_1d(ref_v, sigma=5.0)
+#                 # 计算参考速度
+#                 center_curvature = self.compute_curvature_2d(center_spline, s, smooth_distance=10)
+#                 if self.is_constant_ref_v:
+#                     ref_v = self.max_ref_v * torch.ones_like(center_curvature)
+#                 else:
+#                     factor = 0.2
+#                     ref_v = torch.clamp_max(factor / torch.sqrt(center_curvature + 1e-8) ** 2, self.max_ref_v)
+#                     ref_v = self.gaussian_smooth_1d(ref_v, sigma=5.0)
                 
-                # 预生成参考速度样条
-                coeffs_ref_v = natural_cubic_spline_coeffs(s, ref_v.unsqueeze(-1))
-                ref_v_spline = NaturalCubicSpline(coeffs_ref_v)
+#                 # 预生成参考速度样条
+#                 coeffs_ref_v = natural_cubic_spline_coeffs(s, ref_v.unsqueeze(-1))
+#                 ref_v_spline = NaturalCubicSpline(coeffs_ref_v)
                 
-                # ===================== 核心：缓存预生成的样条 =====================
-                self.path_library.append({
-                    "map_name": map_name,
-                    "path_ids": path_ids,
-                    "center_vertices": resampled_center,
-                    "left_vertices": resampled_left,
-                    "right_vertices": resampled_right,
-                    "s": s,
-                    "s_max": s[-1],
-                    "ref_v": ref_v,
-                    "lane_width": resampled_lane_width,
-                    # 预生成的样条实例（核心优化点）
-                    "coeffs_center_spline": coeffs_center,
-                    "coeffs_left_spline": coeffs_left,
-                    "coeffs_right_spline": coeffs_right,
-                    "coeffs_ref_v_spline": coeffs_ref_v,
-                    "center_spline": center_spline,
-                    "left_spline": left_spline,
-                    "right_spline": right_spline,
-                    "ref_v_spline": ref_v_spline,
-                })
+#                 # ===================== 核心：缓存预生成的样条 =====================
+#                 self.path_library.append({
+#                     "map_name": map_name,
+#                     "path_ids": path_ids,
+#                     "center_vertices": resampled_center,
+#                     "left_vertices": resampled_left,
+#                     "right_vertices": resampled_right,
+#                     "s": s,
+#                     "s_max": s[-1],
+#                     "ref_v": ref_v,
+#                     "lane_width": resampled_lane_width,
+#                     # 预生成的样条实例（核心优化点）
+#                     "coeffs_center_spline": coeffs_center,
+#                     "coeffs_left_spline": coeffs_left,
+#                     "coeffs_right_spline": coeffs_right,
+#                     "coeffs_ref_v_spline": coeffs_ref_v,
+#                     "center_spline": center_spline,
+#                     "left_spline": left_spline,
+#                     "right_spline": right_spline,
+#                     "ref_v_spline": ref_v_spline,
+#                 })
                 
-                # 更新最长路径信息
-                if s[-1] > self.max_path_length:
-                    self.max_path_length = s[-1]
-                    self.max_path_s_list = s
+#                 # 更新最长路径信息
+#                 if s[-1] > self.max_path_length:
+#                     self.max_path_length = s[-1]
+#                     self.max_path_s_list = s
         
-        # 保存包含预生成样条的缓存（避免重复计算）
-        pickle.dump(
-            (self.scenario_library, self.path_library, self.max_path_length, self.max_path_s_list),
-            open(dump_file, "wb")
-        )
+#         # 保存包含预生成样条的缓存（避免重复计算）
+#         pickle.dump(
+#             (self.scenario_library, self.path_library, self.max_path_length, self.max_path_s_list),
+#             open(dump_file, "wb")
+#         )
 
-    def gaussian_smooth_1d(self, x: torch.Tensor, sigma: float = 2.0) -> torch.Tensor:
-        orig_shape = x.shape
-        if x.dim() == 0:
-            return x
+#     def gaussian_smooth_1d(self, x: torch.Tensor, sigma: float = 2.0) -> torch.Tensor:
+#         orig_shape = x.shape
+#         if x.dim() == 0:
+#             return x
         
-        seq_dim = x.shape[-1]
-        batch_dims = x.shape[:-1]
-        x_flat = x.reshape(-1, seq_dim)
+#         seq_dim = x.shape[-1]
+#         batch_dims = x.shape[:-1]
+#         x_flat = x.reshape(-1, seq_dim)
         
-        kernel_size = int(2 * round(3 * sigma) + 1)
-        if kernel_size > seq_dim:
-            kernel_size = seq_dim if seq_dim % 2 == 1 else seq_dim - 1
-        if kernel_size < 3:
-            return x
+#         kernel_size = int(2 * round(3 * sigma) + 1)
+#         if kernel_size > seq_dim:
+#             kernel_size = seq_dim if seq_dim % 2 == 1 else seq_dim - 1
+#         if kernel_size < 3:
+#             return x
         
-        kernel = torch.arange(kernel_size, device=x.device, dtype=torch.float32) - (kernel_size - 1) / 2
-        kernel = torch.exp(-kernel ** 2 / (2 * sigma ** 2))
-        kernel = kernel / torch.sum(kernel)
-        kernel = kernel.unsqueeze(0).unsqueeze(0)
+#         kernel = torch.arange(kernel_size, device=x.device, dtype=torch.float32) - (kernel_size - 1) / 2
+#         kernel = torch.exp(-kernel ** 2 / (2 * sigma ** 2))
+#         kernel = kernel / torch.sum(kernel)
+#         kernel = kernel.unsqueeze(0).unsqueeze(0)
         
-        x_padded = F.pad(x_flat.unsqueeze(1), pad=[kernel_size//2, kernel_size//2], mode='replicate')
-        smooth_x = F.conv1d(x_padded, kernel, stride=1).squeeze(1)
+#         x_padded = F.pad(x_flat.unsqueeze(1), pad=[kernel_size//2, kernel_size//2], mode='replicate')
+#         smooth_x = F.conv1d(x_padded, kernel, stride=1).squeeze(1)
         
-        return smooth_x.reshape(orig_shape)
+#         return smooth_x.reshape(orig_shape)
 
-    def get_scenario_by_env_index(self, env_index):
-        return self.scenario_library[self.batch_map_name[env_index]]
+#     def get_scenario_by_env_index(self, env_index):
+#         return self.scenario_library[self.batch_map_name[env_index]]
 
-    def reset_splines(self, env_index: Optional[int] = None):
-        """
-        核心优化：仅查表替换样条，不生成新样条
-        - env_index=None: 全量重置所有batch
-        - env_index=int: 仅重置指定batch
-        """
-        start_time = time.time()
-        print(f"开始reset_splines, env_index: {env_index}")
+#     def reset_splines(self, env_index: Optional[int] = None):
+#         """
+#         核心优化：仅查表替换样条，不生成新样条
+#         - env_index=None: 全量重置所有batch
+#         - env_index=int: 仅重置指定batch
+#         """
+#         start_time = time.time()
+#         print(f"开始reset_splines, env_index: {env_index}")
         
-        # 1. 确定需要更新的batch索引
-        if env_index is None:
-            update_indices = list(range(self.batch_dim))
-            # 全量更新时重新生成batch_id
-            self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
-        else:
-            update_indices = [env_index]
-            # 仅更新指定env的batch_id
-            self.batch_id[env_index] = torch.randint(0, len(self.path_library), (1,), device=self.device).item()
+#         # 1. 确定需要更新的batch索引
+#         if env_index is None:
+#             update_indices = list(range(self.batch_dim))
+#             # 全量更新时重新生成batch_id
+#             self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
+#         else:
+#             update_indices = [env_index]
+#             # 仅更新指定env的batch_id
+#             self.batch_id[env_index] = torch.randint(0, len(self.path_library), (1,), device=self.device).item()
         
-        # 2. 仅做查表替换（核心：无样条生成，仅指针赋值）
-        for batch_idx in update_indices:
-            path_id = self.batch_id[batch_idx].item()
-            path_data = self.path_library[path_id]
+#         # 2. 仅做查表替换（核心：无样条生成，仅指针赋值）
+#         for batch_idx in update_indices:
+#             path_id = self.batch_id[batch_idx].item()
+#             path_data = self.path_library[path_id]
             
-            # 基础信息更新
-            self.batch_map_name[batch_idx] = path_data["map_name"]
-            self.batch_s_max[batch_idx] = path_data["s_max"]
+#             # 基础信息更新
+#             self.batch_map_name[batch_idx] = path_data["map_name"]
+#             self.batch_s_max[batch_idx] = path_data["s_max"]
             
-            # 样条替换（仅赋值，无计算）
-            self.center_splines[batch_idx] = path_data["center_spline"]
-            self.left_splines[batch_idx] = path_data["left_spline"]
-            self.right_splines[batch_idx] = path_data["right_spline"]
-            self.ref_v_splines[batch_idx] = path_data["ref_v_spline"]
+#             # 样条替换（仅赋值，无计算）
+#             self.center_splines[batch_idx] = path_data["center_spline"]
+#             self.left_splines[batch_idx] = path_data["left_spline"]
+#             self.right_splines[batch_idx] = path_data["right_spline"]
+#             self.ref_v_splines[batch_idx] = path_data["ref_v_spline"]
         
-        end_time = time.time()
-        print(f"结束reset_splines, cost time: {end_time - start_time}")
+#         end_time = time.time()
+#         print(f"结束reset_splines, cost time: {end_time - start_time}")
 
-    def compute_curvature_2d(
-        self,
-        spline: NaturalCubicSpline,
-        t: torch.Tensor,
-        smooth_distance: float = 5.0
-    ) -> torch.Tensor:
-        smooth_distance = max(0.1, smooth_distance)
+#     def compute_curvature_2d(
+#         self,
+#         spline: NaturalCubicSpline,
+#         t: torch.Tensor,
+#         smooth_distance: float = 5.0
+#     ) -> torch.Tensor:
+#         smooth_distance = max(0.1, smooth_distance)
         
-        t_min = torch.min(t) - 0.1
-        t_max = torch.max(t) + 0.1
-        sample_density = 10
-        total_t_range = t_max - t_min
-        total_length_estimate = total_t_range * torch.norm(spline.evaluate(t_max) - spline.evaluate(t_min)) / total_t_range
-        steps = max(500, int(total_length_estimate * sample_density))
-        t_samples = torch.linspace(t_min, t_max, steps=steps, device=t.device)
+#         t_min = torch.min(t) - 0.1
+#         t_max = torch.max(t) + 0.1
+#         sample_density = 10
+#         total_t_range = t_max - t_min
+#         total_length_estimate = total_t_range * torch.norm(spline.evaluate(t_max) - spline.evaluate(t_min)) / total_t_range
+#         steps = max(500, int(total_length_estimate * sample_density))
+#         t_samples = torch.linspace(t_min, t_max, steps=steps, device=t.device)
         
-        pos_samples = spline.evaluate(t_samples)
-        pos_diff = pos_samples[1:] - pos_samples[:-1]
-        seg_lengths = torch.norm(pos_diff, dim=-1)
-        cum_lengths = torch.cat([torch.tensor([0.0], device=t.device), torch.cumsum(seg_lengths, dim=0)])
+#         pos_samples = spline.evaluate(t_samples)
+#         pos_diff = pos_samples[1:] - pos_samples[:-1]
+#         seg_lengths = torch.norm(pos_diff, dim=-1)
+#         cum_lengths = torch.cat([torch.tensor([0.0], device=t.device), torch.cumsum(seg_lengths, dim=0)])
         
-        dr_dt_samples = spline.derivative(t_samples, order=1)
-        d2r_dt2_samples = spline.derivative(t_samples, order=2)
+#         dr_dt_samples = spline.derivative(t_samples, order=1)
+#         d2r_dt2_samples = spline.derivative(t_samples, order=2)
         
-        dr_norm_sq_samples = torch.sum(dr_dt_samples ** 2, dim=-1)
-        dr_norm_samples = torch.sqrt(dr_norm_sq_samples)
-        dr_norm_cube_samples = dr_norm_samples ** 3
-        numerator_samples = torch.abs(
-            dr_dt_samples[:, 0] * d2r_dt2_samples[:, 1] - dr_dt_samples[:, 1] * d2r_dt2_samples[:, 0]
-        )
-        curvature_samples = numerator_samples / (dr_norm_cube_samples + 1e-8)
+#         dr_norm_sq_samples = torch.sum(dr_dt_samples ** 2, dim=-1)
+#         dr_norm_samples = torch.sqrt(dr_norm_sq_samples)
+#         dr_norm_cube_samples = dr_norm_samples ** 3
+#         numerator_samples = torch.abs(
+#             dr_dt_samples[:, 0] * d2r_dt2_samples[:, 1] - dr_dt_samples[:, 1] * d2r_dt2_samples[:, 0]
+#         )
+#         curvature_samples = numerator_samples / (dr_norm_cube_samples + 1e-8)
         
-        t_flat = t.flatten()
-        pos_t = spline.evaluate(t_flat)
+#         t_flat = t.flatten()
+#         pos_t = spline.evaluate(t_flat)
         
-        t_samples_expand = t_samples.unsqueeze(0)
-        t_flat_expand = t_flat.unsqueeze(1)
-        idx_nearest = torch.argmin(torch.abs(t_flat_expand - t_samples_expand), dim=1)
+#         t_samples_expand = t_samples.unsqueeze(0)
+#         t_flat_expand = t_flat.unsqueeze(1)
+#         idx_nearest = torch.argmin(torch.abs(t_flat_expand - t_samples_expand), dim=1)
         
-        pos_nearest = pos_samples[idx_nearest]
-        pos_diff = pos_t - pos_nearest
-        dist_diff = torch.norm(pos_diff, dim=-1)
+#         pos_nearest = pos_samples[idx_nearest]
+#         pos_diff = pos_t - pos_nearest
+#         dist_diff = torch.norm(pos_diff, dim=-1)
         
-        cum_lengths_nearest = cum_lengths[idx_nearest]
-        length_t = cum_lengths_nearest + dist_diff
+#         cum_lengths_nearest = cum_lengths[idx_nearest]
+#         length_t = cum_lengths_nearest + dist_diff
         
-        length_t_expand = length_t.unsqueeze(1)
-        cum_lengths_expand = cum_lengths.unsqueeze(0)
-        mask = (cum_lengths_expand >= (length_t_expand - smooth_distance)) & \
-               (cum_lengths_expand <= (length_t_expand + smooth_distance))
+#         length_t_expand = length_t.unsqueeze(1)
+#         cum_lengths_expand = cum_lengths.unsqueeze(0)
+#         mask = (cum_lengths_expand >= (length_t_expand - smooth_distance)) & \
+#                (cum_lengths_expand <= (length_t_expand + smooth_distance))
         
-        mask_float = mask.float()
-        sum_weights = torch.sum(mask_float, dim=1)
-        curvature_samples_expand = curvature_samples.unsqueeze(0)
+#         mask_float = mask.float()
+#         sum_weights = torch.sum(mask_float, dim=1)
+#         curvature_samples_expand = curvature_samples.unsqueeze(0)
         
-        curvature_sum = torch.sum(mask_float * curvature_samples_expand, dim=1)
-        curvature_nearest = curvature_samples[idx_nearest]
-        smooth_curvature_flat = torch.where(
-            sum_weights > 0,
-            curvature_sum / sum_weights,
-            curvature_nearest
-        )
+#         curvature_sum = torch.sum(mask_float * curvature_samples_expand, dim=1)
+#         curvature_nearest = curvature_samples[idx_nearest]
+#         smooth_curvature_flat = torch.where(
+#             sum_weights > 0,
+#             curvature_sum / sum_weights,
+#             curvature_nearest
+#         )
         
-        return smooth_curvature_flat.reshape(t.shape)
+#         return smooth_curvature_flat.reshape(t.shape)
 
-    # ========== 查询函数：直接使用预生成的样条 ==========
-    def get_pts(self, s: Tensor, env_j: Optional[int] = None) -> Tensor:
-        """获取指定弧长的道路中心点"""
-        if s.dim() == 0:
-            assert env_j is not None, "单值s必须指定env_j"
-            return self.center_splines[env_j].evaluate(s)
-        else:
-            assert s.shape[0] == self.batch_dim, "s的批量维度需与batch_dim一致"
-            return torch.stack([
-                self.center_splines[i].evaluate(s[i]) for i in range(self.batch_dim)
-            ], dim=0)
+#     # ========== 查询函数：直接使用预生成的样条 ==========
+#     def get_pts(self, s: Tensor, env_j: Optional[int] = None) -> Tensor:
+#         """获取指定弧长的道路中心点"""
+#         if s.dim() == 0:
+#             assert env_j is not None, "单值s必须指定env_j"
+#             return self.center_splines[env_j].evaluate(s)
+#         else:
+#             assert s.shape[0] == self.batch_dim, "s的批量维度需与batch_dim一致"
+#             return torch.stack([
+#                 self.center_splines[i].evaluate(s[i]) for i in range(self.batch_dim)
+#             ], dim=0)
 
-    def get_ref_v(self, s: Tensor, env_j: Optional[int] = None) -> Tensor:
-        """获取指定弧长的参考速度"""
-        if s.dim() == 0:
-            assert env_j is not None, "单值s必须指定env_j"
-            return self.ref_v_splines[env_j].evaluate(s)
-        else:
-            assert s.shape[0] == self.batch_dim, "s的批量维度需与batch_dim一致"
-            return torch.stack([
-                self.ref_v_splines[i].evaluate(s[i]) for i in range(self.batch_dim)
-            ], dim=0)
+#     def get_ref_v(self, s: Tensor, env_j: Optional[int] = None) -> Tensor:
+#         """获取指定弧长的参考速度"""
+#         if s.dim() == 0:
+#             assert env_j is not None, "单值s必须指定env_j"
+#             return self.ref_v_splines[env_j].evaluate(s)
+#         else:
+#             assert s.shape[0] == self.batch_dim, "s的批量维度需与batch_dim一致"
+#             return torch.stack([
+#                 self.ref_v_splines[i].evaluate(s[i]) for i in range(self.batch_dim)
+#             ], dim=0)
 
-    def get_tangent_vector(self, s: Tensor, env_j: Optional[int] = None) -> Tensor:
-        """获取指定弧长的切向量"""
-        if s.dim() == 0:
-            assert env_j is not None, "单值s必须指定env_j"
-            tangent = self.center_splines[env_j].derivative(s, order=1)
-        else:
-            assert s.shape[0] == self.batch_dim, "s的批量维度需与batch_dim一致"
-            tangent = torch.stack([
-                self.center_splines[i].derivative(s[i], order=1) for i in range(self.batch_dim)
-            ], dim=0)
+#     def get_tangent_vector(self, s: Tensor, env_j: Optional[int] = None) -> Tensor:
+#         """获取指定弧长的切向量"""
+#         if s.dim() == 0:
+#             assert env_j is not None, "单值s必须指定env_j"
+#             tangent = self.center_splines[env_j].derivative(s, order=1)
+#         else:
+#             assert s.shape[0] == self.batch_dim, "s的批量维度需与batch_dim一致"
+#             tangent = torch.stack([
+#                 self.center_splines[i].derivative(s[i], order=1) for i in range(self.batch_dim)
+#             ], dim=0)
         
-        return tangent / (torch.linalg.norm(tangent, dim=-1, keepdim=True) + 1e-8)
+#         return tangent / (torch.linalg.norm(tangent, dim=-1, keepdim=True) + 1e-8)
 
-    def get_s_max(self, env_j: Optional[int] = None) -> Tensor:
-        """获取道路最大弧长"""
-        if env_j is not None:
-            return self.batch_s_max[env_j]
-        return self.batch_s_max
+#     def get_s_max(self, env_j: Optional[int] = None) -> Tensor:
+#         """获取道路最大弧长"""
+#         if env_j is not None:
+#             return self.batch_s_max[env_j]
+#         return self.batch_s_max
 
-    def get_road_center_pts(self, env_j: Optional[int] = None) -> Tensor:
-        """获取道路中心点列表"""
-        if env_j is not None:
-            path_id = self.batch_id[env_j].item()
-            return self.path_library[path_id]["center_vertices"]
-        return torch.stack([
-            self.path_library[self.batch_id[i].item()]["center_vertices"] for i in range(self.batch_dim)
-        ], dim=0)
+#     def get_road_center_pts(self, env_j: Optional[int] = None) -> Tensor:
+#         """获取道路中心点列表"""
+#         if env_j is not None:
+#             path_id = self.batch_id[env_j].item()
+#             return self.path_library[path_id]["center_vertices"]
+#         return torch.stack([
+#             self.path_library[self.batch_id[i].item()]["center_vertices"] for i in range(self.batch_dim)
+#         ], dim=0)
 
-    def get_road_left_pts(self, env_j: Optional[int] = None) -> Tensor:
-        """获取道路左边界点列表"""
-        if env_j is not None:
-            path_id = self.batch_id[env_j].item()
-            return self.path_library[path_id]["left_vertices"]
-        return torch.stack([
-            self.path_library[self.batch_id[i].item()]["left_vertices"] for i in range(self.batch_dim)
-        ], dim=0)
+#     def get_road_left_pts(self, env_j: Optional[int] = None) -> Tensor:
+#         """获取道路左边界点列表"""
+#         if env_j is not None:
+#             path_id = self.batch_id[env_j].item()
+#             return self.path_library[path_id]["left_vertices"]
+#         return torch.stack([
+#             self.path_library[self.batch_id[i].item()]["left_vertices"] for i in range(self.batch_dim)
+#         ], dim=0)
 
-    def get_road_right_pts(self, env_j: Optional[int] = None) -> Tensor:
-        """获取道路右边界点列表"""
-        if env_j is not None:
-            path_id = self.batch_id[env_j].item()
-            return self.path_library[path_id]["right_vertices"]
-        return torch.stack([
-            self.path_library[self.batch_id[i].item()]["right_vertices"] for i in range(self.batch_dim)
-        ], dim=0)
+#     def get_road_right_pts(self, env_j: Optional[int] = None) -> Tensor:
+#         """获取道路右边界点列表"""
+#         if env_j is not None:
+#             path_id = self.batch_id[env_j].item()
+#             return self.path_library[path_id]["right_vertices"]
+#         return torch.stack([
+#             self.path_library[self.batch_id[i].item()]["right_vertices"] for i in range(self.batch_dim)
+#         ], dim=0)
 
 if __name__ == "__main__":
     device = torch.device("cuda")
