@@ -312,6 +312,7 @@ def render_interactively(
     display_info: bool = True,
     save_render: bool = False,
     seed: int = 0,
+    agent_index_focus: int = 0,
     **kwargs,
 ):
     """Executes a scenario and renders it so that you can debug and control agents interactively.
@@ -362,6 +363,7 @@ def render_interactively(
         render_name=f"{scenario}_interactive"
         if isinstance(scenario, str)
         else "interactive",
+        agent_index_focus=agent_index_focus,
     )
 
 
