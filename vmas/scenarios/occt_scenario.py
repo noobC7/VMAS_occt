@@ -254,14 +254,14 @@ class Scenario(BaseScenario):
         
         # Visualization
         self.visualize_semidims=True
-        self.viewer_zoom = float(kwargs.get("viewer_zoom", 8.0)) #7
+        self.viewer_zoom = float(kwargs.get("viewer_zoom", 17.0)) #7
         self.world_x_dim = kwargs.pop(
             "world_x_dim", 150
         )  # The x-dimension of the world in [m]
         self.world_y_dim = kwargs.pop(
             "world_y_dim", 100
         )  # The y-dimension of the world in [m]
-        self.resolution_factor = kwargs.pop("resolution_factor", 12)  # Default 200
+        self.resolution_factor = kwargs.pop("resolution_factor", 3)  # Default 200
         self.render_origin = kwargs.pop(
             "render_origin", [50, -10]
         )
@@ -315,6 +315,7 @@ class Scenario(BaseScenario):
             cr_map_dir="/home/yons/Graduation/VMAS_occt/vmas/scenarios_data/cr_maps/debug",
             max_ref_v=self.max_speed,
             is_constant_ref_v=True, #TODO: variant ref v perform bad, change to constant
+            eval_mode=kwargs.pop("eval_mode", False)
         )
         self.lane_width = self.road.get_lane_width("mean")
         
@@ -1010,6 +1011,11 @@ class Scenario(BaseScenario):
             )
             world.add_agent(self.tractor_front)
             world.add_agent(self.tractor_rear)
+    def get_occt_cr_path_num(self):
+        """
+        获取OCCT CR地图路径数量
+        """
+        return len(self.road.path_library)
     def reset_world_at(self, env_index: Optional[int] = None, agent_index: Optional[int] = None):
         """
         This function resets the world at the specified env_index and the specified agent_index.
@@ -1253,8 +1259,8 @@ class Scenario(BaseScenario):
         # if self.reset_count % self.batch_dim == 0 or self.time_records["total"]>0.5:
         #     print(f"reset_world_at time:{time.time() - total_start:.6f},total time:{self.reset_total_time:.6f}s")
         self.reset_count += 1
-        if env_index is None:
-            self._print_time_report()
+        # if env_index is None:
+        #     self._print_time_report()
 
     def _print_time_report(self):
         """输出各阶段耗时报告，按耗时从高到低排序"""
@@ -2946,10 +2952,12 @@ class Scenario(BaseScenario):
         geoms.extend(map_geoms)
         # ---------- 1) 路网中心线 ----------
         if hasattr(self, "road"):
+            s_max_idx=self.road.get_s_max_idx(env_index)
             # 使用road对象获取道路中心线点
-            pts = self.road.get_road_center_pts()[env_index]  # [N,2]
+            center_pts = self.road.get_road_center_pts()[env_index]  # [N,2]
+            center_pts = center_pts[:s_max_idx+1]
             # rendering.PolyLine 接受 list[(x,y)]，转成 python list 更稳
-            geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in pts.detach().cpu().tolist()],
+            geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in center_pts.detach().cpu().tolist()],
                                     close=False)
             geom.set_color(*Color.PURPLE.value, alpha=1.0)
             geom.set_linewidth(3.0)  # 设置左边界线宽度
@@ -2957,6 +2965,7 @@ class Scenario(BaseScenario):
         
             # 使用road对象获取左边界点
             left_pts = self.road.get_road_left_pts()[env_index]  # [N,2]
+            left_pts = left_pts[:s_max_idx+1]
             geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in left_pts.detach().cpu().tolist()],
                                     close=False)
             geom.set_color(*Color.BLACK.value, alpha=1.0)
@@ -2965,6 +2974,7 @@ class Scenario(BaseScenario):
         
             # 使用road对象获取右边界点
             right_pts = self.road.get_road_right_pts()[env_index]  # [N,2]
+            right_pts = right_pts[:s_max_idx+1]
             geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in right_pts.detach().cpu().tolist()],
                                     close=False)
             geom.set_color(*Color.BLACK.value, alpha=1.0)
@@ -3208,4 +3218,5 @@ if __name__ == "__main__":
         control_two_agents=True,
         display_info=True,
         seed=None,
+        agent_index_focus=2,
     )
