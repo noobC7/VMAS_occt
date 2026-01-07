@@ -45,6 +45,7 @@ class InteractiveEnv:
         display_info: bool = True,
         save_render: bool = False,
         render_name: str = "interactive",
+        agent_index_focus: int = 0,
     ):
         self.env = env
         self.control_two_agents = control_two_agents
@@ -67,6 +68,7 @@ class InteractiveEnv:
         self.display_info = display_info
         self.save_render = save_render
         self.render_name = render_name
+        self.agent_index_focus = agent_index_focus
 
         if self.control_two_agents:
             assert (
@@ -146,6 +148,7 @@ class InteractiveEnv:
             frame = self.env.render(
                 mode="rgb_array" if self.save_render else "human",
                 visualize_when_rgb=True,
+                agent_index_focus=self.agent_index_focus,
             )
             if self.save_render:
                 self.frame_list.append(frame)
