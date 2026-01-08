@@ -863,19 +863,6 @@ class OcctCRMap(MapBase):
         return smooth_curvature
     
     def get_pts(self, s: Tensor, env_j: int = None, line: str = "center") -> Tensor:
-        """_summary_
-
-        Args:
-            s (Tensor): arc tensor
-            env_j (int, optional): Env index. Defaults to None.
-            line (str, optional): Defaults to "center".
-
-            case1: s.dim()==0 or s.dim()==1, get pts for env_j if env_j is not None, else get pts for all envs
-            case2: s.dim()==2, get pts for batch
-
-        Returns:
-            Tensor: _description_
-        """
         if line == "center":
             p = self.center_splines.evaluate(s)
         elif line == "left":
@@ -885,7 +872,7 @@ class OcctCRMap(MapBase):
         else:
             raise ValueError(f"未知的line参数: {line}")
         if s.dim()==0 or s.dim()==1:
-            if env_j:
+            if type(env_j) == int:
                 return p[env_j]
             return p
         if s.dim()==2:
@@ -897,10 +884,10 @@ class OcctCRMap(MapBase):
     def get_ref_v(self, s: Tensor, env_j: int = None) -> Tensor:
         ref_v = self.ref_v_splines.evaluate(s)
         if s.dim()==0 or s.dim()==1:
-            # get pts for env_j
-            assert env_j is not None, "当s的维度为0时，env_j不能为空"
-            return ref_v[env_j]
-        else:
+            if type(env_j) == int:
+                return ref_v[env_j]
+            return ref_v
+        if s.dim()==2:
             # get pts for batch
             assert self.batch_dim == s.shape[0], "s的批量维度必须与样条批量维度一致"
             ref_v = ref_v[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
