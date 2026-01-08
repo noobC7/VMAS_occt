@@ -102,7 +102,7 @@ def get_short_term_reference_path_by_s(
     B=agent_s.shape[0] if agent_s.dim() else 1
     short_term_path=torch.zeros((B, n_points_to_return , 3 if return_ref_v else 2), device=device, dtype=torch.float32)
     agent_s_query=torch.stack([agent_s+i*sample_interval for i in range(n_points_to_return)],dim=-1)
-    ref_pts = occt_map.get_pts(agent_s_query,env_j, line)
+    ref_pts = occt_map.get_pts(agent_s_query, env_j, line)
     short_term_path[:, :, :2] = ref_pts
     if return_ref_v:
         ref_v = occt_map.get_ref_v(agent_s_query, env_j).squeeze(dim=-1)
@@ -144,7 +144,6 @@ from enum import IntEnum
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
     OCCT_PLATOON = 1 # with cargo
-    
 class Scenario(BaseScenario):
     def make_world(self, batch_dim: int, device: torch.device, **kwargs) -> World:
         self.device = device
@@ -1186,7 +1185,7 @@ class Scenario(BaseScenario):
         # ============== 阶段7：记录agent_s ==============
         stage7_start = time.time()
         # 251224: record arch of agents for closest ref pts
-        self.observations.agent_s[env_index] = vehicle_s[env_index] #BUG FIX： asynchronous update of agent_s instead of self.observations.agent_s = vehicle_s
+        self.observations.agent_s[env_index][...,:self.n_followers] = vehicle_s[env_index] #BUG FIX： asynchronous update of agent_s instead of self.observations.agent_s = vehicle_s
 
         # ============== 阶段8：计算车辆位置/方向 ==============
         stage8_start = time.time()
@@ -1250,7 +1249,7 @@ class Scenario(BaseScenario):
 
             tmp_t=time.time()
             for i_agent in (
-                range(self.n_followers) #251226 revise: old version is self.n_agents
+                range(self.n_agents) #251226 revise: old version is self.n_agents
                 if not is_reset_single_agent
                 else agent_index.unsqueeze(0)
             ):
@@ -1531,7 +1530,8 @@ class Scenario(BaseScenario):
         if self.task_class==TaskClass.SIMPLE_PLATOON:
             return
         # ---- 1) 推进前端弧长并夹取到道路范围 ----
-        s_front = self.s_front + self.platoon_vel_batch * self.dt                   # [B]
+        ref_v = self.road.get_ref_v(self.s_front[:,None])[:,0,0] # [B]
+        s_front = self.s_front + ref_v * self.dt # [B]
         # 不要超过道路最大 s；留一点 eps 免得插值越界
         s_max = self.road.get_s_max() - 1e-6
         s_min = torch.zeros_like(s_max, device=self.device)
@@ -1572,14 +1572,14 @@ class Scenario(BaseScenario):
         B = self.batch_dim
         # update arch of agents
         latest_pos = self.state_buffer.get_latest(n=1)[:,:self.n_followers,0:2] # [B, F, 2]
-        tangent_vec = self.road.get_tangent_vector(self.observations.agent_s)  # [B, F, 2]
+        tangent_vec = self.road.get_tangent_vector(self.observations.agent_s[:, :self.n_followers])  # [B, F, 2]
         agents_pos = torch.zeros_like(latest_pos)
         for i, agent in enumerate(self.followers):
             agents_pos[:, i, 0:2] = agent.state.pos
         agents_move_vec = agents_pos - latest_pos
         
         delta_s = torch.sum(agents_move_vec * tangent_vec, dim=-1)  # [B, F]
-        self.observations.agent_s += delta_s
+        self.observations.agent_s[:, :self.n_followers] += delta_s
         # # debug: s error
         # pos_tmp = agents[i_agent].state.pos[env_j, :]
         # ref_tmp = self.road.get_pts(self.observations.agent_s[env_j, i_agent],env_j)
@@ -2651,7 +2651,7 @@ class Scenario(BaseScenario):
             self.collisions.with_lanelets[:] = False  # Reset
             self.collisions.with_exit_segments[:] = False  # Reset
             
-            for a_i in range(self.n_followers):
+            for a_i in range(self.n_agents):
                 self.vertices[:, a_i] = get_rectangle_vertices(
                     center=self.world.agents[a_i].state.pos,
                     yaw=self.world.agents[a_i].state.rot,
@@ -2671,7 +2671,17 @@ class Scenario(BaseScenario):
                     self.collisions.with_agents[
                         torch.nonzero(collision_batch_index), a_j, a_i
                     ] = True
-
+                
+                # Check for collisions with entry segments
+                if not self.is_loop:
+                    self.collisions.with_exit_segments[:, a_i] = interX(
+                        L1=self.vertices[:, a_i],
+                        L2=self.ref_paths_agent_related.exit[:, a_i],
+                        is_return_points=False,
+                    )
+                # ignore the front and rear vehicle collision
+                if a_i >= self.n_followers:
+                    continue
                 # Check for collisions between agents and lanelet boundaries
                 collision_with_left_boundary = interX(
                     L1=self.vertices[:, a_i],
@@ -2696,13 +2706,6 @@ class Scenario(BaseScenario):
                       (collision_with_right_boundary | is_right_outside_boundary)), a_i
                 ] = True
 
-                # Check for collisions with entry segments
-                if not self.is_loop:
-                    self.collisions.with_exit_segments[:, a_i] = interX(
-                        L1=self.vertices[:, a_i],
-                        L2=self.ref_paths_agent_related.exit[:, a_i],
-                        is_return_points=False,
-                    )
 
         # Distance from the center of gravity (CG) of the agent to its reference path
         (
@@ -3102,8 +3105,8 @@ class Scenario(BaseScenario):
         if self.task_class==TaskClass.OCCT_PLATOON:
             # 端点坐标
             p_front, p_rear = self.get_front_rear_pts(self.s_front, self.s_rear, env_index)
-            pf = p_front[0].detach().cpu() # only one env
-            pr = p_rear[0].detach().cpu() # only one env
+            pf = p_front[env_index].detach().cpu()
+            pr = p_rear[env_index].detach().cpu()
             rod = pf - pr
             rod_len = torch.linalg.norm(rod).item() + 1e-9
             t_hat = (rod / rod_len)            # 切向
