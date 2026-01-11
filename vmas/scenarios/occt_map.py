@@ -10,6 +10,7 @@ from commonroad.common.file_reader import CommonRoadFileReader
 from commonroad.scenario.scenario import Scenario
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 from torchcubicspline import(natural_cubic_spline_coeffs, 
                                 NaturalCubicSpline)
 import time
@@ -301,7 +302,9 @@ class OcctCRMap(MapBase):
                  min_lane_len: float = 70,
                  max_ref_v: float = 20/3.6,
                  is_constant_ref_v: bool = False,
-                 eval_mode: bool = False): # 采样间隔
+                 eval_mode: bool = False,
+                 rod_len: float = 30.0,
+                 n_agents: int = 4): # 采样间隔
         """
         初始化道路类，使用CommonRoad地图并基于torchcubicspline实现路径表示
         
@@ -321,7 +324,9 @@ class OcctCRMap(MapBase):
         self.max_ref_v = max_ref_v # max ref vel in m/s
         self.is_constant_ref_v = is_constant_ref_v # if True, then ref_v is constant and equal to max_ref_v
         self.eval_mode = eval_mode # if True, then the batch id is in order and fixed
+        self.rod_len = rod_len # 车辆长度
         self.start_end_distance_threshold = 25 # 起始点和结束点的距离阈值，小于该阈值的路径会被过滤
+        self.n_agents = n_agents
         
         # 初始化路径库
         self.path_library = []
@@ -548,7 +553,7 @@ class OcctCRMap(MapBase):
                 print(f"  路径 {i+1}: {path}")
             
             # 处理每条路径，生成路径数据
-            for path_ids in path_id_library:
+            for path_ids in tqdm(path_id_library, desc="处理路径"):
                 path_data = {
                     "center_vertices": [],
                     "left_vertices": [],
@@ -624,6 +629,7 @@ class OcctCRMap(MapBase):
                     ref_v = self.gaussian_smooth_1d(ref_v, sigma=8.0)
                 assert len(resampled_center) == len(ref_v), "重采样后的中心路径长度与参考速度长度不一致"
                 # 保存重采样后的路径数据
+                hinge_status, hinge_trajs = self._detect_hinge_status(s, center_splines, left_splines, right_splines)
                 self.path_library.append({
                     "map_name": map_name,
                     "path_ids": path_ids,
@@ -633,8 +639,11 @@ class OcctCRMap(MapBase):
                     "s": s,
                     "ref_v": ref_v,
                     "lane_width": resampled_lane_width,
+                    "hinge_status": hinge_status,
+                    "hinge_trajs": hinge_trajs,
                 })
-                
+                assert hinge_status.shape[0]==self.n_agents, "hinge个数必须与n_agents一致"
+                assert hinge_trajs.shape[0]==self.n_agents and hinge_trajs.shape[-1]==2, "hinge轨迹必须为2维"
                 # 更新最大路径长度
                 if s[-1] > self.max_path_length:
                     self.max_path_length = s[-1]
@@ -642,6 +651,24 @@ class OcctCRMap(MapBase):
         dump_file = os.path.join(self.cr_map_dir, "map_data.pkl")
         pickle.dump((self.scenario_library,self.path_library,\
                      self.max_path_length,self.max_path_s_list), open(dump_file, "wb"))
+    def _detect_hinge_status(self, s, center_splines: NaturalCubicSpline, left_splines: NaturalCubicSpline, right_splines: NaturalCubicSpline):
+        # TODO: check whether correct 260109
+        hinge_status = torch.zeros((self.n_agents, s.shape[0]), device=self.device, dtype=torch.float32)
+        hinge_trajs = torch.zeros((self.n_agents, s.shape[0], 2), device=self.device, dtype=torch.float32)
+        for s_idx, s_i in enumerate(s):
+            pts_first_hinge = center_splines.evaluate(s_i)
+            delta_s = self.solve_delta_s_expand_single(s_i,self.rod_len,center_splines)
+            s_last_hinge = s_i - delta_s
+            pts_last_hinge = center_splines.evaluate(s_last_hinge)
+            rod_vector = pts_first_hinge - pts_last_hinge
+            for agent_idx in range(self.n_agents):
+                hinge_pts = pts_first_hinge + agent_idx/(self.n_agents-1)*rod_vector
+                hinge_trajs[agent_idx, s_idx, :] = hinge_pts
+                correspond_s = s_i + agent_idx/(self.n_agents-1)*(s_last_hinge - s_i)
+                correspond_pts = center_splines.evaluate(correspond_s)
+                correspond_width = torch.linalg.norm(left_splines.evaluate(correspond_s)-right_splines.evaluate(correspond_s), dim=-1)
+                hinge_status[agent_idx, s_idx] = 1 if torch.linalg.norm(hinge_pts-correspond_pts)<correspond_width else 0
+        return hinge_status, hinge_trajs
     def gaussian_smooth_1d(self, x: torch.Tensor, sigma: float = 2.0) -> torch.Tensor:
         """
         对1D/批量张量做高斯平滑（保持形状不变，适配任意批量维度）
@@ -709,6 +736,7 @@ class OcctCRMap(MapBase):
         self.batch_left_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
         self.batch_right_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
         self.batch_ref_v = torch.empty(B, max_path_pts_num, 1, device=self.device).fill_(float('nan'))
+        self.batch_hinge_status = torch.ones(B, max_path_pts_num, self.n_agents, device=self.device)
         self.batch_s_max = torch.empty(B, device=self.device).fill_(float('nan'))
         self.batch_map_name = [None]*B
         max_s_len=0
@@ -729,6 +757,7 @@ class OcctCRMap(MapBase):
             self.batch_right_vertices[batch_idx, :length] = path_data["right_vertices"]
             self.batch_s_max[batch_idx] = s_max
             self.batch_ref_v[batch_idx, :length, 0] = path_data["ref_v"]
+            self.batch_hinge_status[batch_idx, :length, :] = path_data["hinge_status"].transpose(0, 1) #[length, n_agents]
         # 对长度不足的道路样本进行延伸填充
         for batch_idx in range(B):
             current_length = torch.count_nonzero(~torch.isnan(self.batch_center_vertices[batch_idx, :, 0])).item()
@@ -744,6 +773,7 @@ class OcctCRMap(MapBase):
                         vertices[batch_idx, current_length - 1 + i] = new_point
                 last_ref_v = self.batch_ref_v[batch_idx, current_length - 1]
                 self.batch_ref_v[batch_idx, current_length:] = last_ref_v
+
         
         longest_s = self.max_path_s_list
         coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_center_vertices)
@@ -754,6 +784,8 @@ class OcctCRMap(MapBase):
         self.right_splines = NaturalCubicSpline(coeffs)
         coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_ref_v)
         self.ref_v_splines = NaturalCubicSpline(coeffs)
+        coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_hinge_status)
+        self.hinge_status_splines = NaturalCubicSpline(coeffs)
         end_time=time.time()
         #print(f"结束reset_splines, cost time: {end_time-start_time}")
 
@@ -892,6 +924,19 @@ class OcctCRMap(MapBase):
             assert self.batch_dim == s.shape[0], "s的批量维度必须与样条批量维度一致"
             ref_v = ref_v[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
             return ref_v
+        
+    def get_hinge_status(self, s: Tensor, env_j: int = None) -> Tensor:
+        #TODO: 260109
+        hinge_status = self.hinge_status_splines.evaluate(s)
+        if s.dim()==0 or s.dim()==1:
+            if type(env_j) == int:
+                return hinge_status[env_j]
+            return hinge_status
+        if s.dim()==2:
+            # get pts for batch
+            assert self.batch_dim == s.shape[0], "s的批量维度必须与样条批量维度一致"
+            hinge_status = hinge_status[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
+            return hinge_status
     
     def get_tangent_vector(self, s: Tensor) -> Tensor:
         assert self.center_splines._a.shape[0] == s.shape[0], "s的批量维度必须与样条批量维度一致"
@@ -916,40 +961,98 @@ class OcctCRMap(MapBase):
     
     def get_road_right_pts(self) -> Tensor:
         return self.batch_right_vertices 
-    def solve_delta_s(self, s_front: Tensor, L: Tensor, *, max_iter: int = 50, tol: float = 1e-3) -> Tuple[Tensor, Tensor]:
+    def solve_delta_s(self, s_reference: Tensor, L: Tensor, backward: bool = True, max_iter: int = 50, tol: float = 1e-3) -> Tuple[Tensor, Tensor]:
         """
         固定弦长二分法求弧长。
         input:
-            s_front: [B] 前端点弧长
-            L:       [B] 固定弦长（货物长度）
+            s_reference: [B] 参考点弧长（backward=True 时为前端点，backward=False 时为后端点）
+            L:           [B] 固定弦长（货物长度）
+            backward:    bool 搜索方向，True 为向后搜索，False 为向前搜索
+            max_iter:      int 最大迭代次数
+            tol:           float 收敛阈值
+            splines:       Splines 样条对象，用于计算点坐标(仅在_cr_map_process中使用)
         return:
             delta_s:        [B] 解出的 Δs (>=0)
             infeasible:     [B] 是否无解（弦长过短）
         """
-        # 预计算前端点坐标
-        lo = torch.zeros_like(s_front) 
-        p_f = self.get_pts(s_front[:,None]).squeeze(1)
-        p_r_hi = self.get_pts(lo[:,None]).squeeze(1) 
-        chord_max = torch.linalg.norm(p_f - p_r_hi, dim=-1)
-        infeasible = (chord_max + 1e-6) < L 
+        # 根据搜索方向设置参考点和计算最大可能弦长
+        if backward:
+            # 向后搜索：参考点是前端点，搜索空间是从0到s_reference
+            p_fixed = self.get_pts(s_reference[:, None]).squeeze(1)
+            s_boundary = torch.zeros_like(s_reference)
+            p_boundary = self.get_pts(s_boundary[:, None]).squeeze(1)
+            chord_max = torch.linalg.norm(p_fixed - p_boundary, dim=-1)
+            hi = s_reference
+        else:
+            # 向前搜索：参考点是后端点，搜索空间是从s_reference到self.get_s_max()
+            p_fixed = self.get_pts(s_reference[:, None]).squeeze(1)
+            s_max = self.get_s_max()
+            s_boundary = s_max
+            p_boundary = self.get_pts(s_boundary[:, None]).squeeze(1)
+            chord_max = torch.linalg.norm(p_boundary - p_fixed, dim=-1)
+            hi = s_max - s_reference
         
-        hi = s_front
+        infeasible = (chord_max + 1e-6) < L
+        lo = torch.zeros_like(s_reference)
+        
+        # 二分搜索循环
         for _ in range(max_iter):
             interval_length = hi - lo
             
             if torch.all(interval_length < tol):
                 break
             
-            mid = 0.5 * (lo + hi)                                             # [B]
-            p_r = self.get_pts((s_front - mid)[:,None]).squeeze(1)                                # [B,2]
-            chord = torch.linalg.norm(p_f - p_r, dim=-1)                      # [B]
-            go_left = chord > L                                               # [B]
+            mid = 0.5 * (lo + hi)  # [B]
+            
+            # 根据搜索方向计算另一个点的位置
+            if backward:
+                s_other = s_reference - mid
+            else:
+                s_other = s_reference + mid
+            
+            p_other = self.get_pts(s_other[:, None]).squeeze(1)  # [B, 2]
+            chord = torch.linalg.norm(p_fixed - p_other, dim=-1)  # [B]
+            
+            go_left = chord > L  # [B]
             hi = torch.where(go_left, mid, hi)
             lo = torch.where(go_left, lo, mid)
         
-        delta_s = 0.5 * (lo + hi) 
+        delta_s = 0.5 * (lo + hi)
         delta_s = torch.where(infeasible, torch.zeros_like(delta_s), delta_s)
         return delta_s, infeasible
+    def solve_delta_s_expand_single(self, s_reference: Tensor, L: Tensor, splines: NaturalCubicSpline, backward: bool = True, max_iter: int = 50, tol: float = 1e-3) -> Tuple[Tensor, Tensor]:
+        """
+        固定弦长二分法求弧长。
+        input:
+            s_reference: [B] 参考点弧长（backward=True 时为前端点，backward=False 时为后端点）
+            L:           [B] 固定弦长（货物长度）
+            backward:    bool 搜索方向，True 为向后搜索，False 为向前搜索
+            max_iter:      int 最大迭代次数
+            tol:           float 收敛阈值
+            splines:       Splines 样条对象，用于计算点坐标(仅在_cr_map_process中使用)
+        return:
+            delta_s:        [B] 解出的 Δs (>=0)
+            infeasible:     [B] 是否无解（弦长过短）
+        """
+        p_fixed = splines.evaluate(s_reference)
+        lo = torch.zeros_like(s_reference)
+        hi = s_reference + 1.5*L if backward else self.get_s_max() + 1.5*L - s_reference
+        
+        for _ in range(max_iter):
+            interval_length = hi - lo
+            if torch.all(interval_length < tol):
+                break
+            mid = 0.5 * (lo + hi)
+            s_other = s_reference - mid if backward else s_reference + mid
+            p_other = splines.evaluate(s_other)
+            chord = torch.linalg.norm(p_fixed - p_other, dim=-1)
+            go_left = chord > L
+            hi = torch.where(go_left, mid, hi)
+            lo = torch.where(go_left, lo, mid)
+        
+        delta_s = 0.5 * (lo + hi)
+        return delta_s
+    
     def plot_road_debug(self):
         from commonroad.visualization.mp_renderer import MPRenderer, DynamicObstacleParams
         from matplotlib.collections import LineCollection
