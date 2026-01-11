@@ -481,6 +481,91 @@ class OcctCRMap(MapBase):
         
         has_loop = len(loop_pairs) > 0
         return has_loop, loop_pairs
+    @staticmethod
+    def extend_trajectory(trajectory, head_extend_len, tail_extend_len):
+        """
+        为轨迹数组首尾各添加一个延伸点（长度为0时返回原轨迹）
+        :param trajectory: 轨迹数组，shape为(N, 2)
+        :param head_extend_len: 头部延伸长度（0则不延伸）
+        :param tail_extend_len: 尾部延伸长度（0则不延伸）
+        :return: 扩展后的轨迹数组
+        """
+        traj = np.array(trajectory, dtype=np.float64)
+        if len(traj) < 2:
+            raise ValueError("轨迹数组至少需要包含2个点才能计算增量")
+        
+        # 初始化延伸后的轨迹为原轨迹
+        extended_traj = traj.copy()
+        
+        # ===== 头部延伸：仅当长度>0时添加 =====
+        if head_extend_len > 1e-9:  # 浮点精度容错，避免0值误判
+            p0, p1 = traj[0], traj[1]
+            head_delta = p1 - p0
+            head_unit_vec = head_delta / np.linalg.norm(head_delta)
+            head_extend_point = p0 - head_unit_vec * head_extend_len
+            extended_traj = np.vstack([head_extend_point, extended_traj])
+        
+        # ===== 尾部延伸：仅当长度>0时添加 =====
+        if tail_extend_len > 1e-9:
+            p_last2, p_last1 = traj[-2], traj[-1]
+            tail_delta = p_last1 - p_last2
+            tail_unit_vec = tail_delta / np.linalg.norm(tail_delta)
+            tail_extend_point = p_last1 + tail_unit_vec * tail_extend_len
+            extended_traj = np.vstack([extended_traj, tail_extend_point])
+        
+        return extended_traj
+
+    @staticmethod
+    def extend_road(center_vertices, left_vertices, right_vertices, head_extend_len, tail_extend_len):
+        """
+        同步延伸道路的中心线、左边界、右边界（长度为0时返回原轨迹）
+        :return: (extend_center, extend_left, extend_right)
+        """
+        center = np.array(center_vertices, dtype=np.float64)
+        left = np.array(left_vertices, dtype=np.float64)
+        right = np.array(right_vertices, dtype=np.float64)
+        
+        if not (len(center) == len(left) == len(right)):
+            raise ValueError("中心线、左边界、右边界的点数量必须一致")
+        if len(center) < 2:
+            raise ValueError("轨迹至少需要2个点才能延伸")
+        
+        # 初始化延伸后的轨迹为原轨迹
+        extend_center = center.copy()
+        extend_left = left.copy()
+        extend_right = right.copy()
+        
+        # 计算中心线延伸向量（仅当长度>0时）
+        head_extend_vec = np.zeros(2)
+        tail_extend_vec = np.zeros(2)
+        if head_extend_len > 1e-9:
+            p0, p1 = center[0], center[1]
+            head_delta = p1 - p0
+            head_unit_vec = head_delta / np.linalg.norm(head_delta)
+            head_extend_vec = head_unit_vec * head_extend_len  # 头部延伸向量（原首点 - 延伸点）
+            # 头部延伸：中心线+左+右
+            head_center = center[0] - head_extend_vec
+            head_left = left[0] - head_extend_vec
+            head_right = right[0] - head_extend_vec
+            extend_center = np.vstack([head_center, extend_center])
+            extend_left = np.vstack([head_left, extend_left])
+            extend_right = np.vstack([head_right, extend_right])
+        
+        if tail_extend_len > 1e-9:
+            p_last2, p_last1 = center[-2], center[-1]
+            tail_delta = p_last1 - p_last2
+            tail_unit_vec = tail_delta / np.linalg.norm(tail_delta)
+            tail_extend_vec = tail_unit_vec * tail_extend_len  # 尾部延伸向量（延伸点 - 原尾点）
+            # 尾部延伸：中心线+左+右
+            tail_center = center[-1] + tail_extend_vec
+            tail_left = left[-1] + tail_extend_vec
+            tail_right = right[-1] + tail_extend_vec
+            extend_center = np.vstack([extend_center, tail_center])
+            extend_left = np.vstack([extend_left, tail_left])
+            extend_right = np.vstack([extend_right, tail_right])
+    
+        return extend_center, extend_left, extend_right
+    
     def _cr_map_process(self, map_dir: str) -> None:
         """
         处理CommonRoad地图和车道信息
@@ -566,19 +651,37 @@ class OcctCRMap(MapBase):
                 # # if not((path_ids[0]==128 and path_ids[-1]==106) or \
                 # #    (path_ids[0]==102 and path_ids[-1]==175)):
                 #     continue
-                if ((path_ids[0]==100 and path_ids[-1]==129) or \
-                   (path_ids[0]==108 and path_ids[-1]==166) or \
-                   (path_ids[0]==128 and path_ids[-1]==106) or \
-                    (path_ids[0]==189 and path_ids[-1]==103)):
+                # if ((path_ids[0]==100 and path_ids[-1]==129) or \
+                #    (path_ids[0]==108 and path_ids[-1]==166) or \
+                #    (path_ids[0]==128 and path_ids[-1]==106) or \
+                #     (path_ids[0]==189 and path_ids[-1]==103)):
+                if not (path_ids[0]==102 and path_ids[-1]==164):
                 # if not(path_ids[0]==128 and path_ids[-1]==106):
                 # if not((path_ids[0]==128 and path_ids[-1]==106) or \
                 #    (path_ids[0]==102 and path_ids[-1]==175)):
                     continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
-                    left_vertices = lanelet.left_vertices
-                    right_vertices = lanelet.right_vertices
-                    center_vertices = lanelet.center_vertices
+                    center_vertices = np.array(lanelet.center_vertices)
+                    # if i == 0:
+                    #     # smooth the beginning for _detect_hinge_status
+                    #     p2, p3 = center_vertices[2], center_vertices[3]
+                    #     dx = p3[0] - p2[0]
+                    #     dy = p3[1] - p2[1]
+                    #     center_vertices[1] = [p2[0] - dx, p2[1] - dy]
+                    #     center_vertices[0] = [p2[0] - 2*dx, p2[1] - 2*dy]
+                    if i == 0 and len(center_vertices) > 2:
+                        center_vertices[1] = (center_vertices[2] + center_vertices[0]) / 2
+                    if i == len(path_ids)-1 and len(center_vertices) > 2:
+                        center_vertices[-2] = (center_vertices[-1] + center_vertices[-2]) / 2
+                    center_vertices, left_vertices, right_vertices = OcctCRMap.extend_road(center_vertices,
+                                                        lanelet.left_vertices,
+                                                        lanelet.right_vertices, 
+                                                        head_extend_len=self.rod_len if i==0 else 0, 
+                                                        tail_extend_len=self.rod_len if i==len(path_ids)-1 else 0)
+                    # left_vertices = self._extend_trajectory(lanelet.left_vertices, head_extend_len=self.rod_len, tail_extend_len=self.rod_len)
+                    # right_vertices = self._extend_trajectory(lanelet.right_vertices, head_extend_len=self.rod_len, tail_extend_len=self.rod_len)
+                    # center_vertices = self._extend_trajectory(lanelet.center_vertices, head_extend_len=self.rod_len, tail_extend_len=self.rod_len)
                     # if lanelet.adj_left:
                     #     left_lane=scenario.lanelet_network.find_lanelet_by_id(lanelet.adj_left)
                     #     left_vertices = left_lane.left_vertices if lanelet.adj_left_same_direction else left_lane.right_vertices[::-1]
@@ -586,10 +689,9 @@ class OcctCRMap(MapBase):
                     # if lanelet.adj_right:
                     #     right_lane=scenario.lanelet_network.find_lanelet_by_id(lanelet.adj_right)
                     #     right_vertices = right_lane.right_vertices if lanelet.adj_right_same_direction else right_lane.left_vertices[::-1]
-                    
                     center_vertices, left_vertices, right_vertices = \
                         self._enrich_vertices_sampling(center_vertices, left_vertices, right_vertices)
-
+                    
                     slice_range = slice(None) if i == len(path_ids) - 1 else slice(-1)
                     for key, vertices in zip(
                         ["center_vertices", "left_vertices", "right_vertices"],
@@ -630,6 +732,9 @@ class OcctCRMap(MapBase):
                 assert len(resampled_center) == len(ref_v), "重采样后的中心路径长度与参考速度长度不一致"
                 # 保存重采样后的路径数据
                 hinge_status, hinge_trajs = self._detect_hinge_status(s, center_splines, left_splines, right_splines)
+                if (hinge_status==1).all():
+                    # means no corner, we dont want this path
+                    continue
                 self.path_library.append({
                     "map_name": map_name,
                     "path_ids": path_ids,
@@ -652,7 +757,6 @@ class OcctCRMap(MapBase):
         pickle.dump((self.scenario_library,self.path_library,\
                      self.max_path_length,self.max_path_s_list), open(dump_file, "wb"))
     def _detect_hinge_status(self, s, center_splines: NaturalCubicSpline, left_splines: NaturalCubicSpline, right_splines: NaturalCubicSpline):
-        # TODO: check whether correct 260109
         hinge_status = torch.zeros((self.n_agents, s.shape[0]), device=self.device, dtype=torch.float32)
         hinge_trajs = torch.zeros((self.n_agents, s.shape[0], 2), device=self.device, dtype=torch.float32)
         for s_idx, s_i in enumerate(s):
@@ -660,14 +764,15 @@ class OcctCRMap(MapBase):
             delta_s = self.solve_delta_s_expand_single(s_i,self.rod_len,center_splines)
             s_last_hinge = s_i - delta_s
             pts_last_hinge = center_splines.evaluate(s_last_hinge)
-            rod_vector = pts_first_hinge - pts_last_hinge
+            rod_vector = pts_last_hinge - pts_first_hinge
             for agent_idx in range(self.n_agents):
                 hinge_pts = pts_first_hinge + agent_idx/(self.n_agents-1)*rod_vector
                 hinge_trajs[agent_idx, s_idx, :] = hinge_pts
                 correspond_s = s_i + agent_idx/(self.n_agents-1)*(s_last_hinge - s_i)
                 correspond_pts = center_splines.evaluate(correspond_s)
                 correspond_width = torch.linalg.norm(left_splines.evaluate(correspond_s)-right_splines.evaluate(correspond_s), dim=-1)
-                hinge_status[agent_idx, s_idx] = 1 if torch.linalg.norm(hinge_pts-correspond_pts)<correspond_width else 0
+                # 1 means ready to hinge, 0 means not ready
+                hinge_status[agent_idx, s_idx] = 1 if torch.linalg.norm(hinge_pts-correspond_pts)<correspond_width/2 else 0
         return hinge_status, hinge_trajs
     def gaussian_smooth_1d(self, x: torch.Tensor, sigma: float = 2.0) -> torch.Tensor:
         """
@@ -926,7 +1031,7 @@ class OcctCRMap(MapBase):
             return ref_v
         
     def get_hinge_status(self, s: Tensor, env_j: int = None) -> Tensor:
-        #TODO: 260109
+        # TODO: 260109
         hinge_status = self.hinge_status_splines.evaluate(s)
         if s.dim()==0 or s.dim()==1:
             if type(env_j) == int:
@@ -1063,6 +1168,7 @@ class OcctCRMap(MapBase):
         fig1, ax1 = plt.subplots(figsize=(8, 7))  # 增加宽度以容纳颜色条
         rnd = MPRenderer(ax=ax1)
         fig2, ax2 = plt.subplots(figsize=(8, 7))
+        fig3, ax3 = plt.subplots(figsize=(8, 7))
         # 设置渲染参数
         rnd.draw_params.dynamic_obstacle.draw_icon = True
         rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
@@ -1086,6 +1192,8 @@ class OcctCRMap(MapBase):
             ref_v = path_data["ref_v"].detach().cpu().numpy()
             s = path_data["s"].detach().cpu().numpy()
             lane_width = path_data["lane_width"].detach().cpu().numpy()
+            hinge_trajs = path_data["hinge_trajs"].detach().cpu().numpy()  # [n_agents, length, 2]
+            hinge_status = path_data["hinge_status"].detach().cpu().numpy()  # [n_agents, length]
             # 获取场景并绘制
             scenario = self.scenario_library[map_name]
             for i in range(0, 1):
@@ -1126,12 +1234,12 @@ class OcctCRMap(MapBase):
                 rnd.ax.set_ylabel("y/m", fontsize=font_size)
                 rnd.ax.tick_params(axis='both', direction='in', labelsize=16, top=False, right=False)
                 rnd.ax.set_title(f"Path {path_id + 1}, Width=({min(lane_width):.2f},{np.mean(lane_width):.2f},{max(lane_width):.2f})m, Len={s[-1]:.2f}m\npath_ids={path_ids}",
-                                  fontsize=font_size, zorder=20) 
+                                  fontsize=font_size, zorder=20)
                 # 暂停以显示
                 plt.pause(0.01)
                 
                 # 保存图像
-                fig1_path = f"{self.vis_dir}/fig1_{path_id:04d}_{i:04d}.svg"
+                fig1_path = f"{self.vis_dir}/Path{path_id:04d}_map_{i:04d}.svg"
                 fig1.savefig(fig1_path, dpi=300, format="svg", bbox_inches='tight')
                 
                 # 清除颜色条和中心线，准备下一个路径
@@ -1146,8 +1254,60 @@ class OcctCRMap(MapBase):
                 ax2.set_title(f"Path {path_id + 1}: Reference Velocity", fontsize=font_size)
                 ax2.legend(fontsize=14)
                 plt.pause(0.01)
-                fig2_path = f"{self.vis_dir}/fig2_{path_id:04d}_{i:04d}.svg"
+                fig2_path = f"{self.vis_dir}/Path{path_id:04d}_ref_v_{i:04d}.svg"
                 fig2.savefig(fig2_path, dpi=300, format="svg", bbox_inches='tight')
+
+                # 绘制 fig3: hinge 轨迹可视化
+                plt.figure(fig3)
+                ax3.clear()
+
+                # 绘制左右边界
+                ax3.scatter(left_vertices[:, 0], left_vertices[:, 1],
+                           s=0.5, c='r', label='Left Boundary', zorder=20, linewidth=0.3)
+                ax3.scatter(right_vertices[:, 0], right_vertices[:, 1],
+                           s=0.5, c='b', label='Right Boundary', zorder=20, linewidth=0.3)
+
+                # 绘制 hinge 轨迹
+                n_agents = hinge_trajs.shape[0]
+                cmap = plt.get_cmap('tab10')  # 为每个agent分配颜色
+
+                for agent_idx in range(n_agents):
+                    agent_color = cmap(agent_idx % 10)
+
+                    # 绘制完整轨迹线
+                    traj_x = hinge_trajs[agent_idx, :, 0]
+                    traj_y = hinge_trajs[agent_idx, :, 1]
+                    ax3.plot(traj_x, traj_y,
+                            color=agent_color,
+                            linewidth=0.5,
+                            alpha=0.7,
+                            linestyle='-',
+                            zorder=18,
+                            label=f'Hinge {agent_idx}')
+
+                    # 标注 hinge_status == 0 的异常点
+                    out_of_road_mask = hinge_status[agent_idx, :] == 0
+                    if np.any(out_of_road_mask):
+                        out_x = traj_x[out_of_road_mask]
+                        out_y = traj_y[out_of_road_mask]
+                        ax3.scatter(out_x, out_y,
+                                   marker='x',
+                                   s=2,
+                                   c=agent_color,
+                                   linewidths=0.5,
+                                   zorder=22)
+
+                # 设置坐标轴和标题
+                ax3.set_xlabel("x/m", fontsize=font_size)
+                ax3.set_ylabel("y/m", fontsize=font_size)
+                ax3.tick_params(axis='both', direction='in', labelsize=16, top=False, right=False)
+                ax3.set_title(f"Path {path_id + 1}: Hinge Trajectories\npath_ids={path_ids}",
+                             fontsize=font_size)
+                ax3.axis('equal')
+                ax3.legend(fontsize=10, framealpha=0.8)
+                plt.pause(0.01)
+                fig3_path = f"{self.vis_dir}/Path{path_id:04d}_hinge_{i:04d}.svg"
+                fig3.savefig(fig3_path, dpi=300, format="svg", bbox_inches='tight')
 # try separate each path, but more time cost, deprecated
 # class OcctCRMapNew(MapBase):
 #     def __init__(
