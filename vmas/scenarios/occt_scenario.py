@@ -144,6 +144,8 @@ from enum import IntEnum
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
     OCCT_PLATOON = 1 # with cargo
+HINGE_FIRST_INDEX=-2
+HINGE_LAST_INDEX=-1
 class Scenario(BaseScenario):
     def make_world(self, batch_dim: int, device: torch.device, **kwargs) -> World:
         self.device = device
@@ -216,8 +218,8 @@ class Scenario(BaseScenario):
         self.use_frenet_ref=kwargs.pop("use_frenet_ref", True)
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", True)
         self.init_arc_pos = kwargs.pop("init_arc_pos", 5.0)
-        self.init_vel_mean = kwargs.pop("init_vel_mean", 3.0)
-        self.init_vel_std = kwargs.pop("init_vel_std", 1.0) 
+        self.init_vel_mean = kwargs.pop("init_vel_mean", 1.0)
+        self.init_vel_std = kwargs.pop("init_vel_std", 0.0) 
         self.still_space = kwargs.pop("still_space", 10.0)
         self.platoon_tau = kwargs.pop("platoon_tau", 0.0)
         if self.task_class == TaskClass.SIMPLE_PLATOON:
@@ -299,9 +301,32 @@ class Scenario(BaseScenario):
         )  # The number of steps to observe (include the current step). At least one, and at most `n_stored_steps`
 
         # map params
+        B = batch_dim
         self.lane_width = 6  # 道路宽度
         
-        B = batch_dim
+        if self.task_class == TaskClass.OCCT_PLATOON:
+            # agent params
+            self.n_latch = int(kwargs.get("n_latch", 5))
+            self.cargo_half_width = float(kwargs.get("cargo_half_width", 1.7))
+            
+            # ---- 锚点（沿杆的比例 alpha）----
+            self.latch_alpha = torch.linspace(0.0, 1.0, self.n_latch, device=device)  # [n_latch]
+            self.latch_pos_world = torch.zeros(B, self.n_latch, 2, device=device)   # [B,nL,2]
+            self.latch_theta_world = torch.zeros(B, self.n_latch, device=device)    # [B,nL]
+    
+            # ---- 随动车辆的 dock 状态/绑定锚点 ----
+            F = self.n_followers
+            self.rod_len = (F+1) * self.still_space   # 货物长度 L
+            self.dock_state = torch.zeros(B, F, dtype=torch.bool, device=device) # 全部 free
+            self.bound_latch_id = torch.full((B, F), -1, dtype=torch.long, device=device)
+    
+            # 目标位姿缓存（post_step 投影用）
+            self.target_pos = torch.zeros(B, F, 2, device=device)
+            self.target_theta = torch.zeros(B, F, device=device)
+    
+            # 计时器（奖励/日志可用）
+            self.dock_timer = torch.zeros(B, F, device=device)
+            
         # self.road = OcctMap(
         #     batch_dim=B,
         #     device=device,
@@ -314,40 +339,12 @@ class Scenario(BaseScenario):
             cr_map_dir="/home/yons/Graduation/VMAS_occt/vmas/scenarios_data/cr_maps/debug",
             max_ref_v=self.max_speed,
             is_constant_ref_v=True, #TODO: variant ref v perform bad, change to constant
-            eval_mode=kwargs.pop("eval_mode", False)
+            eval_mode=kwargs.pop("eval_mode", False),
+            rod_len=self.rod_len,
+            n_agents=self.n_agents,
         )
         self.lane_width = self.road.get_lane_width("mean")
         
-
-        if self.task_class == TaskClass.OCCT_PLATOON:
-            # agent params
-            self.rod_len = float(kwargs.get("rod_len", 40.0))   # 货物长度 L
-            self.n_latch = int(kwargs.get("n_latch", 5))
-            self.cargo_half_width = float(kwargs.get("cargo_half_width", 2.5))
-            
-            # ---- 前/后端的弧长（按路起点放置）----
-            s0 = torch.zeros(B, device=device)
-            s1 = torch.clamp(s0 + self.rod_len, max=self.road.get_s_max() - 1e-6)
-            self.s_front = s1.clone()   # [B]
-            self.s_rear = s0.clone()    # [B]
-    
-            # ---- 锚点（沿杆的比例 alpha）----
-            self.latch_alpha = torch.linspace(0.0, 1.0, self.n_latch, device=device)  # [n_latch]
-            self.latch_pos_world = torch.zeros(B, self.n_latch, 2, device=device)   # [B,nL,2]
-            self.latch_theta_world = torch.zeros(B, self.n_latch, device=device)    # [B,nL]
-    
-            # ---- 随动车辆的 dock 状态/绑定锚点 ----
-            F = self.n_followers
-            self.dock_state = torch.zeros(B, F, dtype=torch.bool, device=device) # 全部 free
-            self.bound_latch_id = torch.full((B, F), -1, dtype=torch.long, device=device)
-    
-            # 目标位姿缓存（post_step 投影用）
-            self.target_pos = torch.zeros(B, F, 2, device=device)
-            self.target_theta = torch.zeros(B, F, device=device)
-    
-            # 计时器（奖励/日志可用）
-            self.dock_timer = torch.zeros(B, F, device=device)
-            
         # 直接使用Road对象的边界点
         self.ref_paths_agent_related = ReferencePathsAgentRelated(
             long_term=self.road.get_road_center_pts().unsqueeze(1).expand(-1, self.n_agents, -1, -1),
@@ -388,10 +385,6 @@ class Scenario(BaseScenario):
                 (batch_dim, self.n_agents, 2, 2), device=device, dtype=torch.float32
             ),
         )
-        
-        # 初始化 infeasible_mask
-        self.infeasible_mask = torch.zeros(B, dtype=torch.bool, device=device)
-
         # Timer for the first env
         self.timer = Timer(
             start=time.time(),
@@ -477,6 +470,12 @@ class Scenario(BaseScenario):
             agent_s=torch.zeros(
                 (batch_dim, self.n_agents), device=device, dtype=torch.float32
             ),
+            hinge_pos=torch.zeros(
+                (batch_dim, self.n_agents, 2), device=device, dtype=torch.float32
+            ),
+            hinge_state=torch.zeros(
+                (batch_dim, self.n_agents), device=device, dtype=torch.int64
+            ),# 0 means
             nearing_agents_indices=torch.zeros(
                     (batch_dim, self.n_agents, self.n_agents),
                     device=device,
@@ -1015,42 +1014,34 @@ class Scenario(BaseScenario):
         获取OCCT CR地图路径数量
         """
         return len(self.road.path_library)
-    def get_front_rear_pts(self, s_front: Tensor, s_rear: Tensor, env_index: Optional[int] = None) -> Tuple[Tensor, Tensor]:
+    def get_front_rear_pts(self, front_rear_s: Tensor, env_index: Optional[int] = None) -> Tuple[Tensor, Tensor]:
         """
         获取牵引车和末尾车的坐标
         input:
-            s_front: [B] 牵引车弧长
-            s_rear:  [B] 末尾车弧长
+            front_rear_s: [B,2] 牵引车和末尾车弧长
         return:
             p_front: [B,2] 牵引车坐标
             p_rear:  [B,2] 末尾车坐标
         """
-        front_rear_s = torch.stack([s_front, s_rear], dim=-1)
         front_rear_pts = self.road.get_pts(front_rear_s, env_index)    # [B,2]
         p_front = front_rear_pts[:,0,:]    # [B,2,2]
         p_rear = front_rear_pts[:,1,:]    # [B,2,2]
         return p_front, p_rear
-    def get_front_rear_tangent(self, s_front: Tensor, s_rear: Tensor, env_index: Optional[int] = None) -> Tuple[Tensor, Tensor]:
-        """
-        获取牵引车和末尾车的切线向量
-        input:
-            s_front: [B] 牵引车弧长
-            s_rear:  [B] 末尾车弧长
-        return:
-            p_front: [B,2] 牵引车切线向量
-            p_rear:  [B,2] 末尾车切线向量
-        """
-        s = torch.stack([s_front, s_rear], dim=-1)
-        """计算道路上弧长s处的切线方向角"""
-        assert s.dim()==2 # shape=[batch_dim,2]
-        epsilon = 1e-3  # 小扰动值
-        max_s = (self.road.get_s_max() - 1e-6)[:,None].expand(-1,2)
-        s_plus = torch.clamp(s + epsilon, max=max_s)
-        pos_plus = self.road.get_pts(s_plus)  # [B,2]
-        pos = self.road.get_pts(s)  # [B,2]
-        tangent_vec = pos_plus - pos
-        tangent_theta = torch.atan2(tangent_vec[..., 1], tangent_vec[..., 0])
-        return tangent_theta
+    
+    def _set_pose(self, agent: Agent, pos: Tensor, theta: Tensor, vel: Tensor, idx_mask: Tensor):
+        if hasattr(agent.state, "pos"):
+            agent.state.pos[idx_mask] = pos[idx_mask]
+        if hasattr(agent.state, "rot"):
+            theta_reshaped = theta.unsqueeze(-1) if theta.dim() == 1 else theta
+            agent.state.rot[idx_mask] = theta_reshaped[idx_mask]
+        elif hasattr(agent.state, "angle"):
+            theta_reshaped = theta.unsqueeze(-1) if theta.dim() == 1 else theta
+            agent.state.angle[idx_mask] = theta_reshaped[idx_mask]
+        if hasattr(agent.state, "vel"):
+            vx = vel[idx_mask] * torch.cos(theta[idx_mask])
+            vy = vel[idx_mask] * torch.sin(theta[idx_mask])
+            agent.state.vel[idx_mask] = torch.stack([vx, vy], dim=-1)
+            
     def reset_world_at(self, env_index: Optional[int] = None, agent_index: Optional[int] = None):
         """
         This function resets the world at the specified env_index and the specified agent_index.
@@ -1064,7 +1055,7 @@ class Scenario(BaseScenario):
         total_start = time.time()
         B = self.batch_dim
         device = self.device
-
+        assert agent_index==None,"agent_index must be None, not supported"
         # ============== 阶段1：初始化idx_mask ==============
         stage1_start = time.time()
         if env_index is None:
@@ -1085,53 +1076,39 @@ class Scenario(BaseScenario):
 
         # ============== 阶段3：计算最后一辆车弧长 ==============
         stage3_start = time.time()
-        s_buffer = 5.0
+        s_start_buffer = 5.0
+        s_end_buffer = 15.0
         if self.is_rand_arc_pos:
             last_vehicle_s = self.get_random_tensor() * self.road.get_s_max()
         else:
             last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos
-        last_vehicle_s = torch.clamp(last_vehicle_s, s_buffer * torch.ones(B,device=device),
-                                    self.road.get_s_max() - 2* s_buffer - (self.n_agents - 1) * torch.mean(spacing, dim=-1))
+        last_vehicle_s = torch.clamp(last_vehicle_s, s_start_buffer * torch.ones(B,device=device),
+                                    self.road.get_s_max() - (s_start_buffer + s_end_buffer) - (self.n_agents - 1) * torch.mean(spacing, dim=-1))
 
         # ============== 阶段4：OCCT_PLATOON核心逻辑 ==============
         stage4_start = time.time()
         if self.task_class == TaskClass.OCCT_PLATOON:
-            self.rod_len = (self.n_agents - 1) * torch.mean(spacing, dim=-1)
-            self.s_rear = torch.where(idx_mask, last_vehicle_s, self.s_rear)
-            # 3. 计算self.s_front = self.s_rear + rod_len，并夹取到道路合法范围
-            s_front_new = self.s_rear + self.rod_len
-            s_front_clamped = torch.clamp(s_front_new, max=self.road.get_s_max() - 1e-6)
-            self.s_front = torch.where(idx_mask, s_front_clamped, self.s_front)
-            p_front, p_rear = self.get_front_rear_pts(self.s_front, self.s_rear, env_index)
+            # caculate the s of front tractor via last_vehicle_s and rod_len
+            self.observations.agent_s[idx_mask, HINGE_LAST_INDEX] = last_vehicle_s[idx_mask]
+            delta_s, infeasible = self.road.solve_delta_s(last_vehicle_s,self.rod_len,False)
+            assert not infeasible.any(), "Infeasible delta_s"
+            s_front_new = delta_s + last_vehicle_s
+            assert (s_front_new[idx_mask] <= self.road.get_s_max()[idx_mask]).all(), "s_front_new out of range"
+            self.observations.agent_s[idx_mask, HINGE_FIRST_INDEX] = s_front_new[idx_mask]
+            
+            
+            p_front, p_rear = self.get_front_rear_pts(self.observations.agent_s[:,HINGE_FIRST_INDEX:], env_index)
             rod_vec = (p_front - p_rear)           # [B,2]
             rod_theta = torch.atan2(rod_vec[:, 1], rod_vec[:, 0])  # [B]
-        
-            # 设置牵引车初始位姿（只对 mask 的样本赋值）
-            def _set_pose(agent: Agent, pos: Tensor, theta: Tensor, vel: Tensor):
-                if hasattr(agent.state, "pos"):
-                    agent.state.pos[idx_mask] = pos[idx_mask]
-                if hasattr(agent.state, "rot"):
-                    # Ensure theta has the right shape for assignment
-                    theta_reshaped = theta.unsqueeze(-1) if theta.dim() == 1 else theta
-                    agent.state.rot[idx_mask] = theta_reshaped[idx_mask]
-                elif hasattr(agent.state, "angle"):
-                    # Ensure theta has the right shape for assignment
-                    theta_reshaped = theta.unsqueeze(-1) if theta.dim() == 1 else theta
-                    agent.state.angle[idx_mask] = theta_reshaped[idx_mask]
-                if hasattr(agent.state, "vel"):
-                    # 根据航向角和platoon_vel_batch计算速度分量
-                    vx = vel[idx_mask] * torch.cos(theta[idx_mask])
-                    vy = vel[idx_mask] * torch.sin(theta[idx_mask])
-                    agent.state.vel[idx_mask] = torch.stack([vx, vy], dim=-1)
             
             # 计算道路切线方向而不是使用货物方向
-            front_rear_theta = self.road.get_tangent_heading(torch.stack([self.s_front, self.s_rear], dim=-1))
+            front_rear_theta = self.road.get_tangent_heading(self.observations.agent_s[:, HINGE_FIRST_INDEX:])
             front_theta = front_rear_theta[:,0]
             rear_theta = front_rear_theta[:,1]
             
             # 设置牵引车初始位姿 - 修改：传递完整张量，不再提前过滤
-            _set_pose(self.tractor_front, p_front, front_theta, self.platoon_vel_batch)
-            _set_pose(self.tractor_rear, p_rear, rear_theta, self.platoon_vel_batch)
+            self._set_pose(self.tractor_front, p_front, front_theta, self.platoon_vel_batch, idx_mask)
+            self._set_pose(self.tractor_rear, p_rear, rear_theta, self.platoon_vel_batch, idx_mask)
 
             # ---- 随动：初始 free & 随机放置在杆附近（不 dock）----
             self.dock_state[idx_mask, :]     = False
@@ -1209,15 +1186,7 @@ class Scenario(BaseScenario):
         stage9_start = time.time()
         # 设置车辆状态
         for i, ag in enumerate(self.followers):
-            if hasattr(ag.state, "pos"):
-                ag.state.pos[idx_mask] = vehicle_pos[idx_mask, i, :]
-            if hasattr(ag.state, "rot"):
-                ag.state.rot[idx_mask] = vehicle_theta[idx_mask, i][:,None]
-            if hasattr(ag.state, "vel"):
-                # 根据航向角和platoon_vel_batch计算速度分量
-                vx = self.platoon_vel_batch[idx_mask] * torch.cos(vehicle_theta[idx_mask, i])
-                vy = self.platoon_vel_batch[idx_mask] * torch.sin(vehicle_theta[idx_mask, i])
-                ag.state.vel[idx_mask] = torch.stack([vx, vy], dim=-1)
+            self._set_pose(ag, vehicle_pos[:,i,:], vehicle_theta[:,i], self.platoon_vel_batch, idx_mask)
 
         # ============== 阶段10：重置智能体循环（距离/碰撞） ==============
         stage10_start = time.time()
@@ -1517,7 +1486,49 @@ class Scenario(BaseScenario):
             if u.shape[-1] >= 2:
                 u[docked_mask, :2] =  torch.zeros_like(u[docked_mask, :2])
                 agent.action.u = u
+    def get_front_rear_v_use_front(self):
+        s_front=self.observations.agent_s[:, HINGE_FIRST_INDEX]
+        ref_v = self.road.get_ref_v(s_front[:,None])[:,0,0] # [B]
+         #TODO using a simple pid to smooth vel change
+        v_front = torch.linalg.norm(self.tractor_front.state.vel, dim=-1)
+        error_v = v_front - ref_v
+        last_v = torch.linalg.norm(self.state_buffer.get_latest(n=2)[:,HINGE_FIRST_INDEX,-2:], dim=-1)
+        cur_acc = (v_front-last_v)/self.dt
+        Kp=-1
+        Kd=-0
+        desire_acc = torch.clamp(Kp * error_v + Kd * cur_acc, 
+                                 min=-self.max_acceleration,
+                                 max=self.max_acceleration)
+        v_front += desire_acc * self.dt
+        s_front += v_front * self.dt # [B]
+        delta_s, infeasible = self.road.solve_delta_s(s_front, self.rod_len*torch.ones_like(s_front))
+        assert not infeasible.any(), "Infeasible delta_s"
+        s_rear = s_front - delta_s
+        v_rear = (s_rear - self.observations.agent_s[:, HINGE_LAST_INDEX])/self.dt
+        v_front = (self.observations.agent_s[:, HINGE_FIRST_INDEX] - s_front)/self.dt
+        return v_front, v_rear
 
+    def get_front_rear_v_use_rear(self):
+        s_rear=self.observations.agent_s[:, HINGE_LAST_INDEX]
+        ref_v = self.road.get_ref_v(s_rear[:,None])[:,0,0] # [B]
+         #TODO using a simple pid to smooth vel change
+        v_rear = torch.linalg.norm(self.tractor_rear.state.vel, dim=-1)
+        error_v = v_rear - ref_v
+        last_v = torch.linalg.norm(self.state_buffer.get_latest(n=2)[:,HINGE_LAST_INDEX,-2:], dim=-1)
+        cur_acc = (v_rear-last_v)/self.dt
+        Kp=-1
+        Kd=-0
+        desire_acc = torch.clamp(Kp * error_v + Kd * cur_acc, 
+                                 min=-self.max_acceleration,
+                                 max=self.max_acceleration)
+        v_rear += desire_acc * self.dt
+        s_rear += v_rear * self.dt # [B]
+        delta_s, infeasible = self.road.solve_delta_s(s_rear, self.rod_len*torch.ones_like(s_rear), backward=False)
+        assert not infeasible.any(), "Infeasible delta_s"
+        s_front = s_rear + delta_s
+        v_front = (s_front - self.observations.agent_s[:, HINGE_FIRST_INDEX])/self.dt
+        return v_front, v_rear
+        
     def pre_step(self):
         """
         每次 world.step() 之前：
@@ -1529,9 +1540,14 @@ class Scenario(BaseScenario):
         """
         if self.task_class==TaskClass.SIMPLE_PLATOON:
             return
-        # ---- 1) 推进前端弧长并夹取到道路范围 ----
-        ref_v = self.road.get_ref_v(self.s_front[:,None])[:,0,0] # [B]
-        s_front = self.s_front + ref_v * self.dt # [B]
+        # TODO: check whether correct 260109
+        v_front1, v_rear1 = self.get_front_rear_v_use_front()
+        v_front2, v_rear2 = self.get_front_rear_v_use_rear()
+        select_idx = torch.max(v_front1, v_rear1)<torch.max(v_front2, v_rear2)
+        v_front = torch.where(select_idx, v_front1, v_front2)
+        v_rear = torch.where(select_idx, v_rear1, v_rear2)
+
+        s_front += v_front * self.dt # [B]
         # 不要超过道路最大 s；留一点 eps 免得插值越界
         s_max = self.road.get_s_max() - 1e-6
         s_min = torch.zeros_like(s_max, device=self.device)
@@ -1539,21 +1555,25 @@ class Scenario(BaseScenario):
 
         # ---- 2) 固定弦长解 Δs -> s_rear ----
         delta_s, infeasible = self.road.solve_delta_s(s_front, self.rod_len*torch.ones_like(s_front))
+        assert not infeasible.any(), "Infeasible delta_s"
         s_rear = s_front - delta_s
         s_rear = torch.clamp(s_rear, min=s_min, max=s_max)
 
-        # 缓存回成员（别忘了）
-        self.s_front = s_front
-        self.s_rear  = s_rear
-        self.infeasible_mask = infeasible    # 你后面可据此降速/强制 undock，加惩罚等
-
-        # ---- 3) 端点坐标与杆朝向 ----
-        p_front, p_rear = self.get_front_rear_pts(s_front, s_rear) # ([B,2], [B,2])
+        # update the s of first and last agent
+        self.observations.agent_s[:, HINGE_FIRST_INDEX] = s_front
+        v_rear = (s_rear - self.observations.agent_s[:, HINGE_LAST_INDEX])/self.dt
+        self.observations.agent_s[:, HINGE_LAST_INDEX] = s_rear
+        front_rear_theta = self.road.get_tangent_heading(self.observations.agent_s[:, HINGE_FIRST_INDEX:])
+        front_theta = front_rear_theta[:,0]
+        rear_theta = front_rear_theta[:,1]
+        p_front, p_rear = self.get_front_rear_pts(self.observations.agent_s[:,HINGE_FIRST_INDEX:]) # ([B,2], [B,2])
         rod_vec = p_front - p_rear                                             # [B,2]
         theta_rod = torch.atan2(rod_vec[:, 1], rod_vec[:, 0])                  # [B]
+        idx_mask = torch.ones(self.batch_dim, dtype=torch.bool, device=self.device)
+        self._set_pose(self.tractor_front, p_front, front_theta, v_front, idx_mask)
+        self._set_pose(self.tractor_rear, p_rear, rear_theta, v_rear, idx_mask)
 
         # ---- 4) 更新锚点世界位姿（等间距示例；若你有自定义分布，就替换这里）----
-        # latch at: p = p_rear + α * (p_front - p_rear)
         self.latch_pos_world   = p_rear[:, None, :] + self.latch_alpha[None, :, None] * rod_vec[:, None, :]
         self.latch_theta_world = theta_rod[:, None].expand(-1, self.n_latch)   # 全部用杆朝向
 
@@ -1569,22 +1589,18 @@ class Scenario(BaseScenario):
         - 对 docked 的随动车辆做硬投影（对齐到各自锚点）
         - 统计 dock 计时等
         """
+        
         B = self.batch_dim
         # update arch of agents
-        latest_pos = self.state_buffer.get_latest(n=1)[:,:self.n_followers,0:2] # [B, F, 2]
-        tangent_vec = self.road.get_tangent_vector(self.observations.agent_s[:, :self.n_followers])  # [B, F, 2]
+        latest_pos = self.state_buffer.get_latest(n=1)[:,:,:2] # [B, F, 2]
+        tangent_vec = self.road.get_tangent_vector(self.observations.agent_s)  # [B, F, 2]
         agents_pos = torch.zeros_like(latest_pos)
-        for i, agent in enumerate(self.followers):
-            agents_pos[:, i, 0:2] = agent.state.pos
+        for i, agent in enumerate(self.world.agents):
+            agents_pos[:, i, :2] = agent.state.pos
         agents_move_vec = agents_pos - latest_pos
-        
         delta_s = torch.sum(agents_move_vec * tangent_vec, dim=-1)  # [B, F]
-        self.observations.agent_s[:, :self.n_followers] += delta_s
-        # # debug: s error
-        # pos_tmp = agents[i_agent].state.pos[env_j, :]
-        # ref_tmp = self.road.get_pts(self.observations.agent_s[env_j, i_agent],env_j)
-        # dis_tmp = torch.linalg.norm(ref_tmp-pos_tmp,dim=-1)
-        # print(f"reset_init_distances_and_short_term_ref_path,dis_tmp: {torch.mean(dis_tmp)}")
+        # update the follower's s
+        self.observations.agent_s[...,:self.n_followers] += delta_s[:, :self.n_followers]
         if self.task_class==TaskClass.SIMPLE_PLATOON:
             return
         for i, agent in enumerate(self.followers):
@@ -1602,29 +1618,6 @@ class Scenario(BaseScenario):
                 theta_i[docked_mask],               # [M]
                 mask=docked_mask,                   # [B]
             )
-        # 更新牵引车位置以跟随货物（修改后的版本）
-        p_front, p_rear = self.get_front_rear_pts(self.s_front, self.s_rear)
-        # 计算道路切线方向而不是使用货物方向
-        front_rear_theta = self.road.get_tangent_heading(torch.stack([self.s_front, self.s_rear], dim=-1))
-        front_theta = front_rear_theta[:,0]
-        rear_theta = front_rear_theta[:,1]
-        rod_theta = torch.atan2(p_front[:,1]-p_rear[:,1], p_front[:,0]-p_rear[:,0])  # [B]
-        
-        # 分别为前后牵引车设置各自的道路切线方向
-        for i, agent in enumerate([self.tractor_front, self.tractor_rear]):
-            if hasattr(agent.state, "pos"):
-                # 使用杆端点位置
-                pos = p_front if i == 0 else p_rear
-                agent.state.pos = pos
-            if hasattr(agent.state, "rot"):
-                # 使用道路切线方向
-                theta = front_theta if i == 0 else rear_theta
-                agent.state.rot = theta.unsqueeze(-1)
-            elif hasattr(agent.state, "angle"):
-                # 使用道路切线方向
-                theta = front_theta if i == 0 else rear_theta
-                agent.state.angle = theta
-        
 
         # 计时器（可用于奖励）：每步给 docked 的样本累加 dt
         self.dock_timer += self.dock_state.to(self.dock_timer.dtype) * self.dt
@@ -2317,7 +2310,7 @@ class Scenario(BaseScenario):
         self.update_state_before_rewarding(agent, agent_index)
         t1=time.time()
         #print(f"update_state_before_rewarding, agent_index: {agent_index}, time: {t1-t0:.6f}s")
-
+    
         if agent_index>=self.n_followers:
             self.update_state_after_rewarding(agent_index)
             return self.rew
@@ -2781,8 +2774,6 @@ class Scenario(BaseScenario):
                 dim=-1,
             )
             self.state_buffer.add(state_add)
-        if agent_index >= self.n_followers:
-            return
         if self.use_frenet_ref:
             self.ref_paths_agent_related.short_term[:, agent_index] = \
                 get_short_term_reference_path_by_s(
@@ -3022,7 +3013,7 @@ class Scenario(BaseScenario):
         #     geom.add_attr(xform)
         #     geoms.append(geom)
 
-        for agent_i, ag in enumerate(self.followers):
+        for agent_i, ag in enumerate(self.world.agents):
             pos = ag.state.pos[env_index].detach().cpu().tolist()
             # 中心黑点
             dot = rendering.make_circle(radius=0.12, filled=True)
@@ -3103,10 +3094,8 @@ class Scenario(BaseScenario):
                     geoms.append(circle)
         # ---------- 3) 超大件（杆 + 锚点） ----------
         if self.task_class==TaskClass.OCCT_PLATOON:
-            # 端点坐标
-            p_front, p_rear = self.get_front_rear_pts(self.s_front, self.s_rear, env_index)
-            pf = p_front[env_index].detach().cpu()
-            pr = p_rear[env_index].detach().cpu()
+            pf = self.tractor_front.state.pos[env_index].detach().cpu()
+            pr = self.tractor_rear.state.pos[env_index].detach().cpu()
             rod = pf - pr
             rod_len = torch.linalg.norm(rod).item() + 1e-9
             t_hat = (rod / rod_len)            # 切向
@@ -3114,12 +3103,12 @@ class Scenario(BaseScenario):
 
             # 超大件半宽（可选参数）
             cargo_half_w = self.cargo_half_width
-
+            edge_width = self.cargo_half_width
             # 四个角点：rear±n*w, front±n*w
-            rear_left   = (pr + n_hat * cargo_half_w).tolist()
-            rear_right  = (pr - n_hat * cargo_half_w).tolist()
-            front_left  = (pf + n_hat * cargo_half_w).tolist()
-            front_right = (pf - n_hat * cargo_half_w).tolist()
+            rear_left   = (pr + n_hat * cargo_half_w - t_hat * edge_width).tolist()
+            rear_right  = (pr - n_hat * cargo_half_w - t_hat * edge_width).tolist()
+            front_left  = (pf + n_hat * cargo_half_w + t_hat * edge_width).tolist()
+            front_right = (pf - n_hat * cargo_half_w + t_hat * edge_width).tolist()
 
             # 用 PolyLine(close=True) 画矩形外框
             cargo_outline = rendering.PolyLine(
