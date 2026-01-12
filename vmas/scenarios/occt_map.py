@@ -651,11 +651,11 @@ class OcctCRMap(MapBase):
                 # # if not((path_ids[0]==128 and path_ids[-1]==106) or \
                 # #    (path_ids[0]==102 and path_ids[-1]==175)):
                 #     continue
-                # if ((path_ids[0]==100 and path_ids[-1]==129) or \
-                #    (path_ids[0]==108 and path_ids[-1]==166) or \
-                #    (path_ids[0]==128 and path_ids[-1]==106) or \
-                #     (path_ids[0]==189 and path_ids[-1]==103)):
-                if not (path_ids[0]==102 and path_ids[-1]==164):
+                if ((path_ids[0]==100 and path_ids[-1]==129) or \
+                   (path_ids[0]==108 and path_ids[-1]==166) or \
+                   (path_ids[0]==128 and path_ids[-1]==106) or \
+                    (path_ids[0]==189 and path_ids[-1]==103)):
+                #if not (path_ids[0]==102 and path_ids[-1]==164):
                 # if not(path_ids[0]==128 and path_ids[-1]==106):
                 # if not((path_ids[0]==128 and path_ids[-1]==106) or \
                 #    (path_ids[0]==102 and path_ids[-1]==175)):
@@ -735,6 +735,17 @@ class OcctCRMap(MapBase):
                 if (hinge_status==1).all():
                     # means no corner, we dont want this path
                     continue
+
+                # TODO: how the define hinge reward and status
+                # we want to make hinge ready only pass the corner, but cant make sure all hinge has 0 status through the corner
+                # make hinge status consistent through the corner
+                for hinge_idx in range(hinge_status.shape[0]):
+                    if (hinge_status[hinge_idx]==0).any():#exclude first and last hinge pts
+                        begin_idx = torch.where(hinge_status[hinge_idx] == 0)[0][0]
+                        pass_corner_idx = torch.where(hinge_status[hinge_idx] == 0)[0][-1]
+                        hinge_status[hinge_idx, begin_idx:pass_corner_idx] = 0
+                # pass_corner_idx = torch.where(hinge_status == 0)[0][-1]
+                # hinge_status[:pass_corner_idx] = 0
                 self.path_library.append({
                     "map_name": map_name,
                     "path_ids": path_ids,
@@ -772,7 +783,7 @@ class OcctCRMap(MapBase):
                 correspond_pts = center_splines.evaluate(correspond_s)
                 correspond_width = torch.linalg.norm(left_splines.evaluate(correspond_s)-right_splines.evaluate(correspond_s), dim=-1)
                 # 1 means ready to hinge, 0 means not ready
-                hinge_status[agent_idx, s_idx] = 1 if torch.linalg.norm(hinge_pts-correspond_pts)<correspond_width/2 else 0
+                hinge_status[agent_idx, s_idx] = 1 if torch.linalg.norm(hinge_pts-correspond_pts)<max(correspond_width/2-1, 0.75) else 0
         return hinge_status, hinge_trajs
     def gaussian_smooth_1d(self, x: torch.Tensor, sigma: float = 2.0) -> torch.Tensor:
         """
@@ -1031,7 +1042,6 @@ class OcctCRMap(MapBase):
             return ref_v
         
     def get_hinge_status(self, s: Tensor, env_j: int = None) -> Tensor:
-        # TODO: 260109
         hinge_status = self.hinge_status_splines.evaluate(s)
         if s.dim()==0 or s.dim()==1:
             if type(env_j) == int:

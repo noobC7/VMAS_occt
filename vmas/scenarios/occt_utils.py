@@ -176,6 +176,7 @@ class OcctObservations:
         past_vertices: CircularBuffer = None,
         past_vel: CircularBuffer = None,
         past_short_term_ref_points: CircularBuffer = None,
+        past_short_term_hinge_points: CircularBuffer = None,
         past_action_acc: CircularBuffer = None,
         past_action_steering: CircularBuffer = None,
         past_distance_to_ref_path: CircularBuffer = None,
@@ -204,6 +205,9 @@ class OcctObservations:
         self.past_short_term_ref_points = (
             past_short_term_ref_points  # Past short-term reference points
         )
+        self.past_short_term_hinge_points = (
+            past_short_term_hinge_points  # Past short-term hinge points
+        )
         self.past_left_boundary = past_left_boundary  # Past left lanelet boundary
         self.past_right_boundary = past_right_boundary  # Past right lanelet boundary
 
@@ -229,3 +233,41 @@ def check_validity(obj):
         if isinstance(attr_value, torch.Tensor) and torch.isnan(attr_value).any():
             nan_indices = torch.nonzero(torch.isnan(attr_value), as_tuple=False)
             raise ValueError(f"NaN found in self.{attr_name}, index:{nan_indices}")
+
+# def get_short_term_reference_path_by_s_all_agents_backup(
+#     occt_map: OcctCRMap,
+#     agent_s : Tensor, 
+#     n_points_to_return: int,
+#     device=None,
+#     sample_dt: int = 2,
+#     env_j: int = None,
+#     line: str = "center",
+# ):
+#     """
+#     Args:
+#         occt_map:                   OcctMap or OcctCRMap.
+#         agent_s:                    [batch_size, n_agents]. In the case of the latter, batch_dim is deemed as 1.
+#         n_points_to_return:         [1] or []. In the case of the latter, batch_dim is deemed as 1.
+#         sample_dt:                  Sample dt to match specific purposes"""
+#     # warning: not compatible with env_j=int
+#     if device is None:
+#         device = torch.device("cpu")
+#     assert agent_s.dim()==2, "agent_s must be [batch_size, n_agents]!"
+#     B=agent_s.shape[0]
+#     short_term_path = torch.zeros((B, agent_s.shape[1], n_points_to_return, 3), device=device, dtype=torch.float32)
+#     if line=="center":
+#         agent_s_query = torch.zeros((B, agent_s.shape[1], n_points_to_return), device=device, dtype=torch.float32)
+#         agent_s_query[..., 0] = agent_s
+#         short_term_path[..., 0, 2] = occt_map.get_ref_v(agent_s_query[:, :, 0], env_j).squeeze(dim=-1).reshape(B, agent_s.shape[1])
+#         for i in range(1, n_points_to_return):
+#             ref_v = occt_map.get_ref_v(agent_s_query[:, :, i-1], env_j).squeeze(dim=-1).reshape(B, agent_s.shape[1])
+#             agent_s_query[..., i] = agent_s_query[:, :, i-1] + sample_dt * ref_v
+#             short_term_path[..., i, 2] = ref_v
+#     else:
+#         agent_s_query=torch.hstack([agent_s+i*sample_dt*4 for i in range(n_points_to_return)])
+#         ref_v = occt_map.get_ref_v(agent_s_query, env_j).squeeze(dim=-1).reshape(B, agent_s.shape[1], n_points_to_returny)
+#         short_term_path[..., 2] = ref_v
+#     agent_s_query = agent_s_query.reshape(B, -1)
+#     ref_pts = occt_map.get_pts(agent_s_query, env_j, line).reshape(B, agent_s.shape[1], n_points_to_return, 2)
+#     short_term_path[...,:2] = ref_pts
+#     return short_term_path
