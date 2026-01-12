@@ -118,6 +118,44 @@ def get_short_term_reference_path_by_s(
         return short_term_path[0,...]
     return short_term_path
 
+def get_short_term_hinge_path_by_s(
+    occt_map: OcctCRMap,
+    agents : Agent, 
+    agent_s: Tensor,
+    n_points_to_return: int,
+    tractor_slice: list,
+    device=None,
+    sample_dt: int = 1,
+    env_j: int = None,
+):
+    """
+    Args:
+        occt_map:                   OcctMap or OcctCRMap.
+        agent_s:                    [batch_size, 1] or [1] or []. In the case of the latter, batch_dim is deemed as 1.
+        n_points_to_return:         [1] or []. In the case of the latter, batch_dim is deemed as 1.
+        sample_interval:            Sample interval to match specific purposes;
+                                    set to 2 when using this function to get the short-term reference path;
+                                    set to 1 when using this function to get the nearing boundary points."""
+    if device is None:
+        device = torch.device("cpu")
+    HINGE_FIRST_INDEX=tractor_slice[0]
+    HINGE_LAST_INDEX=tractor_slice[-1]
+    first_agent_s = agent_s[env_j, HINGE_FIRST_INDEX]
+    last_agent_s = agent_s[env_j, HINGE_LAST_INDEX]
+    B=agent_s.shape[0] if agent_s.dim() else 1
+    hinge_short_term=torch.zeros((B, len(agents), n_points_to_return , 3), device=device, dtype=torch.float32)
+    first_agent_vel = torch.linalg.norm(agents[HINGE_FIRST_INDEX].state.vel, dim=-1)
+    last_agent_vel = torch.linalg.norm(agents[HINGE_LAST_INDEX].state.vel, dim=-1)
+    first_agent_s_query = torch.stack([first_agent_s+i*sample_dt*first_agent_vel for i in range(n_points_to_return)],dim=-1)
+    last_agent_s_query = torch.stack([last_agent_s+i*sample_dt*last_agent_vel for i in range(n_points_to_return)],dim=-1)
+    first_last_pred_traj = occt_map.get_pts(torch.cat([first_agent_s_query, last_agent_s_query], dim=1), env_j)
+    first_pred_traj = first_last_pred_traj[:,:n_points_to_return] #[B, n_points_to_return, 2]
+    last_pred_traj = first_last_pred_traj[:,n_points_to_return:] #[B, n_points_to_return, 2]
+    for i in range(len(agents)):
+        hinge_short_term[...,i,:,:2] = first_pred_traj + (i/(len(agents)-1))*(last_pred_traj - first_pred_traj)
+    hinges_status = occt_map.get_hinge_status(first_agent_s_query, env_j).transpose(-2,-1) # [batch_size, 2] or [2]
+    hinge_short_term[...,-1] = hinges_status
+    return hinge_short_term
 
 class ReferencePathsAgentRelated:
     def __init__(
@@ -128,6 +166,7 @@ class ReferencePathsAgentRelated:
         nearing_points_left_boundary: torch.Tensor = None,
         nearing_points_right_boundary: torch.Tensor = None,
         short_term: torch.Tensor = None,
+        hinge_short_term: torch.Tensor = None,
         short_term_indices: torch.Tensor = None,
         exit: torch.Tensor = None,
     ):
@@ -135,6 +174,7 @@ class ReferencePathsAgentRelated:
         self.left_boundary = left_boundary
         self.right_boundary = right_boundary
         self.short_term = short_term  # Short-term reference path
+        self.hinge_short_term = hinge_short_term  # Short-term reference path for the hinge
         self.short_term_indices = short_term_indices  # Indices that indicate which part of the long-term reference path is used to build the short-term reference path
         self.nearing_points_left_boundary = nearing_points_left_boundary  # Nearing left boundary
         self.nearing_points_right_boundary = nearing_points_right_boundary  # Nearing right boundary
@@ -144,8 +184,6 @@ from enum import IntEnum
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
     OCCT_PLATOON = 1 # with cargo
-HINGE_FIRST_INDEX=-2
-HINGE_LAST_INDEX=-1
 class Scenario(BaseScenario):
     def make_world(self, batch_dim: int, device: torch.device, **kwargs) -> World:
         self.device = device
@@ -211,21 +249,27 @@ class Scenario(BaseScenario):
         self.batch_dim = batch_dim
         self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
-        self.n_agents=kwargs.pop("n_agents", 3)
+        self.n_agents=kwargs.pop("n_agents", 4)
         # platoon params
         self.is_loop=kwargs.pop("is_loop", False)
         # use agents_s to get ref pts for short term
         self.use_frenet_ref=kwargs.pop("use_frenet_ref", True)
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", True)
-        self.init_arc_pos = kwargs.pop("init_arc_pos", 5.0)
+        self.init_arc_pos = kwargs.pop("init_arc_pos", 40.0)
         self.init_vel_mean = kwargs.pop("init_vel_mean", 1.0)
         self.init_vel_std = kwargs.pop("init_vel_std", 0.0) 
         self.still_space = kwargs.pop("still_space", 10.0)
         self.platoon_tau = kwargs.pop("platoon_tau", 0.0)
         if self.task_class == TaskClass.SIMPLE_PLATOON:
             self.n_followers = self.n_agents
+            self.TRACTOR_SLICE = [123456]
+            self.FOLLOWER_SLICE=slice(0, self.n_agents)
         else:
             self.n_followers = self.n_agents - 2
+            self.HINGE_FIRST_INDEX=0
+            self.HINGE_LAST_INDEX=self.n_agents-1
+            self.TRACTOR_SLICE = [self.HINGE_FIRST_INDEX,self.HINGE_LAST_INDEX]
+            self.FOLLOWER_SLICE=slice(self.HINGE_FIRST_INDEX+1,self.HINGE_LAST_INDEX)
         self.n_nearing_agents_observed=kwargs.pop("n_nearing_agents_observed", 2)
         if self.n_nearing_agents_observed >= self.n_agents:
             raise ValueError("n_nearing_agents_observed must be less than n_agents")
@@ -234,15 +278,12 @@ class Scenario(BaseScenario):
         self.n_points_short_term=kwargs.pop("n_points_short_term", 5)
         self.sample_interval=kwargs.pop("sample_interval", 2)
         
-        self.n_points_nearing_boundary=kwargs.pop("n_points_nearing_boundary", 6)
+        self.n_points_nearing_boundary=kwargs.pop("n_points_nearing_boundary", 5)
         self.is_ego_view=kwargs.pop("is_ego_view", True)
         self.is_apply_mask=kwargs.pop("is_apply_mask", True)
         self.is_observe_vertices=kwargs.pop("is_observe_vertices", True)
         self.is_observe_distance_to_agents=kwargs.pop(
             "is_observe_distance_to_agents", True
-        )
-        self.is_observe_distance_to_boundaries=kwargs.pop(
-            "is_observe_distance_to_boundaries", False
         )
         self.is_observe_distance_to_center_line=kwargs.pop(
             "is_observe_distance_to_center_line", True
@@ -306,7 +347,7 @@ class Scenario(BaseScenario):
         
         if self.task_class == TaskClass.OCCT_PLATOON:
             # agent params
-            self.n_latch = int(kwargs.get("n_latch", 5))
+            self.n_latch = self.n_followers
             self.cargo_half_width = float(kwargs.get("cargo_half_width", 1.7))
             
             # ---- 锚点（沿杆的比例 alpha）----
@@ -338,7 +379,7 @@ class Scenario(BaseScenario):
             device=device,
             cr_map_dir="/home/yons/Graduation/VMAS_occt/vmas/scenarios_data/cr_maps/debug",
             max_ref_v=self.max_speed,
-            is_constant_ref_v=True, #TODO: variant ref v perform bad, change to constant
+            is_constant_ref_v=True,
             eval_mode=kwargs.pop("eval_mode", False),
             rod_len=self.rod_len,
             n_agents=self.n_agents,
@@ -355,7 +396,12 @@ class Scenario(BaseScenario):
                 (batch_dim, self.n_agents, self.n_points_short_term, 3),
                 device=device,
                 dtype=torch.float32,
-            ),  # Short-term reference path
+            ),  # [x, y, v]
+            hinge_short_term=torch.zeros(
+                (batch_dim, self.n_agents, self.n_points_short_term, 3),
+                device=device,
+                dtype=torch.float32,
+            ),  # [x, y, hinge_status]
             short_term_indices=torch.zeros(
                 (batch_dim, self.n_agents, self.n_points_short_term),
                 device=device,
@@ -446,7 +492,7 @@ class Scenario(BaseScenario):
                 is_partial_observation, device=device, dtype=torch.bool
             ),
             n_nearing_agents=torch.tensor(
-                self.n_agents, # TODO: determine partially observe
+                self.n_agents,
                 device=device,
                 dtype=torch.int32,
             ),
@@ -470,12 +516,6 @@ class Scenario(BaseScenario):
             agent_s=torch.zeros(
                 (batch_dim, self.n_agents), device=device, dtype=torch.float32
             ),
-            hinge_pos=torch.zeros(
-                (batch_dim, self.n_agents, 2), device=device, dtype=torch.float32
-            ),
-            hinge_state=torch.zeros(
-                (batch_dim, self.n_agents), device=device, dtype=torch.int64
-            ),# 0 means
             nearing_agents_indices=torch.zeros(
                     (batch_dim, self.n_agents, self.n_agents),
                     device=device,
@@ -518,6 +558,19 @@ class Scenario(BaseScenario):
                         self.n_agents,
                         self.n_points_short_term,
                         3,
+                    ),
+                    device=device,
+                    dtype=torch.float32,
+                )
+            ),
+            past_short_term_hinge_points = CircularBuffer(
+                torch.zeros(
+                    (
+                        n_stored_steps,
+                        batch_dim,
+                        self.n_agents,
+                        self.n_points_short_term,
+                        3,# [pos_x, pos_y, ready]
                     ),
                     device=device,
                     dtype=torch.float32,
@@ -853,60 +906,36 @@ class Scenario(BaseScenario):
     # ========== 3) 创建 Agent & 标注 policy_agents ==========
     def init_agents(self, world: World, *kwargs):
         self.followers = []
-
-        # 牵引车（脚本控制，不进 policy_agents）
-        # 设置合适的形状和动作范围
-        
-
-        for i in range(self.n_followers):
-            # a = Agent(
-            #         name=f"agent_{i}", 
-            #         shape=Box(length=self.agent_length, width=self.agent_width),
-            #         color=tuple(
-            #             torch.rand(3, device=world.device, dtype=torch.float32).tolist()
-            #         ),
-            #         collide=False,
-            #         render_action=False,
-            #         u_range=[
-            #             self.max_speed,
-            #             self.max_steering_angle,
-            #         ],  # Control command serves as velocity command
-            #         u_multiplier=[1, 1],
-            #         max_speed=self.max_speed,
-            #         dynamics=KinematicBicycle(  # Use the kinematic bicycle model for each agent
-            #             world,
-            #             width=self.agent_width,
-            #             l_f=self.l_f,
-            #             l_r=self.l_r,
-            #             max_steering_angle=self.max_steering_angle,
-            #             integration="rk4",  # one of {"euler", "rk4"}
-            #         ),
-            #     )
-            # a = Agent(
-            #         name=f"agent_{i}", 
-            #         shape=Box(length=self.agent_length, width=self.agent_width),
-            #         color=tuple(
-            #             torch.rand(3, device=world.device, dtype=torch.float32).tolist()
-            #         ),
-            #         collide=False,
-            #         render_action=False,
-            #         u_range=[
-            #             self.max_acceleration,
-            #             self.max_steering_rate,
-            #         ],
-            #         u_multiplier=[1, 1],
-            #         max_speed=self.max_speed,
-            #         dynamics=DynamicKinematicBicycle(
-            #             world,
-            #             width=self.agent_width,
-            #             l_f=self.l_f,
-            #             l_r=self.l_r,
-            #             max_steering_angle=self.max_steering_angle,
-            #             max_steering_rate=self.max_steering_rate,
-            #             max_acceleration=self.max_acceleration,
-            #             integration="rk4",  # one of {"euler", "rk4"}
-            #         ),
-            #     )
+        i=0
+        if self.task_class != TaskClass.SIMPLE_PLATOON:
+            self.tractor_front = Agent(
+                name=f"agent_{i}",
+                shape=Box(length=self.agent_length, width=self.agent_width),
+                color=Color.RED,
+                collide=False,
+                render_action=False,
+                u_range=[
+                    self.max_acceleration,
+                    self.max_steering_angle,
+                ],
+                u_multiplier=[1, 1],
+                max_speed=self.max_speed,
+                # 禁用 drag 和 linear_friction
+                drag = 0.0,
+                linear_friction = 0.0,
+                dynamics=DelayedSteeringKinematicBicycle(
+                        world,
+                        width=self.agent_width,
+                        l_f=self.l_f,
+                        l_r=self.l_r,
+                        max_acceleration=self.max_acceleration,
+                        max_steering_angle=self.max_steering_angle,
+                        integration="rk4",  # one of {"euler", "rk4"}
+                    ),
+            )
+            world.add_agent(self.tractor_front)
+            i=1
+        for _ in range(self.n_followers):
             a = Agent(
                     name=f"agent_{i}", 
                     shape=Box(length=self.agent_length, width=self.agent_width),
@@ -951,39 +980,11 @@ class Scenario(BaseScenario):
                 )
             world.add_agent(a)
             self.followers.append(a)
-            
+            i+=1
+        
         if self.task_class != TaskClass.SIMPLE_PLATOON:
-            # otherwise error: NotImplementedError (note: full exception trace is shown but execution is paused at: _run_module_as_main)
-            # File "/home/yons/Graduation/rl_occt/sota-implementations/multiagent/mappo_ippo_occt.py", line 141, in train
-            # "low": env.full_action_spec_unbatched[("agents", "action")].space.low,
-                
-            self.tractor_front = Agent(
-                name=f"agent_{i+1}",
-                shape=Box(length=self.agent_length, width=self.agent_width),
-                color=Color.RED,
-                collide=False,
-                render_action=False,
-                u_range=[
-                    self.max_acceleration,
-                    self.max_steering_angle,
-                ],
-                u_multiplier=[1, 1],
-                max_speed=self.max_speed,
-                # 禁用 drag 和 linear_friction
-                drag = 0.0,
-                linear_friction = 0.0,
-                dynamics=DelayedSteeringKinematicBicycle(
-                        world,
-                        width=self.agent_width,
-                        l_f=self.l_f,
-                        l_r=self.l_r,
-                        max_acceleration=self.max_acceleration,
-                        max_steering_angle=self.max_steering_angle,
-                        integration="rk4",  # one of {"euler", "rk4"}
-                    ),
-            )
             self.tractor_rear  = Agent(
-                name=f"agent_{i+2}",  
+                name=f"agent_{i}",  
                 shape=Box(length=self.agent_length, width=self.agent_width),
                 color=Color.BLUE,
                 collide=False,
@@ -1007,8 +1008,8 @@ class Scenario(BaseScenario):
                         integration="rk4",  # one of {"euler", "rk4"}
                     ),
             )
-            world.add_agent(self.tractor_front)
             world.add_agent(self.tractor_rear)
+            
     def get_occt_cr_path_num(self):
         """
         获取OCCT CR地图路径数量
@@ -1089,20 +1090,19 @@ class Scenario(BaseScenario):
         stage4_start = time.time()
         if self.task_class == TaskClass.OCCT_PLATOON:
             # caculate the s of front tractor via last_vehicle_s and rod_len
-            self.observations.agent_s[idx_mask, HINGE_LAST_INDEX] = last_vehicle_s[idx_mask]
+            self.observations.agent_s[idx_mask, self.HINGE_LAST_INDEX] = last_vehicle_s[idx_mask]
             delta_s, infeasible = self.road.solve_delta_s(last_vehicle_s,self.rod_len,False)
             assert not infeasible.any(), "Infeasible delta_s"
             s_front_new = delta_s + last_vehicle_s
             assert (s_front_new[idx_mask] <= self.road.get_s_max()[idx_mask]).all(), "s_front_new out of range"
-            self.observations.agent_s[idx_mask, HINGE_FIRST_INDEX] = s_front_new[idx_mask]
+            self.observations.agent_s[idx_mask, self.HINGE_FIRST_INDEX] = s_front_new[idx_mask]
             
-            
-            p_front, p_rear = self.get_front_rear_pts(self.observations.agent_s[:,HINGE_FIRST_INDEX:], env_index)
+            p_front, p_rear = self.get_front_rear_pts(self.observations.agent_s[:,self.TRACTOR_SLICE], env_index)
             rod_vec = (p_front - p_rear)           # [B,2]
             rod_theta = torch.atan2(rod_vec[:, 1], rod_vec[:, 0])  # [B]
             
             # 计算道路切线方向而不是使用货物方向
-            front_rear_theta = self.road.get_tangent_heading(self.observations.agent_s[:, HINGE_FIRST_INDEX:])
+            front_rear_theta = self.road.get_tangent_heading(self.observations.agent_s[:, self.TRACTOR_SLICE])
             front_theta = front_rear_theta[:,0]
             rear_theta = front_rear_theta[:,1]
             
@@ -1162,7 +1162,10 @@ class Scenario(BaseScenario):
         # ============== 阶段7：记录agent_s ==============
         stage7_start = time.time()
         # 251224: record arch of agents for closest ref pts
-        self.observations.agent_s[env_index][...,:self.n_followers] = vehicle_s[env_index] #BUG FIX： asynchronous update of agent_s instead of self.observations.agent_s = vehicle_s
+        if self.task_class == TaskClass.OCCT_PLATOON:
+            self.observations.agent_s[env_index][...,self.FOLLOWER_SLICE] = vehicle_s[env_index] #BUG FIX： asynchronous update of agent_s instead of self.observations.agent_s = vehicle_s
+        else:
+            self.observations.agent_s[env_index] = vehicle_s[env_index]
 
         # ============== 阶段8：计算车辆位置/方向 ==============
         stage8_start = time.time()
@@ -1226,7 +1229,7 @@ class Scenario(BaseScenario):
                 self.reset_init_distances_and_short_term_ref_path(
                     env_j, i_agent, agents
                 )
-
+            self.reset_init_hinge_short_term(env_j, agents)
             # Compute mutual distances between agents
             mutual_distances = get_distances_between_agents(
                 self=self, is_set_diagonal=True
@@ -1253,6 +1256,7 @@ class Scenario(BaseScenario):
             dim=-1,
         )
         self.state_buffer.add(state_add)  # Add new state
+        
         self.time_records["state_buffer"] = time.time() - stage11_start
 
         # ============== 总计时结束 + 输出耗时报告 ==============
@@ -1275,7 +1279,20 @@ class Scenario(BaseScenario):
             ratio = (cost / total) * 100 if total > 0 else 0
             print(f"{stage:20s}: {cost:.6f}s ({ratio:.2f}%)")
         print("=============================================\n")
-
+    def reset_init_hinge_short_term(self, env_j, agents):
+        """
+        This function resets the short-term reference paths for all agents in the environment.
+        """
+        self.ref_paths_agent_related.hinge_short_term[env_j, :] = get_short_term_hinge_path_by_s(
+            occt_map=self.road,
+            agents=agents,
+            agent_s=self.observations.agent_s,
+            n_points_to_return=self.n_points_short_term,
+            tractor_slice=self.TRACTOR_SLICE,
+            device=self.world.device,
+            sample_dt=1.0,
+            env_j=env_j)
+        
     def reset_init_distances_and_short_term_ref_path(self, env_j, i_agent, agents):
         """
         This function calculates the distances from the agent's center of gravity (CG) to its reference path and boundaries,
@@ -1388,79 +1405,78 @@ class Scenario(BaseScenario):
 
         #print(f"get_short_term time_cost: {time.time()-tmp_t:.6f}s")
         tmp_t = time.time()
-        if not self.is_observe_distance_to_boundaries:
-            # Get nearing points on boundaries
-            if self.use_frenet_ref:
-                self.ref_paths_agent_related.nearing_points_left_boundary[env_j, i_agent] = \
-                    get_short_term_reference_path_by_s(
-                        self.road,
-                        self.observations.agent_s[env_j, i_agent],
-                        n_points_to_return=self.n_points_nearing_boundary,
-                        device=self.world.device,
-                        sample_interval=self.sample_interval,
-                        return_ref_v=False,
-                        env_j=env_j,
-                        line="left",
-                    )
-                self.ref_paths_agent_related.nearing_points_right_boundary[env_j, i_agent] = \
-                    get_short_term_reference_path_by_s(
-                        self.road,
-                        self.observations.agent_s[env_j, i_agent],
-                        n_points_to_return=self.n_points_nearing_boundary,
-                        device=self.world.device,
-                        sample_interval=self.sample_interval,
-                        return_ref_v=False,
-                        env_j=env_j,
-                        line="right",
-                    )
-            else:
-                (
-                    self.ref_paths_agent_related.nearing_points_left_boundary[
-                        env_j, i_agent
-                    ],
-                    _,
-                ) = get_short_term_reference_path_simple(
-                    polyline=self.ref_paths_agent_related.left_boundary[env_j, i_agent],
-                    index_closest_point=self.distances.closest_point_on_left_b[
-                        env_j, i_agent
-                    ],
+        # Get nearing points on boundaries
+        if self.use_frenet_ref:
+            self.ref_paths_agent_related.nearing_points_left_boundary[env_j, i_agent] = \
+                get_short_term_reference_path_by_s(
+                    self.road,
+                    self.observations.agent_s[env_j, i_agent],
                     n_points_to_return=self.n_points_nearing_boundary,
                     device=self.world.device,
                     sample_interval=self.sample_interval,
-                    n_points_shift=1,
+                    return_ref_v=False,
+                    env_j=env_j,
+                    line="left",
                 )
-                (
-                    self.ref_paths_agent_related.nearing_points_right_boundary[
-                        env_j, i_agent
-                    ],
-                    _,
-                ) = get_short_term_reference_path_simple(
-                    polyline=self.ref_paths_agent_related.right_boundary[env_j, i_agent],
-                    index_closest_point=self.distances.closest_point_on_right_b[
-                        env_j, i_agent
-                    ],
+            self.ref_paths_agent_related.nearing_points_right_boundary[env_j, i_agent] = \
+                get_short_term_reference_path_by_s(
+                    self.road,
+                    self.observations.agent_s[env_j, i_agent],
                     n_points_to_return=self.n_points_nearing_boundary,
                     device=self.world.device,
                     sample_interval=self.sample_interval,
-                    n_points_shift=1,
+                    return_ref_v=False,
+                    env_j=env_j,
+                    line="right",
                 )
-            #251231 exit segment initialization
-            s_max_idx = self.road.get_s_max_idx()[env_j]
-            if s_max_idx.dim():
-                last_pts_idx = s_max_idx[:, None, None].expand(-1, -1, 2)
-            else:
-                # single env_j
-                last_pts_idx = s_max_idx[None, None].expand(-1, 2)
-            self.ref_paths_agent_related.exit[env_j, i_agent, 0, :] = torch.gather(
-                self.ref_paths_agent_related.left_boundary[env_j, i_agent], 
-                dim=-2,
-                index=last_pts_idx
-            ).squeeze(-2)
-            self.ref_paths_agent_related.exit[env_j, i_agent, 1, :] = torch.gather(
-                self.ref_paths_agent_related.right_boundary[env_j, i_agent], 
-                dim=-2,
-                index=last_pts_idx
-            ).squeeze(-2)
+        else:
+            (
+                self.ref_paths_agent_related.nearing_points_left_boundary[
+                    env_j, i_agent
+                ],
+                _,
+            ) = get_short_term_reference_path_simple(
+                polyline=self.ref_paths_agent_related.left_boundary[env_j, i_agent],
+                index_closest_point=self.distances.closest_point_on_left_b[
+                    env_j, i_agent
+                ],
+                n_points_to_return=self.n_points_nearing_boundary,
+                device=self.world.device,
+                sample_interval=self.sample_interval,
+                n_points_shift=1,
+            )
+            (
+                self.ref_paths_agent_related.nearing_points_right_boundary[
+                    env_j, i_agent
+                ],
+                _,
+            ) = get_short_term_reference_path_simple(
+                polyline=self.ref_paths_agent_related.right_boundary[env_j, i_agent],
+                index_closest_point=self.distances.closest_point_on_right_b[
+                    env_j, i_agent
+                ],
+                n_points_to_return=self.n_points_nearing_boundary,
+                device=self.world.device,
+                sample_interval=self.sample_interval,
+                n_points_shift=1,
+            )
+        #251231 exit segment initialization
+        s_max_idx = self.road.get_s_max_idx()[env_j]
+        if s_max_idx.dim():
+            last_pts_idx = s_max_idx[:, None, None].expand(-1, -1, 2)
+        else:
+            # single env_j
+            last_pts_idx = s_max_idx[None, None].expand(-1, 2)
+        self.ref_paths_agent_related.exit[env_j, i_agent, 0, :] = torch.gather(
+            self.ref_paths_agent_related.left_boundary[env_j, i_agent], 
+            dim=-2,
+            index=last_pts_idx
+        ).squeeze(-2)
+        self.ref_paths_agent_related.exit[env_j, i_agent, 1, :] = torch.gather(
+            self.ref_paths_agent_related.right_boundary[env_j, i_agent], 
+            dim=-2,
+            index=last_pts_idx
+        ).squeeze(-2)
     # =========================
     # 核心动作处理/几何解算
     # =========================
@@ -1487,12 +1503,11 @@ class Scenario(BaseScenario):
                 u[docked_mask, :2] =  torch.zeros_like(u[docked_mask, :2])
                 agent.action.u = u
     def get_front_rear_v_use_front(self):
-        s_front=self.observations.agent_s[:, HINGE_FIRST_INDEX]
+        s_front=self.observations.agent_s[:, self.HINGE_FIRST_INDEX].clone()
         ref_v = self.road.get_ref_v(s_front[:,None])[:,0,0] # [B]
-         #TODO using a simple pid to smooth vel change
         v_front = torch.linalg.norm(self.tractor_front.state.vel, dim=-1)
         error_v = v_front - ref_v
-        last_v = torch.linalg.norm(self.state_buffer.get_latest(n=2)[:,HINGE_FIRST_INDEX,-2:], dim=-1)
+        last_v = torch.linalg.norm(self.state_buffer.get_latest(n=2)[:,self.HINGE_FIRST_INDEX,-2:], dim=-1)
         cur_acc = (v_front-last_v)/self.dt
         Kp=-1
         Kd=-0
@@ -1504,17 +1519,15 @@ class Scenario(BaseScenario):
         delta_s, infeasible = self.road.solve_delta_s(s_front, self.rod_len*torch.ones_like(s_front))
         assert not infeasible.any(), "Infeasible delta_s"
         s_rear = s_front - delta_s
-        v_rear = (s_rear - self.observations.agent_s[:, HINGE_LAST_INDEX])/self.dt
-        v_front = (self.observations.agent_s[:, HINGE_FIRST_INDEX] - s_front)/self.dt
+        v_rear = (s_rear - self.observations.agent_s[:, self.HINGE_LAST_INDEX])/self.dt
         return v_front, v_rear
 
     def get_front_rear_v_use_rear(self):
-        s_rear=self.observations.agent_s[:, HINGE_LAST_INDEX]
+        s_rear=self.observations.agent_s[:, self.HINGE_LAST_INDEX].clone()
         ref_v = self.road.get_ref_v(s_rear[:,None])[:,0,0] # [B]
-         #TODO using a simple pid to smooth vel change
         v_rear = torch.linalg.norm(self.tractor_rear.state.vel, dim=-1)
         error_v = v_rear - ref_v
-        last_v = torch.linalg.norm(self.state_buffer.get_latest(n=2)[:,HINGE_LAST_INDEX,-2:], dim=-1)
+        last_v = torch.linalg.norm(self.state_buffer.get_latest(n=2)[:,self.HINGE_LAST_INDEX,-2:], dim=-1)
         cur_acc = (v_rear-last_v)/self.dt
         Kp=-1
         Kd=-0
@@ -1526,7 +1539,7 @@ class Scenario(BaseScenario):
         delta_s, infeasible = self.road.solve_delta_s(s_rear, self.rod_len*torch.ones_like(s_rear), backward=False)
         assert not infeasible.any(), "Infeasible delta_s"
         s_front = s_rear + delta_s
-        v_front = (s_front - self.observations.agent_s[:, HINGE_FIRST_INDEX])/self.dt
+        v_front = (s_front - self.observations.agent_s[:, self.HINGE_FIRST_INDEX])/self.dt
         return v_front, v_rear
         
     def pre_step(self):
@@ -1540,14 +1553,12 @@ class Scenario(BaseScenario):
         """
         if self.task_class==TaskClass.SIMPLE_PLATOON:
             return
-        # TODO: check whether correct 260109
         v_front1, v_rear1 = self.get_front_rear_v_use_front()
         v_front2, v_rear2 = self.get_front_rear_v_use_rear()
         select_idx = torch.max(v_front1, v_rear1)<torch.max(v_front2, v_rear2)
         v_front = torch.where(select_idx, v_front1, v_front2)
         v_rear = torch.where(select_idx, v_rear1, v_rear2)
-
-        s_front += v_front * self.dt # [B]
+        s_front = v_front * self.dt + self.observations.agent_s[:, self.HINGE_FIRST_INDEX]# [B]
         # 不要超过道路最大 s；留一点 eps 免得插值越界
         s_max = self.road.get_s_max() - 1e-6
         s_min = torch.zeros_like(s_max, device=self.device)
@@ -1560,13 +1571,13 @@ class Scenario(BaseScenario):
         s_rear = torch.clamp(s_rear, min=s_min, max=s_max)
 
         # update the s of first and last agent
-        self.observations.agent_s[:, HINGE_FIRST_INDEX] = s_front
-        v_rear = (s_rear - self.observations.agent_s[:, HINGE_LAST_INDEX])/self.dt
-        self.observations.agent_s[:, HINGE_LAST_INDEX] = s_rear
-        front_rear_theta = self.road.get_tangent_heading(self.observations.agent_s[:, HINGE_FIRST_INDEX:])
+        self.observations.agent_s[:, self.HINGE_FIRST_INDEX] = s_front
+        v_rear = (s_rear - self.observations.agent_s[:, self.HINGE_LAST_INDEX])/self.dt
+        self.observations.agent_s[:, self.HINGE_LAST_INDEX] = s_rear
+        front_rear_theta = self.road.get_tangent_heading(self.observations.agent_s[:, self.TRACTOR_SLICE])
         front_theta = front_rear_theta[:,0]
         rear_theta = front_rear_theta[:,1]
-        p_front, p_rear = self.get_front_rear_pts(self.observations.agent_s[:,HINGE_FIRST_INDEX:]) # ([B,2], [B,2])
+        p_front, p_rear = self.get_front_rear_pts(self.observations.agent_s[:,self.TRACTOR_SLICE]) # ([B,2], [B,2])
         rod_vec = p_front - p_rear                                             # [B,2]
         theta_rod = torch.atan2(rod_vec[:, 1], rod_vec[:, 0])                  # [B]
         idx_mask = torch.ones(self.batch_dim, dtype=torch.bool, device=self.device)
@@ -1600,7 +1611,8 @@ class Scenario(BaseScenario):
         agents_move_vec = agents_pos - latest_pos
         delta_s = torch.sum(agents_move_vec * tangent_vec, dim=-1)  # [B, F]
         # update the follower's s
-        self.observations.agent_s[...,:self.n_followers] += delta_s[:, :self.n_followers]
+        self.observations.agent_s[..., self.FOLLOWER_SLICE] \
+                         += delta_s[:, self.FOLLOWER_SLICE]
         if self.task_class==TaskClass.SIMPLE_PLATOON:
             return
         for i, agent in enumerate(self.followers):
@@ -1782,8 +1794,6 @@ class Scenario(BaseScenario):
                 .squeeze(-1)
             )
             proj_v = torch.sum(agents_vel * ref_vec, dim=-1)
-            # TODO 251225: get ref v from spline
-            # ref_vel = self.platoon_vel_batch.unsqueeze(1).expand(-1, self.n_agents)
             ref_vel = self.ref_paths_agent_related.short_term[:, :, 0, 2]
             self.observations.error_vel = (proj_v - ref_vel)
             if torch.isnan(self.observations.error_vel).any():
@@ -1825,6 +1835,9 @@ class Scenario(BaseScenario):
                 ref_i_others = torch.zeros_like(
                     (self.observations.past_short_term_ref_points.get_latest())
                 )  # Reference paths of other agents relative to agent i
+                hinge_short_term = torch.zeros_like(
+                    (self.observations.past_short_term_hinge_points.get_latest())
+                )  # Reference paths of hinge points relative to agent i
                 l_b_i_others = torch.zeros_like(
                     (self.observations.past_left_boundary.get_latest())
                 )  # Left boundaries of other agents relative to agent i
@@ -1845,7 +1858,17 @@ class Scenario(BaseScenario):
                         pos_j=positions_global,
                         rot_i=rot_i,
                     )
-
+                    # i-th hinge short term relative to agent i
+                    hinge_short_term[
+                        :, a_i, :, 0:2
+                    ] = transform_from_global_to_local_coordinate(
+                        pos_i=pos_i,
+                        pos_j=self.ref_paths_agent_related.hinge_short_term[:, a_i, :, 0:2],
+                        rot_i=rot_i,
+                    )
+                    hinge_short_term[
+                        :, a_i, :, 2
+                    ] = self.ref_paths_agent_related.hinge_short_term[:, a_i, :, 2]
                     # Store new observation - rotation
                     rot_i_others[:, a_i] = rotations_global - rot_i
 
@@ -1870,29 +1893,28 @@ class Scenario(BaseScenario):
                         ref_i_others[
                             :, a_i, a_j, :, 2
                         ] = self.ref_paths_agent_related.short_term[:, a_j, :, 2]
-
+                        
                         # Store new observation - left boundary
-                        if not self.is_observe_distance_to_boundaries:
-                            l_b_i_others[
-                                :, a_i, a_j
-                            ] = transform_from_global_to_local_coordinate(
-                                pos_i=pos_i,
-                                pos_j=self.ref_paths_agent_related.nearing_points_left_boundary[
-                                    :, a_j
-                                ],
-                                rot_i=rot_i,
-                            )
+                        l_b_i_others[
+                            :, a_i, a_j
+                        ] = transform_from_global_to_local_coordinate(
+                            pos_i=pos_i,
+                            pos_j=self.ref_paths_agent_related.nearing_points_left_boundary[
+                                :, a_j
+                            ],
+                            rot_i=rot_i,
+                        )
 
-                            # Store new observation - right boundary
-                            r_b_i_others[
-                                :, a_i, a_j
-                            ] = transform_from_global_to_local_coordinate(
-                                pos_i=pos_i,
-                                pos_j=self.ref_paths_agent_related.nearing_points_right_boundary[
-                                    :, a_j
-                                ],
-                                rot_i=rot_i,
-                            )
+                        # Store new observation - right boundary
+                        r_b_i_others[
+                            :, a_i, a_j
+                        ] = transform_from_global_to_local_coordinate(
+                            pos_i=pos_i,
+                            pos_j=self.ref_paths_agent_related.nearing_points_right_boundary[
+                                :, a_j
+                            ],
+                            rot_i=rot_i,
+                        )
 
                         # Store new observation - vertices
                         ver_i_others[
@@ -1914,7 +1936,7 @@ class Scenario(BaseScenario):
                 )
                 self.observations.past_rot.add(rot_i_others / self.normalizers.rot)
                 self.observations.past_vel.add(vel_i_others / self.normalizers.v)
-                #TODO: simplify observation normalization
+                # TODO: simplify observation normalization
                 self.observations.past_short_term_ref_points.add(
                     ref_i_others
                     / (
@@ -1923,6 +1945,15 @@ class Scenario(BaseScenario):
                         else torch.hstack((self.normalizers.pos_world, self.normalizers.v.unsqueeze(0)))
                     )
                 )
+                if self.task_class == TaskClass.OCCT_PLATOON:
+                    self.observations.past_short_term_hinge_points.add(
+                        hinge_short_term
+                        / (
+                            torch.hstack((self.normalizers.pos, torch.ones((1,),device=self.device)))
+                            if self.is_ego_view 
+                            else torch.hstack((self.normalizers.pos_world, torch.ones((1,),device=self.device)))
+                        )
+                    )
                 self.observations.past_left_boundary.add(
                     l_b_i_others
                     / (
@@ -2055,7 +2086,7 @@ class Scenario(BaseScenario):
             self.observations.past_distance_to_left_boundary.get_latest()[
                 :, agent_index
             ].reshape(self.world.batch_dim, -1)
-            if self.is_observe_distance_to_boundaries
+            if False
             else self.observations.past_left_boundary.get_latest()[
                 indexing_tuple_3
             ].reshape(
@@ -2064,7 +2095,7 @@ class Scenario(BaseScenario):
             self.observations.past_distance_to_right_boundary.get_latest()[
                 :, agent_index
             ].reshape(self.world.batch_dim, -1)
-            if self.is_observe_distance_to_boundaries
+            if False
             else self.observations.past_right_boundary.get_latest()[
                 indexing_tuple_3
             ].reshape(
@@ -2311,7 +2342,7 @@ class Scenario(BaseScenario):
         t1=time.time()
         #print(f"update_state_before_rewarding, agent_index: {agent_index}, time: {t1-t0:.6f}s")
     
-        if agent_index>=self.n_followers:
+        if agent_index in self.TRACTOR_SLICE:
             self.update_state_after_rewarding(agent_index)
             return self.rew
         # [penalty] close to lanelet boundaries
@@ -2673,32 +2704,73 @@ class Scenario(BaseScenario):
                         is_return_points=False,
                     )
                 # ignore the front and rear vehicle collision
-                if a_i >= self.n_followers:
-                    continue
-                # Check for collisions between agents and lanelet boundaries
-                collision_with_left_boundary = interX(
-                    L1=self.vertices[:, a_i],
-                    L2=self.ref_paths_agent_related.left_boundary[:, a_i],
-                    is_return_points=False,
-                ).to(self.device)  # [batch_dim]
-                collision_with_right_boundary = interX(
-                    L1=self.vertices[:, a_i],
-                    L2=self.ref_paths_agent_related.right_boundary[:, a_i],
-                    is_return_points=False,
-                ).to(self.device)  # [batch_dim]
-                is_left_outside_boundary = self.is_point_left_of_polyline(
-                    point=self.world.agents[a_i].state.pos,
-                    polyline=self.ref_paths_agent_related.nearing_points_left_boundary[:, a_i],
-                ).to(self.device)
-                is_right_outside_boundary = ~self.is_point_left_of_polyline(
-                    point=self.world.agents[a_i].state.pos,
-                    polyline=self.ref_paths_agent_related.nearing_points_right_boundary[:, a_i],
-                ).to(self.device)
-                self.collisions.with_lanelets[
-                    ((collision_with_left_boundary | is_left_outside_boundary) | \
-                      (collision_with_right_boundary | is_right_outside_boundary)), a_i
-                ] = True
-
+                if a_i not in self.TRACTOR_SLICE:
+                    # Check for collisions between agents and lanelet boundaries
+                    collision_with_left_boundary = interX(
+                        L1=self.vertices[:, a_i],
+                        L2=self.ref_paths_agent_related.left_boundary[:, a_i],
+                        is_return_points=False,
+                    ).to(self.device)  # [batch_dim]
+                    collision_with_right_boundary = interX(
+                        L1=self.vertices[:, a_i],
+                        L2=self.ref_paths_agent_related.right_boundary[:, a_i],
+                        is_return_points=False,
+                    ).to(self.device)  # [batch_dim]
+                    is_left_outside_boundary = self.is_point_left_of_polyline(
+                        point=self.world.agents[a_i].state.pos,
+                        polyline=self.ref_paths_agent_related.nearing_points_left_boundary[:, a_i],
+                    ).to(self.device)
+                    is_right_outside_boundary = ~self.is_point_left_of_polyline(
+                        point=self.world.agents[a_i].state.pos,
+                        polyline=self.ref_paths_agent_related.nearing_points_right_boundary[:, a_i],
+                    ).to(self.device)
+                    self.collisions.with_lanelets[
+                        ((collision_with_left_boundary | is_left_outside_boundary) | \
+                        (collision_with_right_boundary | is_right_outside_boundary)), a_i
+                    ] = True
+                # agent short term reference path and nearing points on boundaries
+                self.ref_paths_agent_related.short_term[:, a_i] = \
+                    get_short_term_reference_path_by_s(
+                        self.road,
+                        self.observations.agent_s[:, a_i],
+                        n_points_to_return=self.n_points_short_term,
+                        device=self.world.device,
+                        sample_interval=self.sample_interval,
+                        return_ref_v=True,
+                        line='center',
+                    )
+                self.ref_paths_agent_related.nearing_points_left_boundary[:, a_i] = \
+                    get_short_term_reference_path_by_s(
+                    self.road,
+                    self.observations.agent_s[:, a_i],
+                    n_points_to_return=self.n_points_nearing_boundary,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    return_ref_v=False,
+                    line='left',
+                )
+                self.ref_paths_agent_related.nearing_points_right_boundary[:, a_i] = \
+                    get_short_term_reference_path_by_s(
+                    self.road,
+                    self.observations.agent_s[:, a_i],
+                    n_points_to_return=self.n_points_nearing_boundary,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    return_ref_v=False,
+                    line='right',
+                )
+            self.ref_paths_agent_related.hinge_short_term = get_short_term_hinge_path_by_s(
+                occt_map=self.road,
+                agents=self.world.agents,
+                agent_s=self.observations.agent_s,
+                n_points_to_return=self.n_points_short_term,
+                tractor_slice=self.TRACTOR_SLICE,
+                device=self.world.device,
+                sample_dt=1.0,
+                env_j=slice(None)
+            )
+                
+            
 
         # Distance from the center of gravity (CG) of the agent to its reference path
         (
@@ -2761,6 +2833,7 @@ class Scenario(BaseScenario):
             ),
             dim=-1,
         )
+    
 
     def update_state_after_rewarding(self, agent_index):
         """Update some states (such as previous positions and short-term reference paths) after rewarding agents."""
@@ -2774,87 +2847,7 @@ class Scenario(BaseScenario):
                 dim=-1,
             )
             self.state_buffer.add(state_add)
-        if self.use_frenet_ref:
-            self.ref_paths_agent_related.short_term[:, agent_index] = \
-                get_short_term_reference_path_by_s(
-                    self.road,
-                    self.observations.agent_s[:, agent_index],
-                    n_points_to_return=self.n_points_short_term,
-                    device=self.world.device,
-                    sample_interval=self.sample_interval,
-                    return_ref_v=True,
-
-                )
-        else:
-            (
-                self.ref_paths_agent_related.short_term[:, agent_index, :, 0:2],
-                _,
-            ) = get_short_term_reference_path_simple(
-                polyline=self.ref_paths_agent_related.long_term[:, agent_index],
-                index_closest_point=self.distances.closest_point_on_ref_path[
-                    :, agent_index
-                ],
-                n_points_to_return=self.n_points_short_term,
-                device=self.world.device,
-                sample_interval=self.sample_interval,
-            )
-
         
-        if not self.is_observe_distance_to_boundaries:
-            if self.use_frenet_ref:
-                # Get nearing points on boundaries
-                self.ref_paths_agent_related.nearing_points_left_boundary[:, agent_index] = \
-                    get_short_term_reference_path_by_s(
-                    self.road,
-                    self.observations.agent_s[:, agent_index],
-                    n_points_to_return=self.n_points_nearing_boundary,
-                    device=self.world.device,
-                    sample_interval=self.sample_interval,
-                    return_ref_v=False,
-                    line='left',
-                )
-                self.ref_paths_agent_related.nearing_points_right_boundary[:, agent_index] = \
-                    get_short_term_reference_path_by_s(
-                    self.road,
-                    self.observations.agent_s[:, agent_index],
-                    n_points_to_return=self.n_points_nearing_boundary,
-                    device=self.world.device,
-                    sample_interval=self.sample_interval,
-                    return_ref_v=False,
-                    line='right',
-                )
-            else:
-                # Get nearing points on boundaries
-                (
-                    self.ref_paths_agent_related.nearing_points_left_boundary[
-                        :, agent_index
-                    ],
-                    _,
-                ) = get_short_term_reference_path_simple(
-                    polyline=self.ref_paths_agent_related.left_boundary[:, agent_index],
-                    index_closest_point=self.distances.closest_point_on_left_b[
-                        :, agent_index
-                    ],
-                    n_points_to_return=self.n_points_nearing_boundary,
-                    device=self.world.device,
-                    sample_interval=self.sample_interval,
-                    n_points_shift=-2,
-                )
-                (
-                    self.ref_paths_agent_related.nearing_points_right_boundary[
-                        :, agent_index
-                    ],
-                    _,
-                ) = get_short_term_reference_path_simple(
-                    polyline=self.ref_paths_agent_related.right_boundary[:, agent_index],
-                    index_closest_point=self.distances.closest_point_on_right_b[
-                        :, agent_index
-                    ],
-                    n_points_to_return=self.n_points_nearing_boundary,
-                    device=self.world.device,
-                    sample_interval=self.sample_interval,
-                    n_points_shift=-2,
-                )
 
     
     def done(self):
@@ -2868,25 +2861,7 @@ class Scenario(BaseScenario):
         )  # [batch_dim]
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
         is_collision_with_exit_segments = self.collisions.with_exit_segments.any(dim=-1)
-        
-        #TODO: reset single agent when collision with exit segments
-        if False:
-            is_done = is_collision_with_agents | is_collision_with_lanelets
-
-            agents_reset = (
-                self.collisions.with_entry_segments 
-                | self.collisions.with_exit_segments
-            )
-            agents_reset_indices = torch.where(agents_reset)
-            for env_idx, agent_idx in zip(
-                agents_reset_indices[0], agents_reset_indices[1]
-            ):
-                if not is_done[env_idx]:
-                    self.reset_world_at(env_index=env_idx, agent_index=agent_idx)
-
-        else:
-            is_done = is_collision_with_agents | is_collision_with_exit_segments | is_collision_with_lanelets
-
+        is_done = is_collision_with_agents | is_collision_with_exit_segments | is_collision_with_lanelets
         return is_done
 
     def info(self, agent: Agent) -> Dict[str, Tensor]:
@@ -2965,23 +2940,23 @@ class Scenario(BaseScenario):
                 time.sleep(pause_duration)
 
             self.timer.render_begin = time.time()  # Update
+        # map rendering
         geoms = []
         map_geoms = self.extra_render_map(env_index)
         geoms.extend(map_geoms)
-        # ---------- 1) 路网中心线 ----------
+        extend_road_polygons = self.extra_render_extend_road(env_index)
+        geoms.extend(extend_road_polygons)
+        # target road rendering
         if hasattr(self, "road"):
             s_max_idx=self.road.get_s_max_idx(env_index)
-            # 使用road对象获取道路中心线点
             center_pts = self.road.get_road_center_pts()[env_index]  # [N,2]
             center_pts = center_pts[:s_max_idx+1]
-            # rendering.PolyLine 接受 list[(x,y)]，转成 python list 更稳
             geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in center_pts.detach().cpu().tolist()],
                                     close=False)
             geom.set_color(*Color.PURPLE.value, alpha=1.0)
             geom.set_linewidth(3.0)  # 设置左边界线宽度
             geoms.append(geom)
         
-            # 使用road对象获取左边界点
             left_pts = self.road.get_road_left_pts()[env_index]  # [N,2]
             left_pts = left_pts[:s_max_idx+1]
             geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in left_pts.detach().cpu().tolist()],
@@ -2990,7 +2965,6 @@ class Scenario(BaseScenario):
             geom.set_linewidth(1.0)  # 设置左边界线宽度
             geoms.append(geom)
         
-            # 使用road对象获取右边界点
             right_pts = self.road.get_road_right_pts()[env_index]  # [N,2]
             right_pts = right_pts[:s_max_idx+1]
             geom = rendering.PolyLine(v=[(float(x), float(y)) for x, y in right_pts.detach().cpu().tolist()],
@@ -3012,7 +2986,7 @@ class Scenario(BaseScenario):
         #     xform = rendering.Transform()
         #     geom.add_attr(xform)
         #     geoms.append(geom)
-
+        # agent rendering
         for agent_i, ag in enumerate(self.world.agents):
             pos = ag.state.pos[env_index].detach().cpu().tolist()
             # 中心黑点
@@ -3022,12 +2996,9 @@ class Scenario(BaseScenario):
             xf.set_translation(float(pos[0]), float(pos[1]))
             dot.set_color(*Color.BLACK.value)  # 黑点
             geoms.append(dot)
-            # 绘制short_term参考轨迹
-            if hasattr(self, "ref_paths_agent_related") and hasattr(self.ref_paths_agent_related, "short_term"):
-                # 确保short_term数组维度正确
-                short_term_path = self.ref_paths_agent_related.short_term[env_index, agent_i]
-                if short_term_path.shape[0] > 1:  # 确保有足够的点
-                    # 绘制轨迹线
+            if hasattr(self, "ref_paths_agent_related"):
+                if hasattr(self.ref_paths_agent_related, "short_term"):
+                    short_term_path = self.ref_paths_agent_related.short_term[env_index, agent_i]
                     geom = rendering.PolyLine(
                         v=[(float(p[0]), float(p[1])) for p in short_term_path.detach().cpu().tolist()],
                         close=False
@@ -3036,8 +3007,6 @@ class Scenario(BaseScenario):
                     geom.add_attr(xform)
                     geom.set_color(*self.world.agents[agent_i].color)
                     geoms.append(geom)
-                    
-                    # 绘制轨迹点
                     for p in short_term_path:
                         circle = rendering.make_circle(radius=0.2, filled=True)
                         xform = rendering.Transform()
@@ -3045,9 +3014,35 @@ class Scenario(BaseScenario):
                         xform.set_translation(float(p[0]), float(p[1]))
                         circle.set_color(*self.world.agents[agent_i].color)
                         geoms.append(circle)
-            if not self.is_observe_distance_to_boundaries:
-                # Visualize nearing points on boundaries
-                # Left boundary
+                if hasattr(self.ref_paths_agent_related, "hinge_short_term") and agent_i!=0 and agent_i!=self.n_agents-1:
+                    hinge_short_term = self.ref_paths_agent_related.hinge_short_term[env_index, agent_i]
+                    if hinge_short_term.shape[0] > 1:
+                        hinge_status = hinge_short_term[...,-1]
+                        agent_color = self.world.agents[agent_i].color
+                        # 半透明线条连接所有点
+                        geom = rendering.PolyLine(
+                            v=[(float(p[0]), float(p[1])) for p in hinge_short_term.detach().cpu().tolist()],
+                            close=False
+                        )
+                        xform = rendering.Transform()
+                        geom.add_attr(xform)
+                        geom.set_color(agent_color[0], agent_color[1], agent_color[2], 0.6)  # 半透明
+                        geoms.append(geom)
+                        # 只画第0个点的铰接状态
+                        for hinge_status in hinge_short_term:
+                            p = hinge_status[:2]
+                            status = hinge_status[-1]
+                            # 可铰接（status=1）：空心圆；不可铰接（status=0）：实心圆
+                            if status > 0.5:
+                                circle = rendering.make_circle(radius=0.3, filled=False)  # 空心
+                            else:
+                                circle = rendering.make_circle(radius=0.3, filled=True)  # 实心
+                            xform = rendering.Transform()
+                            circle.add_attr(xform)
+                            xform.set_translation(float(p[0]), float(p[1]))
+                            circle.set_color(agent_color[0], agent_color[1], agent_color[2], 0.6)  # 半透明
+                            geoms.append(circle)
+            if hasattr(self, "ref_paths_agent_related"):
                 geom = rendering.PolyLine(
                     v=self.ref_paths_agent_related.nearing_points_left_boundary[
                         env_index, agent_i
@@ -3092,7 +3087,8 @@ class Scenario(BaseScenario):
                     xform.set_translation(i_p[0], i_p[1])
                     circle.set_color(*self.world.agents[agent_i].color)
                     geoms.append(circle)
-        # ---------- 3) 超大件（杆 + 锚点） ----------
+                
+        # cargo rendering
         if self.task_class==TaskClass.OCCT_PLATOON:
             pf = self.tractor_front.state.pos[env_index].detach().cpu()
             pr = self.tractor_rear.state.pos[env_index].detach().cpu()
@@ -3101,16 +3097,12 @@ class Scenario(BaseScenario):
             t_hat = (rod / rod_len)            # 切向
             n_hat = torch.tensor([-t_hat[1], t_hat[0]])  # 法向（左法向）
 
-            # 超大件半宽（可选参数）
             cargo_half_w = self.cargo_half_width
             edge_width = self.cargo_half_width
-            # 四个角点：rear±n*w, front±n*w
             rear_left   = (pr + n_hat * cargo_half_w - t_hat * edge_width).tolist()
             rear_right  = (pr - n_hat * cargo_half_w - t_hat * edge_width).tolist()
             front_left  = (pf + n_hat * cargo_half_w + t_hat * edge_width).tolist()
             front_right = (pf - n_hat * cargo_half_w + t_hat * edge_width).tolist()
-
-            # 用 PolyLine(close=True) 画矩形外框
             cargo_outline = rendering.PolyLine(
                 v=[tuple(rear_left), tuple(front_left), tuple(front_right), tuple(rear_right)],
                 close=True
@@ -3118,7 +3110,7 @@ class Scenario(BaseScenario):
             cargo_outline.set_color(*Color.BLACK.value, alpha=0.9)
             geoms.append(cargo_outline)
 
-            # 锚点：self.latch_pos_world[B, nL, 2]
+            # hinge rendering
             if hasattr(self, "latch_pos_world") and hasattr(self, "n_latch"):
                 latch_xy = self.latch_pos_world[env_index]  # [nL,2]
                 nL = int(self.n_latch)
@@ -3142,8 +3134,27 @@ class Scenario(BaseScenario):
                     else:
                         circle.set_color(*(0.5, 0.5, 0.5), alpha=0.9)  # 灰色：空闲
                     geoms.append(circle)
-
         return geoms
+    def extra_render_extend_road(self, env_index: int = 0):
+        """
+        绘制扩展的道路区域（灰色填充）
+        """
+        left_pts1 = self.road.get_pts(torch.tensor(0,device=self.device),env_index,"left")
+        left_pts2 = self.road.get_pts(torch.tensor(self.rod_len+1,device=self.device),env_index,"left")
+        right_pts1 = self.road.get_pts(torch.tensor(0,device=self.device),env_index,"right")
+        right_pts2 = self.road.get_pts(torch.tensor(self.rod_len+1,device=self.device),env_index,"right")
+        extend_road_pts = [left_pts1,left_pts2,right_pts2,right_pts1]
+        extend_road_polygon1 = rendering.make_polygon(extend_road_pts, draw_border=False)
+        extend_road_polygon1.set_color(0.7, 0.7, 0.7, alpha=1.0)  # 灰色填充
+        s_max=self.road.get_s_max()[env_index]
+        left_pts3 = self.road.get_pts(s_max-self.rod_len-1,env_index,"left")
+        left_pts4 = self.road.get_pts(s_max,env_index,"left")
+        right_pts3 = self.road.get_pts(s_max-self.rod_len-1,env_index,"right")
+        right_pts4 = self.road.get_pts(s_max,env_index,"right")
+        extend_road_pts = [left_pts3,left_pts4,right_pts4,right_pts3]
+        extend_road_polygon2 = rendering.make_polygon(extend_road_pts, draw_border=False)
+        extend_road_polygon2.set_color(0.7, 0.7, 0.7, alpha=1.0)  # 灰色填充
+        return [extend_road_polygon1,extend_road_polygon2]
     def extra_render_map(self, env_index: int = 0):
         """
         绘制道路地图：
@@ -3229,5 +3240,5 @@ if __name__ == "__main__":
         control_two_agents=True,
         display_info=True,
         seed=None,
-        agent_index_focus=0,
+        agent_index_focus=1,
     )
