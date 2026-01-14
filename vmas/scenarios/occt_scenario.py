@@ -14,172 +14,12 @@ from vmas.simulator.utils import Color, ScenarioUtils
 
 from vmas.scenarios.road_traffic import get_perpendicular_distances,get_distances_between_agents,get_rectangle_vertices,\
     transform_from_global_to_local_coordinate,interX,exponential_decreasing_fcn,angle_eliminate_two_pi,\
-    Collisions,Distances,CircularBuffer,Timer,StateBuffer
+    Collisions,CircularBuffer,Timer,StateBuffer
 # 添加Road类导入
-from vmas.scenarios.occt_map import OcctMap,OcctCRMap,MapBase
-from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalizers,OcctPenalties,OcctThresholds,OcctConstants,check_validity
-
-def get_short_term_reference_path_simple(
-    polyline: torch.Tensor,
-    index_closest_point: torch.Tensor,
-    n_points_to_return: int,
-    device=None,
-    sample_interval: int = 2,
-    n_points_shift: int = 1,
-):
-    """
-    Args:
-        polyline:                   [batch_size, num_points, 2] or [num_points, 2]. In the case of the latter, batch_dim is deemed as 1.
-        index_closest_point:        [batch_size, 1] or [1] or []. In the case of the latter, batch_dim is deemed as 1.
-        n_points_to_return:         [1] or []. In the case of the latter, batch_dim is deemed as 1.
-        sample_interval:            Sample interval to match specific purposes;
-                                    set to 2 when using this function to get the short-term reference path;
-                                    set to 1 when using this function to get the nearing boundary points.
-        n_points_shift:             Number of points to be shifted to match specific purposes;
-                                    set to 1 when using this function to get the short-term reference path to "force" the first point of the short-term reference path being in front of the agent;
-                                    set to -2 when using this function to get the nearing boundary points to consider the points behind the agent.
-    """
-    if polyline.ndim == 2:
-        polyline = polyline.unsqueeze(0)
-    if index_closest_point.ndim == 1:
-        index_closest_point = index_closest_point.unsqueeze(1)
-    elif index_closest_point.ndim == 0:
-        index_closest_point = index_closest_point.unsqueeze(0).unsqueeze(1)
-    if device is None:
-        device = torch.device("cpu")
-    batch_size = index_closest_point.shape[0]
-    future_points_idx = (
-        torch.arange(n_points_to_return, device=device) * sample_interval
-        + index_closest_point
-        + n_points_shift
-    )
-    # prevent index out of range as well as polyline NaN within batch
-    has_nan = torch.isnan(polyline).any(dim=-1)  # [batch_size, num_points]
-    # 对于每个样本，找到最后一个非NaN点的索引
-    valid_indices = torch.arange(polyline.shape[1], device=device).unsqueeze(0).expand(batch_size, -1)
-    valid_points_mask = ~has_nan
-    assert not (valid_points_mask.sum(dim=-1)==0).any(), "Some samples have no valid points!"
-    max_valid_indices = (valid_indices * valid_points_mask).argmax(dim=1)
-    max_valid_indices_expanded = max_valid_indices.unsqueeze(1).expand(-1, n_points_to_return)
-    min_valid_indices_expanded = torch.zeros_like(max_valid_indices_expanded)
-    future_points_idx = torch.clamp(future_points_idx, \
-                                    min_valid_indices_expanded, max_valid_indices_expanded)
-    short_term_path = polyline[
-        torch.arange(batch_size, device=device, dtype=torch.int).unsqueeze(
-            1
-        ),  # For broadcasting
-        future_points_idx,
-    ]
-    has_nan = torch.isnan(short_term_path).any(dim=(1, 2))
-    nan_sample_indices = torch.nonzero(has_nan).squeeze(dim=1)
-    if len(nan_sample_indices):
-        print(f"包含NaN的样本索引：{nan_sample_indices}")
-        print(f"共有 {len(nan_sample_indices)} 个样本包含NaN")
-        assert True, "Some samples have NaN points in the short-term reference path!"
-    return short_term_path, future_points_idx
-
-
-def get_short_term_reference_path_by_s(
-    occt_map: MapBase,
-    agent_s : Tensor, 
-    n_points_to_return: int,
-    device=None,
-    sample_interval: int = 2,
-    return_ref_v: bool = False,
-    env_j: int = None,
-    line: str = "center",
-):
-    """
-    Args:
-        occt_map:                   OcctMap or OcctCRMap.
-        agent_s:                    [batch_size, 1] or [1] or []. In the case of the latter, batch_dim is deemed as 1.
-        n_points_to_return:         [1] or []. In the case of the latter, batch_dim is deemed as 1.
-        sample_interval:            Sample interval to match specific purposes;
-                                    set to 2 when using this function to get the short-term reference path;
-                                    set to 1 when using this function to get the nearing boundary points."""
-    if device is None:
-        device = torch.device("cpu")
-    B=agent_s.shape[0] if agent_s.dim() else 1
-    short_term_path=torch.zeros((B, n_points_to_return , 3 if return_ref_v else 2), device=device, dtype=torch.float32)
-    agent_s_query=torch.stack([agent_s+i*sample_interval for i in range(n_points_to_return)],dim=-1)
-    ref_pts = occt_map.get_pts(agent_s_query, env_j, line)
-    short_term_path[:, :, :2] = ref_pts
-    if return_ref_v:
-        ref_v = occt_map.get_ref_v(agent_s_query, env_j).squeeze(dim=-1)
-        short_term_path[:, :, 2] = ref_v
-    
-    has_nan = torch.isnan(short_term_path).any(dim=(1, 2))
-    nan_sample_indices = torch.nonzero(has_nan).squeeze(dim=1)
-    # if len(nan_sample_indices):
-    #     print(f"包含NaN的样本索引：{nan_sample_indices}")
-    #     print(f"共有 {len(nan_sample_indices)} 个样本包含NaN")
-    #     assert True, "Some samples have NaN points in the short-term reference path!"
-    if agent_s.dim()==0:
-        return short_term_path[0,...]
-    return short_term_path
-
-def get_short_term_hinge_path_by_s(
-    occt_map: OcctCRMap,
-    agents : Agent, 
-    agent_s: Tensor,
-    n_points_to_return: int,
-    tractor_slice: list,
-    device=None,
-    sample_dt: int = 1,
-    env_j: int = None,
-):
-    """
-    Args:
-        occt_map:                   OcctMap or OcctCRMap.
-        agent_s:                    [batch_size, 1] or [1] or []. In the case of the latter, batch_dim is deemed as 1.
-        n_points_to_return:         [1] or []. In the case of the latter, batch_dim is deemed as 1.
-        sample_interval:            Sample interval to match specific purposes;
-                                    set to 2 when using this function to get the short-term reference path;
-                                    set to 1 when using this function to get the nearing boundary points."""
-    if device is None:
-        device = torch.device("cpu")
-    HINGE_FIRST_INDEX=tractor_slice[0]
-    HINGE_LAST_INDEX=tractor_slice[-1]
-    first_agent_s = agent_s[env_j, HINGE_FIRST_INDEX]
-    last_agent_s = agent_s[env_j, HINGE_LAST_INDEX]
-    B=agent_s.shape[0] if agent_s.dim() else 1
-    hinge_short_term=torch.zeros((B, len(agents), n_points_to_return , 3), device=device, dtype=torch.float32)
-    first_agent_vel = torch.linalg.norm(agents[HINGE_FIRST_INDEX].state.vel, dim=-1)
-    last_agent_vel = torch.linalg.norm(agents[HINGE_LAST_INDEX].state.vel, dim=-1)
-    first_agent_s_query = torch.stack([first_agent_s+i*sample_dt*first_agent_vel for i in range(n_points_to_return)],dim=-1)
-    last_agent_s_query = torch.stack([last_agent_s+i*sample_dt*last_agent_vel for i in range(n_points_to_return)],dim=-1)
-    first_last_pred_traj = occt_map.get_pts(torch.cat([first_agent_s_query, last_agent_s_query], dim=1), env_j)
-    first_pred_traj = first_last_pred_traj[:,:n_points_to_return] #[B, n_points_to_return, 2]
-    last_pred_traj = first_last_pred_traj[:,n_points_to_return:] #[B, n_points_to_return, 2]
-    for i in range(len(agents)):
-        hinge_short_term[...,i,:,:2] = first_pred_traj + (i/(len(agents)-1))*(last_pred_traj - first_pred_traj)
-    hinges_status = occt_map.get_hinge_status(first_agent_s_query, env_j).transpose(-2,-1) # [batch_size, 2] or [2]
-    hinge_short_term[...,-1] = hinges_status
-    return hinge_short_term
-
-class ReferencePathsAgentRelated:
-    def __init__(
-        self,
-        long_term: torch.Tensor = None,
-        left_boundary: torch.Tensor = None,
-        right_boundary: torch.Tensor = None,
-        nearing_points_left_boundary: torch.Tensor = None,
-        nearing_points_right_boundary: torch.Tensor = None,
-        short_term: torch.Tensor = None,
-        hinge_short_term: torch.Tensor = None,
-        short_term_indices: torch.Tensor = None,
-        exit: torch.Tensor = None,
-    ):
-        self.long_term = long_term  # Actual long-term reference paths of agents
-        self.left_boundary = left_boundary
-        self.right_boundary = right_boundary
-        self.short_term = short_term  # Short-term reference path
-        self.hinge_short_term = hinge_short_term  # Short-term reference path for the hinge
-        self.short_term_indices = short_term_indices  # Indices that indicate which part of the long-term reference path is used to build the short-term reference path
-        self.nearing_points_left_boundary = nearing_points_left_boundary  # Nearing left boundary
-        self.nearing_points_right_boundary = nearing_points_right_boundary  # Nearing right boundary
-        self.exit = exit  # Exit segment
-        
+from vmas.scenarios.occt_map import OcctMap,OcctCRMap
+from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalizers,OcctReferencePathsAgentRelated,\
+    OcctPenalties,OcctThresholds,OcctConstants,OcctDistances,check_validity,get_short_term_hinge_path_by_s,\
+    get_short_term_reference_path_simple,get_short_term_reference_path_by_s,check_boolean_block
 from enum import IntEnum
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
@@ -254,6 +94,7 @@ class Scenario(BaseScenario):
         self.is_loop=kwargs.pop("is_loop", False)
         # use agents_s to get ref pts for short term
         self.use_frenet_ref=kwargs.pop("use_frenet_ref", True)
+        self.mask_ref_v=kwargs.pop("mask_ref_v", False)
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", True)
         self.init_arc_pos = kwargs.pop("init_arc_pos", 40.0)
         self.init_vel_mean = kwargs.pop("init_vel_mean", 1.0)
@@ -284,9 +125,6 @@ class Scenario(BaseScenario):
         self.is_observe_vertices=kwargs.pop("is_observe_vertices", True)
         self.is_observe_distance_to_agents=kwargs.pop(
             "is_observe_distance_to_agents", True
-        )
-        self.is_observe_distance_to_center_line=kwargs.pop(
-            "is_observe_distance_to_center_line", True
         )
         self.is_add_noise=kwargs.pop("is_add_noise", True)
         self.is_observe_ref_path_other_agents=kwargs.pop(
@@ -387,7 +225,7 @@ class Scenario(BaseScenario):
         self.lane_width = self.road.get_lane_width("mean")
         
         # 直接使用Road对象的边界点
-        self.ref_paths_agent_related = ReferencePathsAgentRelated(
+        self.ref_paths_agent_related = OcctReferencePathsAgentRelated(
             long_term=self.road.get_road_center_pts().unsqueeze(1).expand(-1, self.n_agents, -1, -1),
             left_boundary=self.road.get_road_left_pts().unsqueeze(1).expand(-1, self.n_agents, -1, -1),
             right_boundary=self.road.get_road_right_pts().unsqueeze(1).expand(-1, self.n_agents, -1, -1),
@@ -492,7 +330,7 @@ class Scenario(BaseScenario):
                 is_partial_observation, device=device, dtype=torch.bool
             ),
             n_nearing_agents=torch.tensor(
-                self.n_agents,
+                self.n_nearing_agents_observed,
                 device=device,
                 dtype=torch.int32,
             ),
@@ -512,6 +350,9 @@ class Scenario(BaseScenario):
                 device=device, 
                 dtype=torch.float32
                 )
+            ),
+            error_hinge_dis=torch.zeros(
+                (batch_dim, self.n_agents), device=device, dtype=torch.float32
             ),
             agent_s=torch.zeros(
                 (batch_dim, self.n_agents), device=device, dtype=torch.float32
@@ -655,7 +496,7 @@ class Scenario(BaseScenario):
             ),
         )
 
-        self.distances = Distances(
+        self.distances = OcctDistances(
             agents=torch.zeros(
                 batch_dim, self.n_agents, self.n_agents, dtype=torch.float32,device=device
             ),
@@ -669,6 +510,9 @@ class Scenario(BaseScenario):
                 (batch_dim, self.n_agents), device=device, dtype=torch.float32
             ),
             ref_paths=torch.zeros(
+                (batch_dim, self.n_agents), device=device, dtype=torch.float32
+            ),
+            lookahead_pts=torch.zeros(
                 (batch_dim, self.n_agents), device=device, dtype=torch.float32
             ),
             closest_point_on_ref_path=torch.zeros(
@@ -688,6 +532,7 @@ class Scenario(BaseScenario):
             "reward_goal": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "reward_track_ref_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "reward_track_ref_space": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_track_hinge": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "reward_track_ref_heading": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "reward_track_ref_path": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "penalty_near_boundary": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
@@ -739,6 +584,10 @@ class Scenario(BaseScenario):
         threshold_no_reward_if_too_close_to_other_agents = kwargs.pop(
             "threshold_no_reward_if_too_close_to_other_agents", self.agent_width / 6
         )
+
+        # Hinge threshold parameters
+        threshold_hinge_close = kwargs.pop("threshold_hinge_close", 0.5)  # 理想铰接距离（米），reward=1
+        threshold_hinge_far = kwargs.pop("threshold_hinge_far", 5.0)      # 最大有效铰接距离（米），reward=0
         self.thresholds = OcctThresholds(
             reach_goal=torch.tensor(
                 threshold_reach_goal, device=device, dtype=torch.float32
@@ -775,6 +624,8 @@ class Scenario(BaseScenario):
                 dtype=torch.float32,
             ),
             distance_mask_agents=self.normalizers.pos[0],
+            hinge_close=torch.tensor(threshold_hinge_close, device=device, dtype=torch.float32),
+            hinge_far=torch.tensor(threshold_hinge_far, device=device, dtype=torch.float32),
         )
         # Initialize collision matrix
         self.collisions = Collisions(
@@ -834,6 +685,9 @@ class Scenario(BaseScenario):
         reward_track_ref_path = (
             kwargs.pop("reward_track_ref_path", 50) / r_p_normalizer
         )
+        reward_track_hinge = (
+            kwargs.pop("reward_track_hinge", 50) / r_p_normalizer
+        )
         self.rewards = OcctRewards(
             progress=torch.tensor(reward_progress, device=device, dtype=torch.float32),
             weighting_ref_directions=weighting_ref_directions,  # Progress in the weighted directions (directions indicating by
@@ -844,6 +698,7 @@ class Scenario(BaseScenario):
             reward_track_ref_space=torch.tensor(reward_track_ref_space, device=device, dtype=torch.float32),
             reward_track_ref_heading=torch.tensor(reward_track_ref_heading, device=device, dtype=torch.float32),
             reward_track_ref_path=torch.tensor(reward_track_ref_path, device=device, dtype=torch.float32),
+            reward_track_hinge=torch.tensor(reward_track_hinge, device=device, dtype=torch.float32),
         )
         self.rew = torch.zeros(batch_dim, device=device, dtype=torch.float32)
 
@@ -1291,7 +1146,7 @@ class Scenario(BaseScenario):
             tractor_slice=self.TRACTOR_SLICE,
             device=self.world.device,
             sample_dt=1.0,
-            env_j=env_j)
+            env_j=env_j)[env_j]
         
     def reset_init_distances_and_short_term_ref_path(self, env_j, i_agent, agents):
         """
@@ -1460,6 +1315,11 @@ class Scenario(BaseScenario):
                 sample_interval=self.sample_interval,
                 n_points_shift=1,
             )
+        # 260115
+        theta = agents[i_agent].state.rot[env_j, :]
+        lookahead_pts = agents[i_agent].state.pos[env_j, :] + 2*self.sample_interval * torch.hstack([torch.cos(theta), torch.sin(theta)])
+        self.distances.lookahead_pts[env_j, i_agent] = \
+            torch.linalg.norm(self.ref_paths_agent_related.short_term[env_j, i_agent, 2, :2] - lookahead_pts, dim=-1)
         #251231 exit segment initialization
         s_max_idx = self.road.get_s_max_idx()[env_j]
         if s_max_idx.dim():
@@ -1954,6 +1814,9 @@ class Scenario(BaseScenario):
                             else torch.hstack((self.normalizers.pos_world, torch.ones((1,),device=self.device)))
                         )
                     )
+                    self.observations.error_hinge_dis = \
+                    torch.linalg.norm((hinge_short_term[:,:,0,:2]),dim=-1) / self.normalizers.distance_ref
+                        
                 self.observations.past_left_boundary.add(
                     l_b_i_others
                     / (
@@ -2060,47 +1923,57 @@ class Scenario(BaseScenario):
 
         # Self-observations
         obs_self = [
-            None
-            if self.is_ego_view
-            else self.observations.past_pos.get_latest()[indexing_tuple_3].reshape(
-                self.world.batch_dim, -1
-            ),  # [own] position,
-            None
-            if self.is_ego_view
-            else self.observations.past_rot.get_latest()[indexing_tuple_3].reshape(
-                self.world.batch_dim, -1
-            ),  # [own] rotation,
+            # [own] velocity
             self.observations.past_vel.get_latest()[indexing_tuple_vel].reshape(
                 self.world.batch_dim, -1
-            ),  # [own] velocity
+            ),
+            # [own] reference and boundary
+            self.observations.past_short_term_ref_points.get_latest()[..., :2][
+                indexing_tuple_3
+            ].reshape(
+                self.world.batch_dim, -1
+            ) if self.mask_ref_v else \
             self.observations.past_short_term_ref_points.get_latest()[
                 indexing_tuple_3
             ].reshape(
                 self.world.batch_dim, -1
-            ),  # [own] short-term reference path
+            )   , 
+            self.observations.past_left_boundary.get_latest()[
+                indexing_tuple_3
+            ].reshape(
+                self.world.batch_dim, -1
+            ), 
+            self.observations.past_right_boundary.get_latest()[
+                indexing_tuple_3
+            ].reshape(
+                self.world.batch_dim, -1
+            ),  
+            self.observations.past_short_term_hinge_points.get_latest()[
+                :,agent_index
+            ].reshape(
+                self.world.batch_dim, -1
+            ) if self.task_class == TaskClass.OCCT_PLATOON
+            else None,  # [own] hinge short-term points (仅 OCCT_PLATOON)
+            # [own] distance
             self.observations.past_distance_to_ref_path.get_latest()[
                 :, agent_index
-            ].reshape(self.world.batch_dim, -1)
-            if self.is_observe_distance_to_center_line
-            else None,  # [own] distances to reference paths
+            ].reshape(self.world.batch_dim, -1),
             self.observations.past_distance_to_left_boundary.get_latest()[
                 :, agent_index
-            ].reshape(self.world.batch_dim, -1)
-            if False
-            else self.observations.past_left_boundary.get_latest()[
-                indexing_tuple_3
-            ].reshape(
-                self.world.batch_dim, -1
-            ),  # [own] left boundaries
+            ].reshape(self.world.batch_dim, -1),
             self.observations.past_distance_to_right_boundary.get_latest()[
                 :, agent_index
-            ].reshape(self.world.batch_dim, -1)
-            if False
-            else self.observations.past_right_boundary.get_latest()[
-                indexing_tuple_3
-            ].reshape(
+            ].reshape(self.world.batch_dim, -1),
+            self.observations.error_vel[:, agent_index].reshape(
                 self.world.batch_dim, -1
-            ),  # [own] right boundaries
+            ),
+            self.observations.error_space.get_latest()[:, agent_index, :].reshape(
+                self.world.batch_dim, -1
+            ),
+            self.observations.error_hinge_dis[:, agent_index].reshape(
+                self.world.batch_dim, -1
+            ) if self.task_class == TaskClass.OCCT_PLATOON
+            else None,
         ]
         return obs_self
     
@@ -2222,7 +2095,10 @@ class Scenario(BaseScenario):
         obs_vel_other_agents_flat = obs_vel_other_agents.reshape(
             self.world.batch_dim, self.observations.n_nearing_agents, -1
         )
-        obs_ref_path_other_agents_flat = obs_ref_path_other_agents.reshape(
+        obs_ref_path_other_agents_flat = obs_ref_path_other_agents[...,:2].reshape(
+            self.world.batch_dim, self.observations.n_nearing_agents, -1
+        ) if self.mask_ref_v else \
+        obs_ref_path_other_agents.reshape(
             self.world.batch_dim, self.observations.n_nearing_agents, -1
         )
         obs_vertices_other_agents_flat = obs_vertices_other_agents.reshape(
@@ -2307,7 +2183,7 @@ class Scenario(BaseScenario):
         else:
             # Return without sensor noise
             return obs
-
+    
     def reward(self, agent: Agent):
         """
         Issue rewards for the given agent in all envs.
@@ -2386,6 +2262,7 @@ class Scenario(BaseScenario):
         penalty_change_steering = (
             (steering_change/torch.deg2rad(torch.tensor(3,device=self.device)))**2 * self.penalties.change_steering
         )
+        penalty_change_steering = torch.clamp(penalty_change_steering,min=-50,max=0)
         reward_details["penalty_change_steering"][:,agent_index] = penalty_change_steering
         self.rew += penalty_change_steering
 
@@ -2407,6 +2284,7 @@ class Scenario(BaseScenario):
         penalty_change_acc = (
             (acc_change/acc_nor)**2 * self.penalties.change_acc
         )
+        penalty_change_acc = torch.clamp(penalty_change_acc,min=-50,max=0)
         reward_details["penalty_change_acc"][:,agent_index] = penalty_change_acc
         self.rew += penalty_change_acc
 
@@ -2523,7 +2401,7 @@ class Scenario(BaseScenario):
             self.rew += reward_track_ref_space
         """
         
-        reward_track_ref_vel = 1 - self.rewards.reward_track_ref_vel* (error_vel)**2
+        reward_track_ref_vel = -self.rewards.reward_track_ref_vel* (error_vel)**2
         reward_details["reward_track_ref_vel"][:,agent_index] =  reward_track_ref_vel
         self.rew += reward_track_ref_vel
         
@@ -2533,15 +2411,43 @@ class Scenario(BaseScenario):
         agent_vel = error_vel + ref_vel
         #error_vel = agent_vel - leader_vel
         error_vel = agent_vel - ref_vel
-        reward_track_ref_space = torch.zeros_like(self.platoon_space_batch,device=self.device)
-        acceptable_space_agent = (torch.abs(space_errors)<space_threshold)# & (torch.abs(error_vel)<vel_threshold)
-        #acceptable_reward = 1 - (0.5*error_vel/(ref_vel+1e-8)**2 + 0.125*(space_errors/(space_threshold+1e-8))**2)
-        acceptable_reward = 1 - self.rewards.reward_track_ref_space *(space_errors)**2
-        nonacceptable_reward = self.rewards.reward_track_ref_space * torch.clamp(10*(abs(last_space_errors)-abs(space_errors)),min=-1.0,max=1.0)
-        reward_track_ref_space[acceptable_space_agent] = acceptable_reward[acceptable_space_agent]
-        reward_track_ref_space[~acceptable_space_agent] = nonacceptable_reward[~acceptable_space_agent]
-        reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
-        self.rew += reward_track_ref_space
+
+        # ========== [Hinge Distance Reward for OCCT_PLATOON] ==========
+        if self.task_class == TaskClass.OCCT_PLATOON:
+            if agent_index not in self.TRACTOR_SLICE:
+                hinge_short_term = self.ref_paths_agent_related.hinge_short_term[:, agent_index]
+                hinge_points = hinge_short_term[:, :, :2]  # [batch_dim, n_points, 2]
+                ready_n = 3
+                hinge_ready = hinge_short_term[:, :ready_n, 2] > 0.5    # [batch_dim, n_points]
+                is_block, block_order = check_boolean_block(hinge_ready)
+                # 0=先0后1(过完弯），2=纯1(直道) is_block(不是反复可铰接)
+                ready_to_hinge = ((block_order==0) | (block_order==2)) & is_block
+                agent_pos = agent.state.pos  # [batch_dim, 2]
+                current_hinge_pos = hinge_points[:, 0, :]
+                current_distance = torch.norm(
+                    current_hinge_pos - agent_pos, dim=-1
+                )  # shape: [batch_dim]
+                reward_track_hinge =  - (
+                    current_distance**2 * ready_to_hinge.float()
+                ) * self.rewards.reward_track_hinge
+                reward_details["reward_track_hinge"][:, agent_index] = torch.clamp(reward_track_hinge,min=-50,max=0)
+                self.rew += reward_track_hinge
+                reward_track_ref_space = -self.rewards.reward_track_ref_space *(space_errors)**2 * (~ready_to_hinge)
+                reward_details["reward_track_ref_space"][:,agent_index] = torch.clamp(reward_track_ref_space,min=-50,max=0)
+                self.rew += reward_track_ref_space
+        else:
+            if False:
+                reward_track_ref_space = torch.zeros_like(self.platoon_space_batch,device=self.device)
+                acceptable_space_agent = (torch.abs(space_errors)<space_threshold)# & (torch.abs(error_vel)<vel_threshold)
+                #acceptable_reward = 1 - (0.5*error_vel/(ref_vel+1e-8)**2 + 0.125*(space_errors/(space_threshold+1e-8))**2)
+                acceptable_reward = - self.rewards.reward_track_ref_space *(space_errors)**2
+                nonacceptable_reward = self.rewards.reward_track_ref_space * torch.clamp(10*(abs(last_space_errors)-abs(space_errors)),min=-1.0,max=1.0)
+                reward_track_ref_space[acceptable_space_agent] = acceptable_reward[acceptable_space_agent]
+                reward_track_ref_space[~acceptable_space_agent] = nonacceptable_reward[~acceptable_space_agent]
+            else:
+                reward_track_ref_space = -self.rewards.reward_track_ref_space *(space_errors)**2
+            reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
+            self.rew += reward_track_ref_space
         # [reward] 横向跟踪
         ref_vector = torch.mean(ref_points_vecs,dim=1) # or ref_points_vecs[:,0,:]
         ref_vector_normalized = ref_vector / (torch.norm(ref_vector, dim=-1, keepdim=True) + 1e-8)
@@ -2552,20 +2458,24 @@ class Scenario(BaseScenario):
         costant_b=1-constant_k
         reward_track_ref_heading = self.rewards.reward_track_ref_heading * \
                                    (constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b)
-        reward_track_ref_heading = 1 - self.rewards.reward_track_ref_heading * \
+        reward_track_ref_heading = - self.rewards.reward_track_ref_heading * \
                                    torch.abs(torch.acos(torch.clamp(
                                        torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0
                                        ))/max_delta_angle)
         reward_details["reward_track_ref_heading"][:,agent_index] =  reward_track_ref_heading
         self.rew += reward_track_ref_heading
-
-        reward_track_ref_path = 1 - (
-            self.distances.ref_paths[:, agent_index] / (0.5*self.lane_width)) * self.rewards.reward_track_ref_path
-        reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
+        if True:
+            reward_track_ref_path = - (
+                self.distances.lookahead_pts[:, agent_index] / (0.5*self.lane_width)) * self.rewards.reward_track_ref_path
+            reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
+        else:
+            reward_track_ref_path = - (
+                self.distances.ref_paths[:, agent_index] / (0.5*self.lane_width)) * self.rewards.reward_track_ref_path
+            reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
         self.rew += reward_track_ref_path
 
         REWARD_MAX_THRESHOLD = 1.0    # 奖励最大值阈值（超过则异常）
-        REWARD_MIN_THRESHOLD = -100.0   # 奖励最小值阈值（低于则异常）
+        REWARD_MIN_THRESHOLD = -50.0   # 奖励最小值阈值（低于则异常）
         PRINT_DETAILED_INDEX = True     # 是否打印异常值的具体索引（True=打印，False=只打印key）
         # 遍历每个奖励项，检测异常
         for k, v in reward_details.items():
@@ -2833,7 +2743,10 @@ class Scenario(BaseScenario):
             ),
             dim=-1,
         )
-    
+        theta = agent.state.rot
+        lookahead_pts = agent.state.pos + 2*self.sample_interval * torch.hstack([torch.cos(theta), torch.sin(theta)])
+        self.distances.lookahead_pts[:, agent_index] = \
+            torch.linalg.norm(self.ref_paths_agent_related.short_term[:, agent_index, 2, :2] - lookahead_pts, dim=-1)
 
     def update_state_after_rewarding(self, agent_index):
         """Update some states (such as previous positions and short-term reference paths) after rewarding agents."""
@@ -2847,9 +2760,6 @@ class Scenario(BaseScenario):
                 dim=-1,
             )
             self.state_buffer.add(state_add)
-        
-
-    
     def done(self):
         """
         This function computes the done flag for each env in a vectorized way.
@@ -2892,7 +2802,10 @@ class Scenario(BaseScenario):
             # reward_tensor 维度：(batch_dim, n_agents) → 提取当前智能体的列
             # 结果维度：(batch_dim,)，与info中其他字段（如pos/vel）维度对齐
             agent_reward_details[reward_name] = reward_tensor[:, agent_index]
-
+        hinge_short_term = self.ref_paths_agent_related.hinge_short_term[:, agent_index] # [B, n_points, 3]
+        hinge_pos = hinge_short_term[:, 0, :2]  # [batch_dim, n_points, 2]
+        hinge_status = hinge_short_term[:, :3, 2].any(dim=-1)  # [batch_dim]
+        hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)  # [batch_dim, n_points]
         info = {
             "pos": agent.state.pos,
             "rot": angle_eliminate_two_pi(agent.state.rot),
@@ -2901,6 +2814,7 @@ class Scenario(BaseScenario):
             "act_acc": (agent.action.u[:, 0]) if not is_action_empty else self.constants.empty_action_acc[:, agent_index],
             "act_steer": (agent.action.u[:, 1]) if not is_action_empty else self.constants.empty_action_steering[:, agent_index],
             "distance_ref": self.distances.ref_paths[:, agent_index],
+            "distance_lookahead_pts": self.distances.lookahead_pts[:, agent_index],
             "distance_left_b": self.distances.left_boundaries[:, agent_index].min(
                 dim=-1
             )[0],
@@ -2913,6 +2827,8 @@ class Scenario(BaseScenario):
             "error_space": agent_error_space,
             "error_vel": self.observations.error_vel[:, agent_index],
             "ref_vel": self.ref_paths_agent_related.short_term[:, agent_index, 0, 2],
+            "hinge_dis": hinge_dis,
+            "hinge_status": hinge_status,
             **agent_reward_details,
             }
         
