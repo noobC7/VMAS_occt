@@ -477,6 +477,45 @@ def get_short_term_hinge_path_by_s(
     last_agent_s = agent_s[env_j, HINGE_LAST_INDEX]
     B=agent_s.shape[0] if agent_s.dim() else 1
     hinge_short_term=torch.zeros((B, len(agents), n_points_to_return , 3), device=device, dtype=torch.float32)
+    first_agent_vel = 2*torch.ones_like(torch.linalg.norm(agents[HINGE_FIRST_INDEX].state.vel, dim=-1))
+    last_agent_vel = 2*torch.ones_like(torch.linalg.norm(agents[HINGE_LAST_INDEX].state.vel, dim=-1))
+    first_agent_s_query = torch.stack([first_agent_s+i*sample_dt*first_agent_vel for i in range(n_points_to_return)],dim=-1)
+    last_agent_s_query = torch.stack([last_agent_s+i*sample_dt*last_agent_vel for i in range(n_points_to_return)],dim=-1)
+    first_last_pred_traj = occt_map.get_pts(torch.cat([first_agent_s_query, last_agent_s_query], dim=1), env_j)
+    first_pred_traj = first_last_pred_traj[:,:n_points_to_return] #[B, n_points_to_return, 2]
+    last_pred_traj = first_last_pred_traj[:,n_points_to_return:] #[B, n_points_to_return, 2]
+    for i in range(len(agents)):
+        hinge_short_term[...,i,:,:2] = first_pred_traj + (i/(len(agents)-1))*(last_pred_traj - first_pred_traj)
+    hinges_status = occt_map.get_hinge_status(first_agent_s_query, env_j).transpose(-2,-1) # [batch_size, 2] or [2]
+    hinge_short_term[...,-1] = hinges_status
+    return hinge_short_term
+
+def get_short_term_hinge_path_by_s_backup(
+    occt_map: OcctCRMap,
+    agents : Agent, 
+    agent_s: Tensor,
+    n_points_to_return: int,
+    tractor_slice: list,
+    device=None,
+    sample_dt: int = 1,
+    env_j: int = None,
+):
+    """
+    Args:
+        occt_map:                   OcctMap or OcctCRMap.
+        agent_s:                    [batch_size, 1] or [1] or []. In the case of the latter, batch_dim is deemed as 1.
+        n_points_to_return:         [1] or []. In the case of the latter, batch_dim is deemed as 1.
+        sample_interval:            Sample interval to match specific purposes;
+                                    set to 2 when using this function to get the short-term reference path;
+                                    set to 1 when using this function to get the nearing boundary points."""
+    if device is None:
+        device = torch.device("cpu")
+    HINGE_FIRST_INDEX=tractor_slice[0]
+    HINGE_LAST_INDEX=tractor_slice[-1]
+    first_agent_s = agent_s[env_j, HINGE_FIRST_INDEX]
+    last_agent_s = agent_s[env_j, HINGE_LAST_INDEX]
+    B=agent_s.shape[0] if agent_s.dim() else 1
+    hinge_short_term=torch.zeros((B, len(agents), n_points_to_return , 3), device=device, dtype=torch.float32)
     first_agent_vel = torch.linalg.norm(agents[HINGE_FIRST_INDEX].state.vel, dim=-1)
     last_agent_vel = torch.linalg.norm(agents[HINGE_LAST_INDEX].state.vel, dim=-1)
     first_agent_s_query = torch.stack([first_agent_s+i*sample_dt*first_agent_vel for i in range(n_points_to_return)],dim=-1)

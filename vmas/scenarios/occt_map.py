@@ -651,14 +651,15 @@ class OcctCRMap(MapBase):
                 # # if not((path_ids[0]==128 and path_ids[-1]==106) or \
                 # #    (path_ids[0]==102 and path_ids[-1]==175)):
                 #     continue
-                if ((path_ids[0]==100 and path_ids[-1]==129) or \
-                   (path_ids[0]==108 and path_ids[-1]==166) or \
-                   (path_ids[0]==128 and path_ids[-1]==106) or \
-                    (path_ids[0]==189 and path_ids[-1]==103)):
+                # if ((path_ids[0]==100 and path_ids[-1]==129) or \
+                #    (path_ids[0]==108 and path_ids[-1]==166) or \
+                #    (path_ids[0]==128 and path_ids[-1]==106) or \
+                #     (path_ids[0]==189 and path_ids[-1]==103)):
                 #if not (path_ids[0]==102 and path_ids[-1]==164):
                 # if not(path_ids[0]==128 and path_ids[-1]==106):
                 # if not((path_ids[0]==128 and path_ids[-1]==106) or \
                 #    (path_ids[0]==102 and path_ids[-1]==175)):
+                if not (path_ids[0]==153 and path_ids[-1]==175):
                     continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
