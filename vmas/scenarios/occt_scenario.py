@@ -19,7 +19,7 @@ from vmas.scenarios.road_traffic import get_perpendicular_distances,get_distance
 from vmas.scenarios.occt_map import OcctMap,OcctCRMap
 from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalizers,OcctReferencePathsAgentRelated,\
     OcctPenalties,OcctThresholds,OcctConstants,OcctDistances,check_validity,get_short_term_hinge_path_by_s,\
-    get_short_term_reference_path_simple,get_short_term_reference_path_by_s,check_boolean_block
+    get_short_term_reference_path_simple,get_short_term_reference_path_by_s,check_boolean_block,calibrate_agent_s_by_road_pts
 from enum import IntEnum
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
@@ -96,8 +96,8 @@ class Scenario(BaseScenario):
         self.use_center_frenet_ref=kwargs.pop("use_center_frenet_ref", True)
         self.use_boundary_frenet_ref=kwargs.pop("use_boundary_frenet_ref", True)
         self.mask_ref_v=kwargs.pop("mask_ref_v", False)
-        self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", True)
-        self.init_arc_pos = kwargs.pop("init_arc_pos", 40.0)
+        self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", False)
+        self.init_arc_pos = kwargs.pop("init_arc_pos", 67.0)
         self.init_vel_mean = kwargs.pop("init_vel_mean", 1.0)
         self.init_vel_std = kwargs.pop("init_vel_std", 0.0) 
         self.still_space = kwargs.pop("still_space", 10.0)
@@ -1157,7 +1157,7 @@ class Scenario(BaseScenario):
             n_points_to_return=self.n_points_short_term,
             tractor_slice=self.TRACTOR_SLICE,
             device=self.world.device,
-            sample_dt=1.0,
+            sample_ds=self.sample_interval,
             env_j=env_j)[env_j]
         
     def reset_init_distances_and_short_term_ref_path(self, env_j, i_agent, agents):
@@ -1474,17 +1474,31 @@ class Scenario(BaseScenario):
         """
         
         B = self.batch_dim
-        # update arch of agents
+        F = len(self.world.agents)
+        # update arch of agents[Deprecated]
         latest_pos = self.state_buffer.get_latest(n=1)[:,:,:2] # [B, F, 2]
         tangent_vec = self.road.get_tangent_vector(self.observations.agent_s)  # [B, F, 2]
-        agents_pos = torch.zeros_like(latest_pos)
+        agents_pos = torch.zeros((B, F, 2), device=self.device)
         for i, agent in enumerate(self.world.agents):
             agents_pos[:, i, :2] = agent.state.pos
-        agents_move_vec = agents_pos - latest_pos
-        delta_s = torch.sum(agents_move_vec * tangent_vec, dim=-1)  # [B, F]
-        # update the follower's s
-        self.observations.agent_s[..., self.FOLLOWER_SLICE] \
-                         += delta_s[:, self.FOLLOWER_SLICE]
+        # agents_move_vec = agents_pos - latest_pos
+        # delta_s = torch.sum(agents_move_vec * tangent_vec, dim=-1)  # [B, F]
+        # self.observations.agent_s[..., self.FOLLOWER_SLICE] \
+        #                  += delta_s[:, self.FOLLOWER_SLICE]
+
+        # update arch of agents[Current]
+        start_time = time.time()
+        new_agent_s = calibrate_agent_s_by_road_pts(
+            agent_pos=agents_pos,          # [B, F, 2]
+            ref_agent_s=self.observations.agent_s.clone(), # [B, F]
+            road_get_pts_func=self.road.get_pts,
+            interval=0.25,
+            precision=0.025,
+            device=self.observations.agent_s.device
+        )
+        end_time = time.time()
+        #print(f"calibrate_agent_s_by_road_pts time: {end_time - start_time}")
+        self.observations.agent_s[..., self.FOLLOWER_SLICE] = new_agent_s[:, self.FOLLOWER_SLICE]
         if self.task_class==TaskClass.SIMPLE_PLATOON:
             return
         for i, agent in enumerate(self.followers):
@@ -2195,7 +2209,8 @@ class Scenario(BaseScenario):
         else:
             # Return without sensor noise
             return obs
-    def get_hinge_status(self,hinge_short_term,ready_n=None):
+    def get_hinge_status(self, agent_index, ready_n=None):
+        hinge_short_term = self.ref_paths_agent_related.hinge_short_term[:, agent_index] # [B, n_points, 3]
         if ready_n is None:
             ready_n = hinge_short_term.shape[-2]
         hinge_ready = hinge_short_term[:, :ready_n, 2] > 0.5    # [batch_dim, n_points]
@@ -2386,7 +2401,7 @@ class Scenario(BaseScenario):
         self.rew += reward_goal  # Relative to the maximum possible movement
 
         # [reward] 编队跟踪
-        space_threshold=2.0 #m
+        space_threshold=1.0 #m
         vel_threshold=1.0 #m/s
         error_vel = self.observations.error_vel[:, agent_index]
         ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
@@ -2425,28 +2440,26 @@ class Scenario(BaseScenario):
         reward_details["reward_track_ref_vel"][:,agent_index] =  reward_track_ref_vel
         self.rew += reward_track_ref_vel
         
-        # leader_index = 0
-        # leader_ref_vel = self.ref_paths_agent_related.short_term[:, leader_index, 0, 2]
-        # leader_vel = self.observations.error_vel[:, leader_index] + leader_ref_vel
+        leader_index = 0
+        leader_ref_vel = self.ref_paths_agent_related.short_term[:, leader_index, 0, 2]
+        leader_vel = self.observations.error_vel[:, leader_index] + leader_ref_vel
         agent_vel = error_vel + ref_vel
-        #error_vel = agent_vel - leader_vel
-        error_vel = agent_vel - ref_vel
+        error_vel = agent_vel - leader_vel
 
         # ========== [Hinge Distance Reward for OCCT_PLATOON] ==========
         if self.task_class == TaskClass.OCCT_PLATOON:
             if agent_index not in self.TRACTOR_SLICE:
                 if False:
                     # has stage change
-                    hinge_short_term = self.ref_paths_agent_related.hinge_short_term[:, agent_index]
-                    hinge_points = hinge_short_term[:, :, :2]
-                    hinge_status = self.get_hinge_status(hinge_short_term)
-                    agent_pos = agent.state.pos  # [batch_dim, 2]
+                    hinge_status = self.get_hinge_status(agent_index)
+                    # lookahead hinge
+                    agent_desire_pos = self.get_desire_agent_pos(agent_index, 2)  # [batch_dim, 2]
                     # current_hinge_pos = hinge_points[:, 0, :] # dont know why use short term has constant error
-                    current_hinge_pos = self.get_cor_hinge_pos(agent_index)
-                    current_distance = torch.norm(
-                        current_hinge_pos - agent_pos, dim=-1
+                    hinge_desire_pos = self.get_desire_hinge_pos(agent_index, 2)
+                    desire_distance = torch.norm(
+                        hinge_desire_pos - agent_desire_pos, dim=-1
                     )  # shape: [batch_dim]
-                    reward_track_hinge =  torch.clamp(1 - self.rewards.reward_track_hinge * current_distance**2, min=0) * hinge_status - 1
+                    reward_track_hinge =  torch.clamp(1 - self.rewards.reward_track_hinge * desire_distance**2, min=0) * hinge_status - 1
                     reward_details["reward_track_hinge"][:, agent_index] = reward_track_hinge
                     self.rew += reward_track_hinge
                     reward_track_ref_space = torch.clamp(-self.rewards.reward_track_ref_space * space_errors**2 * (~hinge_status),min=-1)
@@ -2457,18 +2470,17 @@ class Scenario(BaseScenario):
                     # reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
                     # self.rew += reward_track_ref_space
                     # DonNan University Design: when error less then threshold, negative pow2 reward, otherwise, reward acc when error>0, decrease when error<0
-                    leader_index = 0
-                    leader_ref_vel = self.ref_paths_agent_related.short_term[:, leader_index, 0, 2]
-                    leader_vel = self.observations.error_vel[:, leader_index] + leader_ref_vel
-                    agent_vel = error_vel + ref_vel
-                    error_vel = agent_vel - leader_vel
+                    leader_index = self.TRACTOR_SLICE[0]
+                    leader_vel = torch.linalg.norm(self.world.agents[leader_index].state.vel, dim=-1)
+                    agent_vel = torch.linalg.norm(agent.state.vel, dim=-1)
+                    error_vel =  agent_vel - leader_vel
                     reward_track_ref_space = torch.zeros_like(self.platoon_space_batch,device=self.device)
                     acceptable_space_agent = (torch.abs(space_errors)<space_threshold) & (torch.abs(error_vel)<vel_threshold)
-                    acceptable_reward = 1 - (0.5*error_vel**2 + 0.125*space_errors**2)
-                    nonacceptable_reward = 2.5*(abs(last_space_errors)-abs(space_errors))
+                    acceptable_reward = torch.clamp(1 - (0.5*error_vel**2 + 0.5*space_errors**2), min=0)
+                    nonacceptable_reward = torch.clamp(2.5*(abs(last_space_errors)-abs(space_errors)),min=-1.0,max=1.0)
                     reward_track_ref_space[acceptable_space_agent] = acceptable_reward[acceptable_space_agent]
                     reward_track_ref_space[~acceptable_space_agent] = nonacceptable_reward[~acceptable_space_agent]
-                    reward_details["reward_track_ref_space"][:,agent_index] = self.rewards.reward_track_ref_space * reward_track_ref_space
+                    reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
                     self.rew += reward_track_ref_space
         else:
             if False:
@@ -2746,7 +2758,7 @@ class Scenario(BaseScenario):
                 n_points_to_return=self.n_points_short_term,
                 tractor_slice=self.TRACTOR_SLICE,
                 device=self.world.device,
-                sample_dt=1.0,
+                sample_ds=self.sample_interval,
                 env_j=slice(None)
             )
                 
@@ -2842,14 +2854,26 @@ class Scenario(BaseScenario):
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
         is_collision_with_exit_segments = self.collisions.with_exit_segments.any(dim=-1)
         is_done = is_collision_with_agents | is_collision_with_exit_segments# | is_collision_with_lanelets
+        is_done =  is_collision_with_exit_segments# | is_collision_with_lanelets
         return is_done
-    def get_cor_hinge_pos(self, agent_index):
+    def get_desire_agent_pos(self, agent_index, lookahead_idx = None):
+        """
+        Get the current agent position of the agent.
+        """
+        if lookahead_idx is None:
+            return self.world.agents[agent_index].state.pos
+        else:
+            return self.ref_paths_agent_related.short_term[:, agent_index, lookahead_idx, :2]
+    def get_desire_hinge_pos(self, agent_index, lookahead_idx = None):
         """
         Get the current hinge position of the agent.
         """
-        leader_hinge_pos = self.world.agents[self.TRACTOR_SLICE[0]].state.pos
-        latter_hinge_pos = self.world.agents[self.TRACTOR_SLICE[-1]].state.pos
-        current_hinge_pos = leader_hinge_pos + (latter_hinge_pos - leader_hinge_pos) * agent_index / (self.n_agents - 1)
+        if lookahead_idx is None:
+            leader_hinge_pos = self.world.agents[self.TRACTOR_SLICE[0]].state.pos
+            latter_hinge_pos = self.world.agents[self.TRACTOR_SLICE[-1]].state.pos
+            current_hinge_pos = leader_hinge_pos + (latter_hinge_pos - leader_hinge_pos) * agent_index / (self.n_agents - 1)
+        else:
+            current_hinge_pos = self.ref_paths_agent_related.hinge_short_term[:, agent_index, lookahead_idx, :2]
         return current_hinge_pos
     def info(self, agent: Agent) -> Dict[str, Tensor]:
         """
@@ -2879,9 +2903,8 @@ class Scenario(BaseScenario):
             # reward_tensor 维度：(batch_dim, n_agents) → 提取当前智能体的列
             # 结果维度：(batch_dim,)，与info中其他字段（如pos/vel）维度对齐
             agent_reward_details[reward_name] = reward_tensor[:, agent_index]
-        hinge_short_term = self.ref_paths_agent_related.hinge_short_term[:, agent_index] # [B, n_points, 3]
-        hinge_pos = self.get_cor_hinge_pos(agent_index)
-        hinge_status = self.get_hinge_status(hinge_short_term)
+        hinge_pos = self.get_desire_hinge_pos(agent_index)
+        hinge_status = self.get_hinge_status(agent_index)
         hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)  # [batch_dim, n_points]
         #print(f"agent_index: {agent_index}, hinge_status: {hinge_status}, hinge_dis: {hinge_dis}")
         info = {

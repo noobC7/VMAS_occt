@@ -459,6 +459,7 @@ def get_short_term_hinge_path_by_s(
     tractor_slice: list,
     device=None,
     sample_dt: int = 1,
+    sample_ds: int = None,
     env_j: int = None,
 ):
     """
@@ -477,10 +478,15 @@ def get_short_term_hinge_path_by_s(
     last_agent_s = agent_s[env_j, HINGE_LAST_INDEX]
     B=agent_s.shape[0] if agent_s.dim() else 1
     hinge_short_term=torch.zeros((B, len(agents), n_points_to_return , 3), device=device, dtype=torch.float32)
-    first_agent_vel = 2*torch.ones_like(torch.linalg.norm(agents[HINGE_FIRST_INDEX].state.vel, dim=-1))
-    last_agent_vel = 2*torch.ones_like(torch.linalg.norm(agents[HINGE_LAST_INDEX].state.vel, dim=-1))
-    first_agent_s_query = torch.stack([first_agent_s+i*sample_dt*first_agent_vel for i in range(n_points_to_return)],dim=-1)
-    last_agent_s_query = torch.stack([last_agent_s+i*sample_dt*last_agent_vel for i in range(n_points_to_return)],dim=-1)
+    if sample_ds is None:
+        first_agent_vel = 2*torch.ones_like(torch.linalg.norm(agents[HINGE_FIRST_INDEX].state.vel, dim=-1))
+        last_agent_vel = 2*torch.ones_like(torch.linalg.norm(agents[HINGE_LAST_INDEX].state.vel, dim=-1))
+        first_agent_s_query = torch.stack([first_agent_s+i*sample_dt*first_agent_vel for i in range(n_points_to_return)],dim=-1)
+        last_agent_s_query = torch.stack([last_agent_s+i*sample_dt*last_agent_vel for i in range(n_points_to_return)],dim=-1)
+    else:
+        tmp = torch.ones_like(torch.linalg.norm(agents[HINGE_FIRST_INDEX].state.vel, dim=-1))
+        first_agent_s_query = torch.stack([first_agent_s+i*sample_ds*tmp for i in range(n_points_to_return)],dim=-1)
+        last_agent_s_query = torch.stack([last_agent_s+i*sample_ds*tmp for i in range(n_points_to_return)],dim=-1)
     first_last_pred_traj = occt_map.get_pts(torch.cat([first_agent_s_query, last_agent_s_query], dim=1), env_j)
     first_pred_traj = first_last_pred_traj[:,:n_points_to_return] #[B, n_points_to_return, 2]
     last_pred_traj = first_last_pred_traj[:,n_points_to_return:] #[B, n_points_to_return, 2]
@@ -566,3 +572,82 @@ def get_short_term_hinge_path_by_s_backup(
 #     ref_pts = occt_map.get_pts(agent_s_query, env_j, line).reshape(B, agent_s.shape[1], n_points_to_return, 2)
 #     short_term_path[...,:2] = ref_pts
 #     return short_term_path
+
+def calibrate_agent_s_by_road_pts(
+    agent_pos: torch.Tensor,
+    ref_agent_s: torch.Tensor,
+    road_get_pts_func,
+    interval: float = 0.25,
+    precision: float = 0.05,
+    forward_search: bool = True,  # 重命名+默认True：默认向前搜索
+    device: torch.device = None
+) -> torch.Tensor:
+    """
+    基于道路中心线物理点校准agent_s（纯batch操作，兼容任意B值）
+    核心：全程保留batch维度，默认向前搜索（适配车辆正常向前行驶场景）
+    
+    Args:
+        agent_pos: 车辆当前位置，shape=[B, F, 2]（必须是3维，B≥1）
+        ref_agent_s: 上一时刻的参考agent_s，shape=[B, F]（必须是2维，B≥1）
+        road_get_pts_func: 道路获取点的函数，输入[s_list]返回[pts_list]，输入shape=[B, N]，输出shape=[B, N, 2]
+        interval: 搜索范围（以ref_agent_s为中心的覆盖距离），单位m，默认0.5m
+        precision: 搜索点的步长（精度），单位m，默认0.05m
+        forward_search: 是否仅向前搜索（True=仅ref_agent_s ~ ref_agent_s+interval，False=双向搜索），默认True
+        device: 计算设备（CPU/GPU），默认自动匹配agent_pos的设备
+    
+    Returns:
+        new_agent_s: 校准后的agent_s，shape=[B, F]（与输入维度完全一致）
+    """
+    # 0. 严格校验输入维度（避免维度错误）
+    assert len(agent_pos.shape) == 3 and agent_pos.shape[-1] == 2, \
+        f"agent_pos必须是[B, F, 2]维度，当前为{agent_pos.shape}"
+    assert len(ref_agent_s.shape) == 2, \
+        f"ref_agent_s必须是[B, F]维度，当前为{ref_agent_s.shape}"
+    assert agent_pos.shape[0] == ref_agent_s.shape[0] and agent_pos.shape[1] == ref_agent_s.shape[1], \
+        f"agent_pos和ref_agent_s的B/F维度不匹配：agent_pos={agent_pos.shape}, ref_agent_s={ref_agent_s.shape}"
+    
+    # 设备适配
+    if device is None:
+        device = agent_pos.device
+    agent_pos = agent_pos.to(device)
+    ref_agent_s = ref_agent_s.to(device)
+    
+    # 1. 提取基础维度（全程保留B/F）
+    B, F, _ = agent_pos.shape
+    # 计算搜索点数（纯数值计算，不涉及tensor维度）
+    if forward_search:
+        # 仅向前搜索：ref_agent_s ~ ref_agent_s+interval（适配车辆向前行驶）
+        n_nearby = int(interval / precision) + 1
+        steps = torch.linspace(0, interval, n_nearby, device=device).reshape(1, 1, -1)
+    else:
+        # 双向搜索：ref_agent_s-interval ~ ref_agent_s+interval
+        n_nearby = int((2 * interval) / precision) + 1
+        steps = torch.linspace(-interval, interval, n_nearby, device=device).reshape(1, 1, -1)
+    
+    # 2. 生成搜索用的agent_s序列（纯batch操作）
+    # [B,F,1] + [1,1,n_nearby] → [B,F,n_nearby]（保留B/F维度）
+    nearby_agent_s = ref_agent_s.unsqueeze(-1) + steps
+    
+    # 3. 展平用于road_get_pts_func（保留B维度）
+    nearby_agent_s_flat = nearby_agent_s.reshape(B, -1)  # [B, F*n_nearby]
+    
+    # 4. 获取搜索s对应的道路中心线点（保留B维度）
+    nearby_pts = road_get_pts_func(nearby_agent_s_flat)  # [B, F*n_nearby, 2]
+    nearby_pts = nearby_pts.reshape(B, F, n_nearby, 2).to(device)  # [B, F, n_nearby, 2]
+    
+    # 5. 计算车辆到每个搜索点的距离（纯batch操作）
+    agent_pos_expand = agent_pos.unsqueeze(2)  # [B, F, 1, 2]
+    dists = torch.norm(nearby_pts - agent_pos_expand, dim=-1)  # [B, F, n_nearby]
+    
+    # 6. 找到最近点索引（保留B/F维度）
+    min_indices = torch.argmin(dists, dim=-1)  # [B, F]
+    
+    # 7. 根据索引获取校准后的agent_s（纯batch gather操作）
+    new_agent_s = torch.gather(
+        nearby_agent_s,
+        dim=2,
+        index=min_indices.unsqueeze(-1)  # [B, F, 1]
+    ).squeeze(-1)  # [B, F]（仅压缩最后一维，B/F保留）
+    
+    # 最终返回维度严格为[B, F]，与输入完全一致
+    return new_agent_s
