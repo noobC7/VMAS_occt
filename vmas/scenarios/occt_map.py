@@ -15,6 +15,7 @@ from torchcubicspline import(natural_cubic_spline_coeffs,
                                 NaturalCubicSpline)
 import time
 import torch.nn.functional as F
+from vmas.scenarios.occt_boundary import OcctBoundaryCalculator
 class MapBase(ABC):
     @abstractmethod
     def get_s_max(self) -> Tensor:
@@ -291,7 +292,6 @@ def get_cr_scenario(scenario_path):
     for dyn_obs in scenario.dynamic_obstacles:
         scenario.remove_obstacle(dyn_obs)
     return scenario
-
 class OcctCRMap(MapBase):
     def __init__(self,
                  batch_dim: int,
@@ -379,13 +379,13 @@ class OcctCRMap(MapBase):
         """
         # 计算路径点的累计长度
         if type(vertices) == np.ndarray:
-            vertices = torch.tensor(vertices,device=self.device)
+            vertices = torch.tensor(vertices,device=vertices.device)
         seg = vertices[1:] - vertices[:-1]  # [N-1, 2]
         seg_len = torch.linalg.norm(seg, dim=-1)  # [N-1]
-        cum_len = torch.cat([torch.zeros(1, device=self.device), torch.cumsum(seg_len, dim=0)])  # [N]
+        cum_len = torch.cat([torch.zeros(1, device=vertices.device), torch.cumsum(seg_len, dim=0)])  # [N]
         return cum_len
     
-    def _resample_path(self, vertices: Tensor) -> Tuple[Tensor, Tensor]:
+    def _resample_path(self, vertices: Tensor, M: int = None) -> Tuple[Tensor, Tensor]:
         """
         对路径点进行重采样
         
@@ -396,17 +396,22 @@ class OcctCRMap(MapBase):
             resampled_vertices: [M, 2] 重采样后的路径点
             s: [M] 重采样后的弧长参数
         """
+        return_ndarray=False
+        if type(vertices) == np.ndarray:
+            return_ndarray=True
+            vertices = torch.tensor(vertices,device=vertices.device)
         original_s = self._get_cum_len(vertices)  # [N]
-        
+        device = vertices.device
         # 计算重采样点数量
         s_max = original_s[-1]
-        M = max(2, int(torch.floor(s_max / self.sample_gap)))
+        if M is None:
+            M = max(2, int(torch.floor(s_max / self.sample_gap)))
         
         # 生成重采样的弧长参数
-        s = torch.linspace(0.0, s_max, M, device=self.device)
+        s = torch.linspace(0.0, s_max, M, device=device)
         
         # 使用线性插值获取重采样点
-        resampled_vertices = torch.zeros(M, 2, device=self.device)
+        resampled_vertices = torch.zeros(M, 2, device=device)
         
         # 找到每个t对应的区间
         idx = torch.searchsorted(original_s, s, right=True) - 1
@@ -420,8 +425,11 @@ class OcctCRMap(MapBase):
         
         alpha = (s - s0) / (s1 - s0 + 1e-8)
         resampled_vertices = p0 + alpha.unsqueeze(1) * (p1 - p0)
-        
+        if return_ndarray:
+            resampled_vertices = resampled_vertices.cpu().numpy()
+            s = s.cpu().numpy()
         return resampled_vertices, s
+    
     def _enrich_vertices_sampling(self, center_vertices, left_vertices, right_vertices):
         """
         对直路路径点进行重采样,确保采样点数量为sample_num
@@ -514,7 +522,6 @@ class OcctCRMap(MapBase):
             extended_traj = np.vstack([extended_traj, tail_extend_point])
         
         return extended_traj
-
     @staticmethod
     def extend_road(center_vertices, left_vertices, right_vertices, head_extend_len, tail_extend_len):
         """
@@ -565,6 +572,66 @@ class OcctCRMap(MapBase):
             extend_right = np.vstack([extend_right, tail_right])
     
         return extend_center, extend_left, extend_right
+    # @staticmethod
+    # def extend_road(center_vertices, left_vertices, right_vertices, head_extend_len, tail_extend_len):
+    #     """
+    #     同步延伸道路的中心线、左边界、右边界（长度为0时返回原轨迹）
+    #     根据左右边界端点在中心线切线方向的投影偏移，自动调整各自延伸长度
+    #     :return: (extend_center, extend_left, extend_right)
+    #     """
+    #     center = np.array(center_vertices, dtype=np.float64)
+    #     left = np.array(left_vertices, dtype=np.float64)
+    #     right = np.array(right_vertices, dtype=np.float64)
+
+    #     if not (len(center) == len(left) == len(right)):
+    #         raise ValueError("中心线、左边界、右边界的点数量必须一致")
+    #     if len(center) < 2:
+    #         raise ValueError("轨迹至少需要2个点才能延伸")
+
+    #     # 初始化延伸后的轨迹为原轨迹
+    #     extend_center = center.copy()
+    #     extend_left = left.copy()
+    #     extend_right = right.copy()
+
+    #     # 头部延伸
+    #     if head_extend_len > 1e-9:
+    #         p0, p1 = center[0], center[1]
+    #         head_delta = p1 - p0
+    #         head_unit_vec = head_delta / np.linalg.norm(head_delta)
+
+    #         # 计算左右边界端点相对于中心线端点在切线方向的投影偏移
+    #         left_offset = np.dot(left[0] - center[0], head_unit_vec)
+    #         right_offset = np.dot(right[0] - center[0], head_unit_vec)
+    #         # 计算延伸后的中心点位置
+    #         head_center = center[0] - head_unit_vec * head_extend_len
+    #         head_left = head_center + (left[0] - center[0]) - left_offset * head_unit_vec
+    #         head_right = head_center + (right[0] - center[0]) - right_offset * head_unit_vec
+    #         extend_center = np.vstack([head_center, extend_center])
+    #         extend_left = np.vstack([head_left, extend_left])
+    #         extend_right = np.vstack([head_right, extend_right])
+
+    #     # 尾部延伸
+    #     if tail_extend_len > 1e-9:
+    #         p_last2, p_last1 = center[-2], center[-1]
+    #         tail_delta = p_last1 - p_last2
+    #         tail_unit_vec = tail_delta / np.linalg.norm(tail_delta)
+
+    #         # 计算左右边界端点相对于中心线端点在切线方向的投影偏移
+    #         left_offset = np.dot(left[-1] - center[-1], tail_unit_vec)
+    #         right_offset = np.dot(right[-1] - center[-1], tail_unit_vec)
+    #         # 计算延伸后的中心点位置
+    #         tail_center = center[-1] + tail_unit_vec * tail_extend_len
+    #         tail_left = tail_center + (left[-1] - center[-1]) - left_offset * tail_unit_vec
+    #         tail_right = tail_center + (right[-1] - center[-1]) - right_offset * tail_unit_vec
+    #         # 验证：三个点在切线方向的投影应该相同
+    #         proj_left = np.dot(tail_left - tail_center, tail_unit_vec)
+    #         proj_right = np.dot(tail_right - tail_center, tail_unit_vec)
+
+    #         extend_center = np.vstack([extend_center, tail_center])
+    #         extend_left = np.vstack([extend_left, tail_left])
+    #         extend_right = np.vstack([extend_right, tail_right])
+
+    #     return extend_center, extend_left, extend_right
     
     def _cr_map_process(self, map_dir: str) -> None:
         """
@@ -573,7 +640,7 @@ class OcctCRMap(MapBase):
         Args:
             map_dir: 地图所在的文件夹路径
         """
-
+        boundary_calculator = OcctBoundaryCalculator()
         dump_file = os.path.join(self.cr_map_dir, "map_data.pkl")
         if os.path.exists(dump_file):
             self.scenario_library, self.path_library,\
@@ -657,32 +724,25 @@ class OcctCRMap(MapBase):
                 #     (path_ids[0]==189 and path_ids[-1]==103)):
                 #if not (path_ids[0]==102 and path_ids[-1]==164):
                 # if not(path_ids[0]==128 and path_ids[-1]==106):
-                # if not((path_ids[0]==128 and path_ids[-1]==106) or \
-                #    (path_ids[0]==102 and path_ids[-1]==175)):
-                if not (path_ids[0]==153 and path_ids[-1]==175):
+                if not((path_ids[0]==153 and path_ids[-1]==175)):
                     continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
                     center_vertices = np.array(lanelet.center_vertices)
-                    # if i == 0:
-                    #     # smooth the beginning for _detect_hinge_status
-                    #     p2, p3 = center_vertices[2], center_vertices[3]
-                    #     dx = p3[0] - p2[0]
-                    #     dy = p3[1] - p2[1]
-                    #     center_vertices[1] = [p2[0] - dx, p2[1] - dy]
-                    #     center_vertices[0] = [p2[0] - 2*dx, p2[1] - 2*dy]
                     if i == 0 and len(center_vertices) > 2:
                         center_vertices[1] = (center_vertices[2] + center_vertices[0]) / 2
                     if i == len(path_ids)-1 and len(center_vertices) > 2:
                         center_vertices[-2] = (center_vertices[-1] + center_vertices[-2]) / 2
+
                     center_vertices, left_vertices, right_vertices = OcctCRMap.extend_road(center_vertices,
                                                         lanelet.left_vertices,
                                                         lanelet.right_vertices, 
                                                         head_extend_len=self.rod_len if i==0 else 0, 
                                                         tail_extend_len=self.rod_len if i==len(path_ids)-1 else 0)
-                    # left_vertices = self._extend_trajectory(lanelet.left_vertices, head_extend_len=self.rod_len, tail_extend_len=self.rod_len)
-                    # right_vertices = self._extend_trajectory(lanelet.right_vertices, head_extend_len=self.rod_len, tail_extend_len=self.rod_len)
-                    # center_vertices = self._extend_trajectory(lanelet.center_vertices, head_extend_len=self.rod_len, tail_extend_len=self.rod_len)
+                    # center_vertices, _ = self._resample_path(center_vertices)
+                    # left_vertices, _ = self._resample_path(left_vertices, M=len(center_vertices))
+                    # right_vertices, _ = self._resample_path(right_vertices, M=len(center_vertices))
+                    # center_vertices, left_vertices, right_vertices = center_vertices, lanelet.left_vertices, lanelet.right_vertices
                     # if lanelet.adj_left:
                     #     left_lane=scenario.lanelet_network.find_lanelet_by_id(lanelet.adj_left)
                     #     left_vertices = left_lane.left_vertices if lanelet.adj_left_same_direction else left_lane.right_vertices[::-1]
@@ -690,8 +750,8 @@ class OcctCRMap(MapBase):
                     # if lanelet.adj_right:
                     #     right_lane=scenario.lanelet_network.find_lanelet_by_id(lanelet.adj_right)
                     #     right_vertices = right_lane.right_vertices if lanelet.adj_right_same_direction else right_lane.left_vertices[::-1]
-                    center_vertices, left_vertices, right_vertices = \
-                        self._enrich_vertices_sampling(center_vertices, left_vertices, right_vertices)
+                    # center_vertices, left_vertices, right_vertices = \
+                    #     self._enrich_vertices_sampling(center_vertices, left_vertices, right_vertices)
                     
                     slice_range = slice(None) if i == len(path_ids) - 1 else slice(-1)
                     for key, vertices in zip(
@@ -699,40 +759,43 @@ class OcctCRMap(MapBase):
                         [center_vertices, left_vertices, right_vertices]
                     ):
                         path_data[key].extend([v.tolist() for v in vertices[slice_range]])
+                # calculate correspond boundary pts
+                center_vertices = np.array(path_data["center_vertices"])
+                center_vertices, _ = self._resample_path(center_vertices)
+                left_vertices = np.array(path_data["left_vertices"])
+                right_vertices = np.array(path_data["right_vertices"])
+                left_vertices, right_vertices = boundary_calculator._calculate_boundary_pts(center_vertices, left_vertices, right_vertices)
+
                 lane_width=([np.linalg.norm(left_vertices[i]-right_vertices[i]) for i in range(len(center_vertices))])
-                center_vertices = torch.tensor(path_data["center_vertices"], device=self.device, dtype=torch.float32)
-                left_vertices = torch.tensor(path_data["left_vertices"], device=self.device, dtype=torch.float32)
-                right_vertices = torch.tensor(path_data["right_vertices"], device=self.device, dtype=torch.float32)
+                center_vertices = torch.tensor(center_vertices, device=self.device, dtype=torch.float32)
+                left_vertices = torch.tensor(left_vertices, device=self.device, dtype=torch.float32)
+                right_vertices = torch.tensor(right_vertices, device=self.device, dtype=torch.float32)
                 center_cum_len = self._get_cum_len(center_vertices)  # [N]
-                if min(lane_width)<self.min_lane_width or center_cum_len[-1]<self.min_lane_len or \
-                        torch.linalg.norm(center_vertices[0]-center_vertices[-1])<self.start_end_distance_threshold:
-                    continue
+                # if min(lane_width)<self.min_lane_width or center_cum_len[-1]<self.min_lane_len or \
+                #         torch.linalg.norm(center_vertices[0]-center_vertices[-1])<self.start_end_distance_threshold:
+                #     continue
                 # 对中心路径进行重采样
                 coeffs = natural_cubic_spline_coeffs(center_cum_len, left_vertices)
                 left_splines = NaturalCubicSpline(coeffs)
                 coeffs = natural_cubic_spline_coeffs(center_cum_len, right_vertices)
                 right_splines = NaturalCubicSpline(coeffs)
-                resampled_center, s = self._resample_path(center_vertices)
-                is_loop,_=self._detect_loop(resampled_center)
+                is_loop,_=self._detect_loop(center_vertices)
                 if is_loop:
                     continue
-                resampled_left = left_splines.evaluate(s)  # [B, N, 2, 1]
-                resampled_right = right_splines.evaluate(s)  # [B, N, 2, 1]
-                resampled_lane_width=torch.linalg.norm(resampled_left-resampled_right, dim=-1)
-                assert len(resampled_center) == len(s), "重采样后的中心路径长度与s参数长度不一致"
+                resampled_lane_width=torch.linalg.norm(left_vertices-right_vertices, dim=-1)
                  # caculate ref vel according to curvature
                 coeffs = natural_cubic_spline_coeffs(center_cum_len, center_vertices)
                 center_splines = NaturalCubicSpline(coeffs)
-                center_curvature = self.compute_curvature_2d(center_splines, s, smooth_distance=10)
+                center_curvature = self.compute_curvature_2d(center_splines, center_cum_len, smooth_distance=10)
                 factor=0.3
                 if self.is_constant_ref_v:
                     ref_v = self.max_ref_v * torch.ones_like(center_curvature)
                 else:
                     ref_v = torch.clamp_max(factor * 1.0 / torch.sqrt(center_curvature+1e-8)**2, self.max_ref_v) 
                     ref_v = self.gaussian_smooth_1d(ref_v, sigma=8.0)
-                assert len(resampled_center) == len(ref_v), "重采样后的中心路径长度与参考速度长度不一致"
+                assert len(center_vertices) == len(ref_v), "重采样后的中心路径长度与参考速度长度不一致"
                 # 保存重采样后的路径数据
-                hinge_status, hinge_trajs = self._detect_hinge_status(s, center_splines, left_splines, right_splines)
+                hinge_status, hinge_trajs = self._detect_hinge_status(center_cum_len, center_splines, left_splines, right_splines)
                 if (hinge_status==1).all():
                     # means no corner, we dont want this path
                     continue
@@ -750,10 +813,10 @@ class OcctCRMap(MapBase):
                 self.path_library.append({
                     "map_name": map_name,
                     "path_ids": path_ids,
-                    "center_vertices": resampled_center,
-                    "left_vertices": resampled_left,
-                    "right_vertices": resampled_right,
-                    "s": s,
+                    "center_vertices": center_vertices,
+                    "left_vertices": left_vertices,
+                    "right_vertices": right_vertices,
+                    "s": center_cum_len,
                     "ref_v": ref_v,
                     "lane_width": resampled_lane_width,
                     "hinge_status": hinge_status,
@@ -762,9 +825,9 @@ class OcctCRMap(MapBase):
                 assert hinge_status.shape[0]==self.n_agents, "hinge个数必须与n_agents一致"
                 assert hinge_trajs.shape[0]==self.n_agents and hinge_trajs.shape[-1]==2, "hinge轨迹必须为2维"
                 # 更新最大路径长度
-                if s[-1] > self.max_path_length:
-                    self.max_path_length = s[-1]
-                    self.max_path_s_list = s
+                if center_cum_len[-1] > self.max_path_length:
+                    self.max_path_length = center_cum_len[-1]
+                    self.max_path_s_list = center_cum_len
         dump_file = os.path.join(self.cr_map_dir, "map_data.pkl")
         pickle.dump((self.scenario_library,self.path_library,\
                      self.max_path_length,self.max_path_s_list), open(dump_file, "wb"))
@@ -1219,6 +1282,7 @@ class OcctCRMap(MapBase):
                 # 绘制左右边界（保持原有颜色）
                 rnd.ax.scatter(left_vertices[:, 0], left_vertices[:, 1], s = 0.5, c = 'r', label='Left Boundary', zorder=20, linewidth=linewidth)
                 rnd.ax.scatter(right_vertices[:, 0], right_vertices[:, 1], s = 0.5, c = 'b', label='Right Boundary', zorder=20, linewidth=linewidth)
+                rnd.ax.scatter(center_vertices[:, 0], center_vertices[:, 1], s = 0.5, c = 'gray', label='Center', zorder=20, linewidth=linewidth, alpha=0.5)
                 
                 # 绘制带颜色映射的中心线
                 # 准备线段集合
