@@ -22,6 +22,7 @@ from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalize
     get_short_term_reference_path_simple,get_short_term_reference_path_by_s,check_boolean_block,calibrate_agent_s_by_road_pts,\
     is_point_left_of_polyline,get_frenet_distances_between_agents
 from enum import IntEnum
+TRADITIONAL_CONTROL=True
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
     OCCT_PLATOON = 1 # with cargo
@@ -830,6 +831,9 @@ class Scenario(BaseScenario):
                     # 禁用 drag 和 linear_friction
                     drag = 0.0,
                     linear_friction = 0.0,
+                    angular_friction = 0.0,
+                    movable=False if TRADITIONAL_CONTROL else True,
+                    rotatable=False if TRADITIONAL_CONTROL else True,
                     dynamics=DelayedSteeringKinematicBicycle(
                         world,
                         width=self.agent_width,
@@ -1481,24 +1485,28 @@ class Scenario(BaseScenario):
 
         # ---- 5) 计算随动车辆目标（按绑定锚点），shape 必须是 [B, nF, 2] / [B, nF] ----
         self.compute_latch_targets()  # 这个函数我们之前已经给了实现
+        if TRADITIONAL_CONTROL:
+            self._pure_pursuit_control()
 
     def _pure_pursuit_control(self):
         """
-        TODO
         纯跟踪控制器 - 用于batch_size=1时的手动控制
 
         对每个agent：
         1. 使用纯跟踪算法计算前轮转角
         2. 使用PD控制器计算加速度
-        3. 直接设置action.u，VMAS的world.step()会根据动力学模型自动更新状态
+        3. 手动积分计算下一个状态
+        4. 调用_set_pose直接设置状态（绕过VMAS的dynamics）
+
+        注意：必须在pre_step中调用，因为action已在env_process_action中读取完毕
         """
         # 纯跟踪控制器参数
         LOOKAHEAD_DIST = 5.0  # 前瞻距离（米）
         WHEELBASE = self.l_f + self.l_r  # 轴距
 
         # PD控制器参数
-        KP_VEL = 2.0   # 速度比例增益
-        KD_VEL = 0.5   # 速度微分增益
+        KP_VEL = 1.0   # 速度比例增益
+        KD_VEL = 0.0   # 速度微分增益
 
         # 初始化速度误差存储（如果不存在）
         if not hasattr(self, '_last_vel_errors'):
@@ -1518,6 +1526,12 @@ class Scenario(BaseScenario):
             # 当前速度大小
             v_current = torch.linalg.norm(current_vel)  # scalar
 
+            # 速度方向（用于倒车判断）
+            vel_dir = current_vel / (v_current + 1e-8)
+            heading_vec = torch.stack([torch.cos(current_theta), torch.sin(current_theta)])
+            direction_sign = torch.sign(torch.sum(vel_dir * heading_vec))
+            v_signed = v_current * direction_sign
+
             # ========== 2) 获取参考路径信息 ==========
             # short_term: [B, n_agents, n_points_short_term, 3]
             # 最后维度: [x, y, ref_v]
@@ -1525,7 +1539,6 @@ class Scenario(BaseScenario):
 
             # 提取参考点和参考速度
             ref_points = ref_path[:, :2]  # [n_points, 2]
-            ref_vels = ref_path[:, 2]     # [n_points]
 
             # ========== 3) 纯跟踪算法 - 选择lookahead点 ==========
             # 计算当前点到所有参考点的距离
@@ -1571,10 +1584,10 @@ class Scenario(BaseScenario):
 
             # ========== 5) PD控制器 - 计算加速度 ==========
             # 获取目标速度（使用lookahead点的参考速度）
-            v_ref = ref_vels[target_idx]
+            v_ref = torch.linalg.norm(self.world.agents[0].state.vel)
 
             # 速度误差
-            vel_error = v_ref - v_current
+            vel_error = v_ref - v_signed
 
             # 获取上一时刻的速度误差
             last_vel_error = self._last_vel_errors.get(agent_idx, torch.tensor(0.0, device=self.device))
@@ -1594,19 +1607,39 @@ class Scenario(BaseScenario):
             # 保存当前速度误差供下次使用
             self._last_vel_errors[agent_idx] = vel_error.detach().clone()
 
-            # ========== 6) 设置action（VMAS会根据dynamics自动更新状态）==========
-            # 初始化action.u（如果不存在）
-            if agent.action.u is None:
-                agent.action.u = torch.zeros((self.batch_dim, 2), device=self.device)
+            # ========== 6) 手动积分计算下一个状态 ==========
+            # 使用自行车模型积分
+            # 参考DelayedSteeringKinematicBicycle的f()函数
 
-            # 设置控制输入 [acceleration, steering_angle]
-            agent.action.u[0, 0] = acceleration       # 加速度 [m/s²]
-            agent.action.u[0, 1] = steering_angle    # 前轮转角 [rad]
+            # 滑移角 beta = atan(l_r / (l_f + l_r) * tan(delta))
+            beta = torch.atan2(
+                torch.tan(steering_angle) * self.l_r / (self.l_f + self.l_r),
+                torch.tensor(1.0, device=self.device)
+            )
 
-            # ========== 7) 调试输出（可选，取消注释可查看详细信息）==========
+            # 状态导数
+            dx = v_signed * torch.cos(current_theta + beta)
+            dy = v_signed * torch.sin(current_theta + beta)
+            dtheta = (v_signed / (self.l_f + self.l_r)) * torch.cos(beta) * torch.tan(steering_angle)
+            dv = acceleration
+
+            # Euler积分
+            next_pos = current_pos + torch.stack([dx, dy]) * self.dt
+            next_theta = current_theta + dtheta * self.dt
+            next_v = v_signed + dv * self.dt
+
+            # 确保速度为正（自行车模型限制）
+            next_v = torch.clamp(next_v, min=0.0)
+
+            # ========== 7) 直接设置状态 ==========
+            idx_mask = torch.ones(self.batch_dim, dtype=torch.bool, device=self.device)
+            self._set_pose(agent, next_pos.unsqueeze(0), next_theta.unsqueeze(0).unsqueeze(0), next_v.unsqueeze(0), idx_mask)
+
+            # ========== 8) 调试输出 ==========
             # if agent_idx == 1:  # 只打印第一个follower
             #     print(f"Agent {agent_idx}: v={v_current:.2f}m/s, v_ref={v_ref:.2f}m/s, "
-            #           f"acc={acceleration:.2f}m/s², steer={torch.rad2deg(steering_angle):.1f}°")
+            #           f"acc={acceleration:.2f}m/s², steer={torch.rad2deg(steering_angle):.1f}°, "
+            #           f"next_v={next_v:.2f}m/s")
 
     def post_step(self):
         """
@@ -3129,26 +3162,42 @@ class Scenario(BaseScenario):
         
         # 遍历每个车道段
         for lanelet in lanelets:
-            
+
             left_vertices = lanelet.left_vertices
             right_vertices = lanelet.right_vertices
-            # ---------- 1) 道路多边形区域填充（灰色） ----------
+            # ---------- 1) 道路多边形区域填充（灰色） - 分段绘制 ----------
             if left_vertices is not None and right_vertices is not None:
-                # 将左边界点和右边界点（反转顺序）组合成多边形
-                polygon_pts = []
-                
-                # 添加左边界点
-                for x, y in left_vertices:
-                    polygon_pts.append((float(x), float(y)))
-                
-                # 反转右边界点顺序，形成闭合多边形
-                for x, y in reversed(right_vertices):
-                    polygon_pts.append((float(x), float(y)))
-                
-                # 创建多边形并填充灰色
-                road_polygon = rendering.make_polygon(polygon_pts, draw_border=False)
-                road_polygon.set_color(0.7, 0.7, 0.7, alpha=1.0)  # 灰色填充
-                geoms.append(road_polygon)
+                # 分段参数：每段道路的顶点数（约10米一段，假设顶点间隔约1-2米）
+                SEGMENT_VERTEX_COUNT = 3  # 每段约10-20米
+
+                n_left = len(left_vertices)
+                n_right = len(right_vertices)
+
+                # 确保左右边界顶点数量一致
+                n_vertices = min(n_left, n_right)
+
+                # 分段绘制道路，每段创建一个小四边形
+                for i in range(0, n_vertices - 1, SEGMENT_VERTEX_COUNT):
+                    # 当前段的结束索引
+                    end_idx = min(i + SEGMENT_VERTEX_COUNT, n_vertices - 1)
+
+                    # 构建当前段的多边形：左边界(前→后) + 右边界(后→前)
+                    segment_pts = []
+
+                    # 添加当前段的左边界点（从前往后）
+                    for j in range(i, end_idx + 1):
+                        x, y = left_vertices[j]
+                        segment_pts.append((float(x), float(y)))
+
+                    # 添加当前段的右边界点（从后往前，形成闭合）
+                    for j in range(end_idx, i - 1, -1):
+                        x, y = right_vertices[j]
+                        segment_pts.append((float(x), float(y)))
+
+                    # 创建当前段的多边形并填充灰色
+                    road_polygon = rendering.make_polygon(segment_pts, draw_border=False)
+                    road_polygon.set_color(0.7, 0.7, 0.7, alpha=1.0)  # 灰色填充
+                    geoms.append(road_polygon)
 
             # ---------- 2) 道路中心线 ----------
             center_vertices = lanelet.center_vertices
