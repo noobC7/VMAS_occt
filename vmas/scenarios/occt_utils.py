@@ -244,6 +244,7 @@ class OcctDistances:
     def __init__(
         self,
         agents=None,
+        agents_frenet=None,
         left_boundaries=None,
         right_boundaries=None,
         boundaries=None,
@@ -256,6 +257,7 @@ class OcctDistances:
         obstacles=None,
     ):
         self.agents = agents  # Distances between agents
+        self.agents_frenet = agents_frenet  # Frenet distances between agents
         self.left_boundaries = left_boundaries  # Distances between agents and the left boundaries of their current lanelets (for each vertex of each agent)
         self.right_boundaries = right_boundaries  # Distances between agents and the right boundaries of their current lanelets (for each vertex of each agent)
         self.boundaries = boundaries  # The minimum distances between agents and the boundaries of their current lanelets
@@ -651,3 +653,54 @@ def calibrate_agent_s_by_road_pts(
     
     # 最终返回维度严格为[B, F]，与输入完全一致
     return new_agent_s
+
+def is_point_left_of_polyline(point, polyline):
+        """
+        判断点是否在边界左侧
+        
+        参数:
+            point: [B, 2] 形状的张量，表示点的坐标
+            polyline: [B, N, 2] 形状的张量，表示折线的坐标点
+        
+        返回:
+            is_left: [B] 形状的布尔张量，表示点是否在边界左侧
+        """
+        # 获取边界线段的起点和终点
+        assert torch.isnan(point).any() == False, "point should not be nan"
+        assert torch.isnan(polyline).any() == False, "polyline should not be nan"
+        start_points = polyline[:, :-1]
+        end_points = polyline[:, 1:]
+        
+        # 计算线段向量: end - start
+        seg_vectors = end_points - start_points
+        
+        # 计算点到线段起点的向量: point - start
+        point_vectors = point.unsqueeze(1) - start_points
+        
+        # 计算叉积: seg_x * point_y - seg_y * point_x
+        cross_products = seg_vectors[..., 0] * point_vectors[..., 1] - seg_vectors[..., 1] * point_vectors[..., 0]
+        
+        # 对于每个点，检查是否在所有线段的左侧（叉积>0）
+        # 或者检查是否在边界的左侧区域
+        # 这里我们取最靠近点的线段的叉积符号
+        closest_seg_idx = torch.argmin(torch.norm(point_vectors, dim=-1), dim=1)
+        closest_cross = torch.gather(cross_products, 1, closest_seg_idx.unsqueeze(1)).squeeze(1)
+        
+        return closest_cross > 0
+
+
+def get_frenet_distances_between_agents(agent_s):
+    s1 = agent_s.unsqueeze(2)            # [B, n_agents, 1]
+    s2 = agent_s.unsqueeze(1)            # [B, 1, n_agents]
+    mutual_frenet_distances = torch.abs(s1 - s2)  # [B, n_agents, n_agents]
+    mutual_frenet_distances.diagonal(dim1=-2, dim2=-1).fill_(mutual_frenet_distances.max() + 1)
+    return mutual_frenet_distances
+
+def polynomial_decreasing_fcn(x, x0, x1, power):
+    x_clamped = torch.clamp(x, min=x0, max=x1)
+    denominator = x1 - x0
+    if denominator == 0:
+        return torch.ones_like(x_clamped)
+    normalized_x = (x_clamped - x0) / denominator
+    y = torch.pow(1 - normalized_x, power)
+    return y
