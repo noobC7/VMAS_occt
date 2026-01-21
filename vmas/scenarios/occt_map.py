@@ -16,6 +16,55 @@ from torchcubicspline import(natural_cubic_spline_coeffs,
 import time
 import torch.nn.functional as F
 from vmas.scenarios.occt_boundary import OcctBoundaryCalculator
+
+from scipy.interpolate import CubicSpline  # 若用GPU可替换为torch版本
+import numpy as np
+def smooth_road_centerline(
+    centerline_pts: np.ndarray,
+    sample_step: float = 0.05,  # 平滑后点的步长（适配你的校准精度）
+    smooth_density: int = 5      # 平滑密度（越大越平滑，默认5倍原始点数）
+) -> np.ndarray:
+    """
+    平滑道路中心线（仅输入输出轨迹点，消除拐点）
+    Args:
+        centerline_pts: 原始中心线顶点，格式为[N, 2]的numpy数组/列表（N≥3）
+        sample_step: 平滑后点的均匀步长（单位m），默认0.05m（与agent_s校准精度一致）
+        smooth_density: 插值密度因子，原始点数×该值=插值后点数，默认5（3~10为宜）
+    Returns:
+        smooth_centerline_pts: 平滑后的中心线点，[M, 2]的numpy数组（M>N，步长均匀）
+    """
+    # 1. 格式统一为numpy数组
+    centerline_pts = np.array(centerline_pts, dtype=np.float32)
+    assert len(centerline_pts.shape) == 2 and centerline_pts.shape[1] == 2, \
+        f"centerline_pts必须是[N, 2]维度，当前为{centerline_pts.shape}"
+    N = len(centerline_pts)
+    if N < 3:  # 点数过少无需平滑，直接返回原数据
+        return centerline_pts
+    
+    # 2. 生成插值参数t（0~1均匀分布，用于B样条插值）
+    t_raw = np.linspace(0, 1, N)
+    t_smooth = np.linspace(0, 1, N * smooth_density)  # 密集化t提升平滑度
+    
+    # 3. 三次B样条插值x/y坐标（核心平滑逻辑，消除拐点）
+    cs_x = CubicSpline(t_raw, centerline_pts[:, 0])
+    cs_y = CubicSpline(t_raw, centerline_pts[:, 1])
+    interp_x = cs_x(t_smooth)
+    interp_y = cs_y(t_smooth)
+    interp_pts = np.stack([interp_x, interp_y], axis=-1)  # 插值后的密集点
+    
+    # 4. 计算插值点的累积弧长（用于后续均匀采样）
+    cum_dist = np.zeros(len(interp_pts))
+    for i in range(1, len(interp_pts)):
+        cum_dist[i] = cum_dist[i-1] + np.linalg.norm(interp_pts[i] - interp_pts[i-1])
+    
+    # 5. 按固定步长重新采样，保证输出点步长均匀
+    target_dist = np.arange(0, cum_dist[-1], sample_step)
+    # 对x/y分别插值，得到均匀步长的平滑点
+    cs_final_x = CubicSpline(cum_dist, interp_pts[:, 0])
+    cs_final_y = CubicSpline(cum_dist, interp_pts[:, 1])
+    smooth_centerline_pts = np.stack([cs_final_x(target_dist), cs_final_y(target_dist)], axis=-1)
+    
+    return smooth_centerline_pts
 class MapBase(ABC):
     @abstractmethod
     def get_s_max(self) -> Tensor:
@@ -304,6 +353,7 @@ class OcctCRMap(MapBase):
                  is_constant_ref_v: bool = False,
                  eval_mode: bool = False,
                  rod_len: float = 30.0,
+                 extend_len = None,
                  n_agents: int = 4): # 采样间隔
         """
         初始化道路类，使用CommonRoad地图并基于torchcubicspline实现路径表示
@@ -325,6 +375,7 @@ class OcctCRMap(MapBase):
         self.is_constant_ref_v = is_constant_ref_v # if True, then ref_v is constant and equal to max_ref_v
         self.eval_mode = eval_mode # if True, then the batch id is in order and fixed
         self.rod_len = rod_len # 车辆长度
+        self.extend_len = rod_len if extend_len is None else 0.0
         self.start_end_distance_threshold = 25 # 起始点和结束点的距离阈值，小于该阈值的路径会被过滤
         self.n_agents = n_agents
         
@@ -724,8 +775,8 @@ class OcctCRMap(MapBase):
                 #     (path_ids[0]==189 and path_ids[-1]==103)):
                 #if not (path_ids[0]==102 and path_ids[-1]==164):
                 # if not(path_ids[0]==128 and path_ids[-1]==106):
-                if not((path_ids[0]==153 and path_ids[-1]==175)):
-                    continue
+                # if not((path_ids[0]==153 and path_ids[-1]==175)):
+                #     continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
                     center_vertices = np.array(lanelet.center_vertices)
@@ -737,8 +788,8 @@ class OcctCRMap(MapBase):
                     center_vertices, left_vertices, right_vertices = OcctCRMap.extend_road(center_vertices,
                                                         lanelet.left_vertices,
                                                         lanelet.right_vertices, 
-                                                        head_extend_len=self.rod_len if i==0 else 0, 
-                                                        tail_extend_len=self.rod_len if i==len(path_ids)-1 else 0)
+                                                        head_extend_len=self.extend_len if i==0 else 0, 
+                                                        tail_extend_len=self.extend_len if i==len(path_ids)-1 else 0)
                     # center_vertices, _ = self._resample_path(center_vertices)
                     # left_vertices, _ = self._resample_path(left_vertices, M=len(center_vertices))
                     # right_vertices, _ = self._resample_path(right_vertices, M=len(center_vertices))
@@ -761,6 +812,10 @@ class OcctCRMap(MapBase):
                         path_data[key].extend([v.tolist() for v in vertices[slice_range]])
                 # calculate correspond boundary pts
                 center_vertices = np.array(path_data["center_vertices"])
+                center_vertices = smooth_road_centerline(
+                    center_vertices,
+                    sample_step=1  # 与校准精度一致
+                )
                 center_vertices, _ = self._resample_path(center_vertices)
                 left_vertices = np.array(path_data["left_vertices"])
                 right_vertices = np.array(path_data["right_vertices"])
@@ -771,23 +826,27 @@ class OcctCRMap(MapBase):
                 left_vertices = torch.tensor(left_vertices, device=self.device, dtype=torch.float32)
                 right_vertices = torch.tensor(right_vertices, device=self.device, dtype=torch.float32)
                 center_cum_len = self._get_cum_len(center_vertices)  # [N]
-                # if min(lane_width)<self.min_lane_width or center_cum_len[-1]<self.min_lane_len or \
-                #         torch.linalg.norm(center_vertices[0]-center_vertices[-1])<self.start_end_distance_threshold:
-                #     continue
-                # 对中心路径进行重采样
+                if min(lane_width)<self.min_lane_width or center_cum_len[-1]<self.min_lane_len:
+                    print(f"path:{path_ids} is too short or too narrow, continue")
+                    continue
+                if torch.linalg.norm(center_vertices[0]-center_vertices[-1])<self.start_end_distance_threshold:
+                    print(f"path:{path_ids} start and end point is too close, continue")
+                    continue
+                #对中心路径进行重采样
                 coeffs = natural_cubic_spline_coeffs(center_cum_len, left_vertices)
                 left_splines = NaturalCubicSpline(coeffs)
                 coeffs = natural_cubic_spline_coeffs(center_cum_len, right_vertices)
                 right_splines = NaturalCubicSpline(coeffs)
                 is_loop,_=self._detect_loop(center_vertices)
                 if is_loop:
+                    print(f"path:{path_ids} is a loop, continue")
                     continue
                 resampled_lane_width=torch.linalg.norm(left_vertices-right_vertices, dim=-1)
                  # caculate ref vel according to curvature
                 coeffs = natural_cubic_spline_coeffs(center_cum_len, center_vertices)
                 center_splines = NaturalCubicSpline(coeffs)
                 center_curvature = self.compute_curvature_2d(center_splines, center_cum_len, smooth_distance=10)
-                factor=0.3
+                factor=0.15 #factor=0.3 # for INTERACTION
                 if self.is_constant_ref_v:
                     ref_v = self.max_ref_v * torch.ones_like(center_curvature)
                 else:
@@ -797,6 +856,7 @@ class OcctCRMap(MapBase):
                 # 保存重采样后的路径数据
                 hinge_status, hinge_trajs = self._detect_hinge_status(center_cum_len, center_splines, left_splines, right_splines)
                 if (hinge_status==1).all():
+                    print(f"path:{path_ids} has no corner, continue")
                     # means no corner, we dont want this path
                     continue
 
@@ -1171,9 +1231,8 @@ class OcctCRMap(MapBase):
             chord_max = torch.linalg.norm(p_boundary - p_fixed, dim=-1)
             hi = s_max - s_reference
         
-        infeasible = (chord_max + 1e-6) < L
-        lo = torch.zeros_like(s_reference)
         
+        lo = torch.zeros_like(s_reference)
         # 二分搜索循环
         for _ in range(max_iter):
             interval_length = hi - lo
@@ -1197,6 +1256,7 @@ class OcctCRMap(MapBase):
             lo = torch.where(go_left, lo, mid)
         
         delta_s = 0.5 * (lo + hi)
+        infeasible = interval_length >= tol
         delta_s = torch.where(infeasible, torch.zeros_like(delta_s), delta_s)
         return delta_s, infeasible
     def solve_delta_s_expand_single(self, s_reference: Tensor, L: Tensor, splines: NaturalCubicSpline, backward: bool = True, max_iter: int = 50, tol: float = 1e-3) -> Tuple[Tensor, Tensor]:
@@ -1879,8 +1939,11 @@ if __name__ == "__main__":
     road = OcctCRMap(batch_dim=200, 
                      cr_map_dir="vmas/scenarios_data/cr_maps/debug",
                      max_ref_v=15/3.6 ,
-                     min_lane_width=3, 
+                     min_lane_width=2.9, 
                      device=device, 
                      sample_gap=1, 
-                     is_constant_ref_v=False)
+                     is_constant_ref_v=False,
+                     rod_len=30.0,
+                     extend_len=0.0)
+    
     road.plot_road_debug()
