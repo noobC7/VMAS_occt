@@ -22,16 +22,18 @@ import numpy as np
 def smooth_road_centerline(
     centerline_pts: np.ndarray,
     sample_step: float = 0.05,  # 平滑后点的步长（适配你的校准精度）
-    smooth_density: int = 5      # 平滑密度（越大越平滑，默认5倍原始点数）
+    smooth_density: int = 5,    # 平滑密度（越大越平滑，默认5倍原始点数）
+    min_gap: float = 0.2        # 原始点保留阈值：间隔≥0.2才保留该点
 ) -> np.ndarray:
     """
-    平滑道路中心线（仅输入输出轨迹点，消除拐点）
+    平滑道路中心线（新增原始点筛选：仅保留间隔≥0.2的点，避免回环）
     Args:
         centerline_pts: 原始中心线顶点，格式为[N, 2]的numpy数组/列表（N≥3）
-        sample_step: 平滑后点的均匀步长（单位m），默认0.05m（与agent_s校准精度一致）
-        smooth_density: 插值密度因子，原始点数×该值=插值后点数，默认5（3~10为宜）
+        sample_step: 平滑后点的均匀步长（单位m），默认0.05m
+        smooth_density: 插值密度因子，原始点数×该值=插值后点数，默认5
+        min_gap: 原始点保留阈值，相邻点间隔≥此值才保留，默认0.2m
     Returns:
-        smooth_centerline_pts: 平滑后的中心线点，[M, 2]的numpy数组（M>N，步长均匀）
+        smooth_centerline_pts: 平滑后的中心线点，[M, 2]的numpy数组
     """
     # 1. 格式统一为numpy数组
     centerline_pts = np.array(centerline_pts, dtype=np.float32)
@@ -41,28 +43,49 @@ def smooth_road_centerline(
     if N < 3:  # 点数过少无需平滑，直接返回原数据
         return centerline_pts
     
-    # 2. 生成插值参数t（0~1均匀分布，用于B样条插值）
-    t_raw = np.linspace(0, 1, N)
-    t_smooth = np.linspace(0, 1, N * smooth_density)  # 密集化t提升平滑度
+    # 2. 原始点预处理：仅保留间隔≥min_gap的点（核心逻辑）
+    filtered_pts = [centerline_pts[0]]  # 先保留第一个点
+    last_pt = centerline_pts[0]        # 记录上一个保留的点
     
-    # 3. 三次B样条插值x/y坐标（核心平滑逻辑，消除拐点）
-    cs_x = CubicSpline(t_raw, centerline_pts[:, 0])
-    cs_y = CubicSpline(t_raw, centerline_pts[:, 1])
+    for i in range(1, N):
+        current_pt = centerline_pts[i]
+        # 计算当前点与上一个保留点的欧氏距离（弧长）
+        gap = np.linalg.norm(current_pt - last_pt)
+        # 仅当间隔≥0.2时，保留该点并更新上一个保留点
+        if gap >= min_gap:
+            filtered_pts.append(current_pt)
+            last_pt = current_pt
+    
+    # 确保至少保留3个点（样条插值的最小要求）
+    if len(filtered_pts) < 3:
+        filtered_pts = centerline_pts.copy()  # 不足则恢复原始点
+    filtered_pts = np.array(filtered_pts)
+    
+    # 3. 对筛选后的点计算累积弧长
+    cum_dist = np.zeros(len(filtered_pts))
+    for i in range(1, len(filtered_pts)):
+        cum_dist[i] = cum_dist[i-1] + np.linalg.norm(filtered_pts[i] - filtered_pts[i-1])
+    
+    # 4. 三次B样条插值（添加端点夹紧约束，避免振荡）
+    cs_x = CubicSpline(cum_dist, filtered_pts[:, 0], bc_type='clamped')
+    cs_y = CubicSpline(cum_dist, filtered_pts[:, 1], bc_type='clamped')
+    
+    # 5. 生成密集的插值点（基于筛选后点的弧长范围）
+    t_smooth = np.linspace(cum_dist[0], cum_dist[-1], len(filtered_pts) * smooth_density)
     interp_x = cs_x(t_smooth)
     interp_y = cs_y(t_smooth)
-    interp_pts = np.stack([interp_x, interp_y], axis=-1)  # 插值后的密集点
+    interp_pts = np.stack([interp_x, interp_y], axis=-1)
     
-    # 4. 计算插值点的累积弧长（用于后续均匀采样）
-    cum_dist = np.zeros(len(interp_pts))
+    # 6. 计算插值点的累积弧长，用于最终均匀采样
+    cum_dist_interp = np.zeros(len(interp_pts))
     for i in range(1, len(interp_pts)):
-        cum_dist[i] = cum_dist[i-1] + np.linalg.norm(interp_pts[i] - interp_pts[i-1])
+        cum_dist_interp[i] = cum_dist_interp[i-1] + np.linalg.norm(interp_pts[i] - interp_pts[i-1])
     
-    # 5. 按固定步长重新采样，保证输出点步长均匀
-    target_dist = np.arange(0, cum_dist[-1], sample_step)
-    # 对x/y分别插值，得到均匀步长的平滑点
-    cs_final_x = CubicSpline(cum_dist, interp_pts[:, 0])
-    cs_final_y = CubicSpline(cum_dist, interp_pts[:, 1])
-    smooth_centerline_pts = np.stack([cs_final_x(target_dist), cs_final_y(target_dist)], axis=-1)
+    # 7. 按固定步长重新采样（线性插值避免三次样条振荡）
+    target_dist = np.arange(0, cum_dist_interp[-1], sample_step)
+    final_x = np.interp(target_dist, cum_dist_interp, interp_pts[:, 0])
+    final_y = np.interp(target_dist, cum_dist_interp, interp_pts[:, 1])
+    smooth_centerline_pts = np.stack([final_x, final_y], axis=-1)
     
     return smooth_centerline_pts
 class MapBase(ABC):
@@ -775,15 +798,15 @@ class OcctCRMap(MapBase):
                 #     (path_ids[0]==189 and path_ids[-1]==103)):
                 #if not (path_ids[0]==102 and path_ids[-1]==164):
                 # if not(path_ids[0]==128 and path_ids[-1]==106):
-                # if not((path_ids[0]==153 and path_ids[-1]==175)):
-                #     continue
+                if not((path_ids[0]==100 and path_ids[-1]==169)):
+                    continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
                     center_vertices = np.array(lanelet.center_vertices)
                     if i == 0 and len(center_vertices) > 2:
                         center_vertices[1] = (center_vertices[2] + center_vertices[0]) / 2
                     if i == len(path_ids)-1 and len(center_vertices) > 2:
-                        center_vertices[-2] = (center_vertices[-1] + center_vertices[-2]) / 2
+                        center_vertices[-2] = (center_vertices[-1] + center_vertices[-3]) / 2
 
                     center_vertices, left_vertices, right_vertices = OcctCRMap.extend_road(center_vertices,
                                                         lanelet.left_vertices,
@@ -1943,7 +1966,6 @@ if __name__ == "__main__":
                      device=device, 
                      sample_gap=1, 
                      is_constant_ref_v=False,
-                     rod_len=30.0,
-                     extend_len=0.0)
+                     rod_len=30.0)
     
     road.plot_road_debug()
