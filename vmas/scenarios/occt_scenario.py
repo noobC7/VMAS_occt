@@ -22,7 +22,7 @@ from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalize
     get_short_term_reference_path_simple,get_short_term_reference_path_by_s,check_boolean_block,calibrate_agent_s_by_road_pts,\
     is_point_left_of_polyline,get_frenet_distances_between_agents
 from enum import IntEnum
-TRADITIONAL_CONTROL=True
+TRADITIONAL_CONTROL=False
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
     OCCT_PLATOON = 1 # with cargo
@@ -89,7 +89,7 @@ class Scenario(BaseScenario):
         # world params
         self.device = device
         self.batch_dim = batch_dim
-        self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
+        self.task_class=kwargs.pop("task_class", TaskClass.SIMPLE_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
         self.n_agents=kwargs.pop("n_agents", 4)
         # platoon params
@@ -139,14 +139,14 @@ class Scenario(BaseScenario):
         
         # Visualization
         self.visualize_semidims=True
-        self.viewer_zoom = float(kwargs.get("viewer_zoom", 17.0)) #7
+        self.viewer_zoom = float(kwargs.get("viewer_zoom", 25.0)) #7
         self.world_x_dim = kwargs.pop(
             "world_x_dim", 150
         )  # The x-dimension of the world in [m]
         self.world_y_dim = kwargs.pop(
             "world_y_dim", 100
         )  # The y-dimension of the world in [m]
-        self.resolution_factor = kwargs.pop("resolution_factor", 5)  # Default 200
+        self.resolution_factor = kwargs.pop("resolution_factor", 12)  # Default 5
         self.render_origin = kwargs.pop(
             "render_origin", [50, -10]
         )
@@ -187,9 +187,10 @@ class Scenario(BaseScenario):
         # map params
         B = batch_dim
         self.lane_width = 6  # 道路宽度
-        
+        self.rod_len = (self.n_followers-1) * self.still_space
         if self.task_class == TaskClass.OCCT_PLATOON:
             # agent params
+            F = self.n_followers
             self.n_latch = self.n_followers
             self.cargo_half_width = float(kwargs.get("cargo_half_width", 1.7))
             
@@ -198,9 +199,6 @@ class Scenario(BaseScenario):
             self.latch_pos_world = torch.zeros(B, self.n_latch, 2, device=device)   # [B,nL,2]
             self.latch_theta_world = torch.zeros(B, self.n_latch, device=device)    # [B,nL]
     
-            # ---- 随动车辆的 dock 状态/绑定锚点 ----
-            F = self.n_followers
-            self.rod_len = (F+1) * self.still_space   # 货物长度 L
             self.dock_state = torch.zeros(B, F, dtype=torch.bool, device=device) # 全部 free
             self.bound_latch_id = torch.full((B, F), -1, dtype=torch.long, device=device)
     
@@ -211,6 +209,7 @@ class Scenario(BaseScenario):
             # 计时器（奖励/日志可用）
             self.dock_timer = torch.zeros(B, F, device=device)
             
+            self.rod_len = (self.n_followers+1) * self.still_space   # 货物长度 L
         # self.road = OcctMap(
         #     batch_dim=B,
         #     device=device,
@@ -1012,7 +1011,8 @@ class Scenario(BaseScenario):
 
             # 给一个初始的 target（free 也写当前位姿，post_step 会用 mask 过滤）
             self.compute_latch_targets()
-
+        else:
+            s_front_new = (self.n_followers-1)* self.still_space + last_vehicle_s
         # ============== 阶段5：生成横向偏移/航向误差 ==============
         stage5_start = time.time()
         F = self.n_followers
@@ -1114,7 +1114,8 @@ class Scenario(BaseScenario):
                 self.reset_init_distances_and_short_term_ref_path(
                     env_j, i_agent, agents
                 )
-            self.reset_init_hinge_short_term(env_j, agents)
+            if self.task_class == TaskClass.OCCT_PLATOON:
+                self.reset_init_hinge_short_term(env_j, agents)
             # Compute mutual distances between agents
             mutual_distances = get_distances_between_agents(
                 self=self, is_set_diagonal=True
@@ -2392,7 +2393,7 @@ class Scenario(BaseScenario):
         t1=time.time()
         #print(f"update_state_before_rewarding, agent_index: {agent_index}, time: {t1-t0:.6f}s")
     
-        if agent_index in self.TRACTOR_SLICE:
+        if self.task_class == TaskClass.OCCT_PLATOON and agent_index in self.TRACTOR_SLICE:
             self.update_state_after_rewarding(agent_index)
             return self.rew
 
@@ -2524,18 +2525,20 @@ class Scenario(BaseScenario):
         self.rew += reward_goal  # Relative to the maximum possible movement
 
         # [reward] 编队跟踪
-        space_threshold=1.0 #m
-        # vel_threshold=1.0 #m/s
-        # ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
-        leader_index = self.TRACTOR_SLICE[0]
-        leader_vel = torch.linalg.norm(self.world.agents[leader_index].state.vel, dim=-1)
-        agent_vel = torch.linalg.norm(agent.state.vel, dim=-1)
-        error_vel = agent_vel - leader_vel
+        if self.task_class==TaskClass.OCCT_PLATOON:
+            leader_index = 0
+            leader_vel = torch.linalg.norm(self.world.agents[leader_index].state.vel, dim=-1)
+            agent_vel = torch.linalg.norm(agent.state.vel, dim=-1)
+            error_vel = agent_vel - leader_vel
+        else:
+            ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
+            agent_vel = torch.linalg.norm(agent.state.vel, dim=-1)
+            error_vel = agent_vel - ref_vel
 
         reward_track_ref_vel = torch.clamp(1 - self.rewards.reward_track_ref_vel* (error_vel)**2, min=0)
         reward_details["reward_track_ref_vel"][:,agent_index] =  reward_track_ref_vel
         self.rew += reward_track_ref_vel
-        
+
         # last_space_errors = self.observations.error_space.get_latest(n=2)[:, agent_index, 0] # only consider front space
         space_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0]
         reward_track_ref_space = torch.clamp(1 - self.rewards.reward_track_ref_space * space_errors**2, min=0)
@@ -2639,7 +2642,8 @@ class Scenario(BaseScenario):
                         is_return_points=False,
                     )
                 # ignore the front and rear vehicle collision
-                if a_i not in self.TRACTOR_SLICE:
+                if (self.task_class == TaskClass.OCCT_PLATOON and a_i not in self.TRACTOR_SLICE) or\
+                    self.task_class == TaskClass.SIMPLE_PLATOON:
                     # Check for collisions between agents and lanelet boundaries
                     collision_with_left_boundary = interX(
                         L1=self.vertices[:, a_i],
@@ -2729,16 +2733,17 @@ class Scenario(BaseScenario):
                         sample_interval=self.sample_interval,
                         n_points_shift=1,
                     )
-            self.ref_paths_agent_related.hinge_short_term = get_short_term_hinge_path_by_s(
-                occt_map=self.road,
-                agents=self.world.agents,
-                agent_s=self.observations.agent_s,
-                n_points_to_return=self.n_points_short_term,
-                tractor_slice=self.TRACTOR_SLICE,
-                device=self.world.device,
-                sample_ds=self.sample_interval,
-                env_j=slice(None)
-            )
+            if self.task_class == TaskClass.OCCT_PLATOON:
+                self.ref_paths_agent_related.hinge_short_term = get_short_term_hinge_path_by_s(
+                    occt_map=self.road,
+                    agents=self.world.agents,
+                    agent_s=self.observations.agent_s,
+                    n_points_to_return=self.n_points_short_term,
+                    tractor_slice=self.TRACTOR_SLICE,
+                    device=self.world.device,
+                    sample_ds=self.sample_interval,
+                    env_j=slice(None)
+                )
                 
             
 
@@ -2868,9 +2873,15 @@ class Scenario(BaseScenario):
             # reward_tensor 维度：(batch_dim, n_agents) → 提取当前智能体的列
             # 结果维度：(batch_dim,)，与info中其他字段（如pos/vel）维度对齐
             agent_reward_details[reward_name] = reward_tensor[:, agent_index]
-        hinge_pos = self.get_desire_hinge_pos(agent_index)
-        hinge_status = self.get_hinge_status(agent_index)
-        hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)  # [batch_dim, n_points]
+        hinge_dict = {}
+        if self.task_class == TaskClass.OCCT_PLATOON:
+            hinge_pos = self.get_desire_hinge_pos(agent_index)
+            hinge_status = self.get_hinge_status(agent_index)
+            hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)  # [batch_dim, n_points]
+            hinge_dict = {
+                "hinge_status": hinge_status,
+                "hinge_dis": hinge_dis,
+            }
         #print(f"agent_index: {agent_index}, hinge_status: {hinge_status}, hinge_dis: {hinge_dis}")
         info = {
             "pos": agent.state.pos,
@@ -2893,8 +2904,7 @@ class Scenario(BaseScenario):
             "error_space": agent_error_space,
             "error_vel": self.observations.error_vel[:, agent_index],
             "ref_vel": self.ref_paths_agent_related.short_term[:, agent_index, 0, 2],
-            "hinge_dis": hinge_dis,
-            "hinge_status": hinge_status,
+            **hinge_dict,
             **agent_reward_details,
             }
         
@@ -2916,9 +2926,8 @@ class Scenario(BaseScenario):
         geoms = []
         map_geoms = self.extra_render_map(env_index)
         geoms.extend(map_geoms)
-        if False:
-            extend_road_polygons = self.extra_render_extend_road(env_index)
-            geoms.extend(extend_road_polygons)
+        extend_road_polygons = self.extra_render_extend_road(env_index)
+        geoms.extend(extend_road_polygons)
         # target road rendering
         if hasattr(self, "road"):
             s_max_idx=self.road.get_s_max_idx(env_index)
@@ -3029,6 +3038,7 @@ class Scenario(BaseScenario):
                 geom.set_color(*self.world.agents[agent_i].color)
                 geoms.append(geom)
 
+                # Left boundary
                 for i_p in self.ref_paths_agent_related.nearing_points_left_boundary[
                     env_index, agent_i
                 ]:

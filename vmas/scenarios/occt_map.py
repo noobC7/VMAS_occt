@@ -375,7 +375,7 @@ class OcctCRMap(MapBase):
                  max_ref_v: float = 20/3.6,
                  is_constant_ref_v: bool = False,
                  eval_mode: bool = False,
-                 rod_len: float = 30.0,
+                 rod_len = None,
                  extend_len = None,
                  n_agents: int = 4): # 采样间隔
         """
@@ -725,6 +725,7 @@ class OcctCRMap(MapBase):
         # 递归读取文件夹中所有XML文件
         map_files = glob.glob(os.path.join(map_dir, "**/*.xml"), recursive=True)
         
+        assert self.rod_len is not None, "请先设置货物长度 L"
         # 打印地图库信息
         print(f"找到 {len(map_files)} 个地图文件:")
         for i, map_file in enumerate(map_files):
@@ -798,8 +799,8 @@ class OcctCRMap(MapBase):
                 #     (path_ids[0]==189 and path_ids[-1]==103)):
                 #if not (path_ids[0]==102 and path_ids[-1]==164):
                 # if not(path_ids[0]==128 and path_ids[-1]==106):
-                if not((path_ids[0]==100 and path_ids[-1]==169)):
-                    continue
+                # if not((path_ids[0]==100 and path_ids[-1]==169)):
+                #     continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
                     center_vertices = np.array(lanelet.center_vertices)
@@ -1466,6 +1467,140 @@ class OcctCRMap(MapBase):
                 plt.pause(0.01)
                 fig3_path = f"{self.vis_dir}/Path{path_id:04d}_hinge_{i:04d}.svg"
                 fig3.savefig(fig3_path, dpi=300, format="svg", bbox_inches='tight')
+    def plot_road_debug_paper(self):
+        import matplotlib.font_manager as fm
+        from commonroad.visualization.mp_renderer import MPRenderer, DynamicObstacleParams
+        from matplotlib.collections import LineCollection
+        from matplotlib.colors import Normalize
+        import matplotlib.pyplot as plt
+        font_path = '/usr/share/fonts/truetype/msttcorefonts/SongTi.ttf'
+        font_prop = fm.FontProperties(fname=font_path, size=12)
+        
+        # 字体大小统一配置（论文常用尺寸）
+        font_size_label = 16    # 坐标轴标签字体大小
+        font_size_tick = 14     # 刻度字体大小（数字用新罗马）
+        font_size_legend = 14   # 图例字体大小
+        font_size_cbar = 14     # 颜色条标签字体大小
+
+        # ===================== 创建绘图画布（适配论文排版）=====================
+        fig1, ax1 = plt.subplots(figsize=(9, 7))  # 微调宽度，适配中文标签
+        rnd = MPRenderer(ax=ax1)
+        fig2, ax2 = plt.subplots(figsize=(8, 5))  # 优化高度，符合论文图表比例
+        fig3, ax3 = plt.subplots(figsize=(8, 5))  # 保留备用，若需扩展绘图
+        
+        # ===================== 渲染参数设置（论文级样式）=====================
+        # 动态障碍物渲染参数
+        rnd.draw_params.dynamic_obstacle.draw_icon = True
+        rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
+        rnd.draw_params.dynamic_obstacle.show_label = False
+        rnd.draw_params.dynamic_obstacle.state.draw_arrow = False
+        rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
+        rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD"  # 深蓝色
+        # 自车渲染参数
+        ego_params = DynamicObstacleParams()
+        ego_params.draw_icon = True
+        ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
+        ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400"  # 深绿色
+        ego_params.vehicle_shape.occupancy.shape.zorder = 20
+
+        # ===================== 遍历路径并绘图 =====================
+        for path_id, path_data in enumerate(self.path_library):
+            if path_id != 5:  # 仅绘制第5条路径，可根据需求调整
+                continue
+            
+            # 提取路径数据（从张量转换为numpy数组）
+            map_name = path_data["map_name"]
+            path_ids = path_data["path_ids"]
+            center_vertices = path_data["center_vertices"].detach().cpu().numpy()
+            left_vertices = path_data["left_vertices"].detach().cpu().numpy()
+            right_vertices = path_data["right_vertices"].detach().cpu().numpy()
+            ref_v = path_data["ref_v"].detach().cpu().numpy()
+            s = path_data["s"].detach().cpu().numpy()
+            lane_width = path_data["lane_width"].detach().cpu().numpy()
+            hinge_trajs = path_data["hinge_trajs"].detach().cpu().numpy()  # [n_agents, length, 2]
+            hinge_status = path_data["hinge_status"].detach().cpu().numpy()  # [n_agents, length]
+            
+            # 获取场景并绘制
+            scenario = self.scenario_library[map_name]
+            for i in range(0, 1):  # 仅绘制第0帧，可扩展多帧
+                # --------------------- 图1：道路场景+参考速度色带 ---------------------
+                plt.figure(fig1.number)  # 显式指定画布，避免错位
+                rnd.draw_params.time_begin = i
+                rnd.draw_params.time_end = i
+                ego_params.time_begin = i
+                ego_params.time_end = i
+                scenario.draw(rnd)
+                rnd.render(show=False)  # 关闭实时显示，提升效率
+                
+                # 绘制道路边界/中心线（中文图例）
+                linewidth = 0.3
+                rnd.ax.grid(alpha=0.3)  # 增加浅网格，提升论文图表可读性
+                
+                rnd.ax.scatter(left_vertices[:, 0], left_vertices[:, 1], 
+                            s=0.5, c='r', label='左边界', zorder=20, linewidth=linewidth)
+                rnd.ax.scatter(right_vertices[:, 0], right_vertices[:, 1], 
+                            s=0.5, c='b', label='右边界', zorder=20, linewidth=linewidth)
+                rnd.ax.scatter(center_vertices[:, 0], center_vertices[:, 1], 
+                            s=0.5, c='gray', label='中心线', zorder=20, linewidth=linewidth, alpha=0.5)
+                
+                # 绘制参考速度色带（彩虹色系）
+                points = center_vertices.reshape(-1, 1, 2)
+                segments = np.concatenate([points[:-1], points[1:]], axis=1)
+                norm = Normalize(vmin=ref_v.min(), vmax=ref_v.max())
+                lc = LineCollection(segments, cmap='viridis', norm=norm, 
+                                    linewidth=linewidth, linestyle='--', zorder=19)
+                lc.set_array(ref_v)
+                line = rnd.ax.add_collection(lc)
+                
+                # 添加颜色条（中文标注+单位/s）
+                cbar = fig1.colorbar(line, ax=ax1, shrink=0.9, pad=0.05)
+                cbar.set_label('参考速度 (m/s)', fontproperties=font_prop)
+                # 修复：替换fontproperties为labelfontfamily，设置刻度字体为新罗马
+                cbar.ax.tick_params(labelsize=font_size_tick, labelfontfamily='Times New Roman')
+                
+                # 设置坐标轴（中文标签+数字新罗马+单位/s）
+                rnd.ax.set_xlim(25, 100)
+                rnd.ax.set_ylim(-60, 5)
+                rnd.ax.set_xlabel("x/m", fontproperties=font_prop)
+                rnd.ax.set_ylabel("y/m", fontproperties=font_prop)
+                # 修复：刻度字体用labelfontfamily指定新罗马
+                rnd.ax.tick_params(axis='both', direction='in', labelsize=font_size_tick, 
+                                top=False, right=False, labelfontfamily='Times New Roman')
+                # 图例中文显示
+                rnd.ax.legend(prop=font_prop)
+                
+                # 保存场景图（论文级分辨率）
+                fig1_path = f"{self.vis_dir}/Path{path_id:04d}_map_{i:04d}.pdf"
+                fig1.savefig(fig1_path, dpi=300, format="pdf", bbox_inches='tight')
+                
+                # 清除临时元素，准备后续绘图
+                cbar.remove()
+                line.remove()
+                
+                # --------------------- 图2：参考速度-路径长度曲线 ---------------------
+                plt.figure(fig2.number)
+                ax2.clear()
+                ax2.plot(s, ref_v, 'b', label='参考速度', zorder=20, linewidth=1.5)
+                # 坐标轴配置（中文标签+单位/s+数字新罗马）
+                ax2.set_xlabel("累计路程/m", fontproperties=font_prop)
+                ax2.set_ylabel("参考速度/(m/s)", fontproperties=font_prop)  # 单位改为/s
+                # 修复：同样用labelfontfamily设置刻度字体
+                ax2.tick_params(axis='both', direction='in', labelsize=font_size_tick, 
+                                top=False, right=False, labelfontfamily='Times New Roman')
+                #ax2.legend(prop=font_prop)
+                ax2.grid(alpha=0.3)  # 增加浅网格，提升论文图表可读性
+                
+                # 保存速度曲线图
+                fig2_path = f"{self.vis_dir}/Path{path_id:04d}_ref_v_{i:04d}.pdf"
+                fig2.savefig(fig2_path, dpi=300, format="pdf", bbox_inches='tight')
+                
+                # 暂停仅用于调试，发布版可注释
+                plt.pause(0.01)
+        
+        # 关闭画布，释放资源
+        plt.close(fig1)
+        plt.close(fig2)
+        plt.close(fig3)
 # try separate each path, but more time cost, deprecated
 # class OcctCRMapNew(MapBase):
 #     def __init__(
@@ -1968,4 +2103,4 @@ if __name__ == "__main__":
                      is_constant_ref_v=False,
                      rod_len=30.0)
     
-    road.plot_road_debug()
+    road.plot_road_debug_paper()
