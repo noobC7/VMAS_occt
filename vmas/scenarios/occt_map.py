@@ -801,6 +801,16 @@ class OcctCRMap(MapBase):
                 # if not(path_ids[0]==128 and path_ids[-1]==106):
                 # if not((path_ids[0]==100 and path_ids[-1]==169)):
                 #     continue
+
+                if map_name == "USA_Roundabout_EP_repaired.xml":
+                    if (path_ids[-1]==124) or \
+                        (path_ids[0]==100 and path_ids[-1]==169) or \
+                            (path_ids[0]==149 and path_ids[-1]==157) or \
+                            (path_ids[0]==149 and path_ids[-1]==124) or \
+                            (path_ids[0]==127 and path_ids[-1]==124) or \
+                            (path_ids[0]==127 and path_ids[-1]==157) or \
+                            (path_ids[0]==149 and path_ids[-1]==132):
+                        continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
                     center_vertices = np.array(lanelet.center_vertices)
@@ -975,7 +985,7 @@ class OcctCRMap(MapBase):
         """
         map_name = self.batch_map_name[env_index]
         return self.scenario_library[map_name]
-    def reset_splines(self, env_index=None):
+    def reset_splines(self):
         """
         生成batch_dim长度的随机整型tensor，范围0到道路库数量-1
         使用torchcubicspline初始化路径样条
@@ -986,10 +996,10 @@ class OcctCRMap(MapBase):
             assert self.batch_dim==len(self.path_library), f"batch_dim(got {self.batch_dim}) must equal to len(self.path_library)(got {len(self.path_library)})"
             self.batch_id = torch.arange(0, len(self.path_library), dtype=torch.int64, device=self.device)
         else:
-            if env_index:
-                self.batch_id[env_index] = torch.randint(0, len(self.path_library), (1,), device=self.device)
-            else:
-                self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
+            self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
+            # 260128 revise
+            for i in range(self.batch_dim):
+                self.batch_id[i] = torch.tensor(i % len(self.path_library), dtype=torch.int64, device=self.device)
         # 准备batch数据
         B = self.batch_dim
         max_path_pts_num = len(self.max_path_s_list)
@@ -1392,7 +1402,7 @@ class OcctCRMap(MapBase):
                 rnd.ax.set_xlabel("x/m", fontsize=font_size)
                 rnd.ax.set_ylabel("y/m", fontsize=font_size)
                 rnd.ax.tick_params(axis='both', direction='in', labelsize=16, top=False, right=False)
-                rnd.ax.set_title(f"Path {path_id + 1}, Width=({min(lane_width):.2f},{np.mean(lane_width):.2f},{max(lane_width):.2f})m, Len={s[-1]:.2f}m\npath_ids={path_ids}",
+                rnd.ax.set_title(f"{map_name} Path {path_id + 1}, Width=({min(lane_width):.2f},{np.mean(lane_width):.2f},{max(lane_width):.2f})m, Len={s[-1]:.2f}m\npath_ids={path_ids}",
                                   fontsize=font_size, zorder=20)
                 # 暂停以显示
                 plt.pause(0.01)
@@ -1571,6 +1581,7 @@ class OcctCRMap(MapBase):
                 
                 # 保存场景图（论文级分辨率）
                 fig1_path = f"{self.vis_dir}/Path{path_id:04d}_map_{i:04d}.pdf"
+                plt.show()
                 fig1.savefig(fig1_path, dpi=300, format="pdf", bbox_inches='tight')
                 
                 # 清除临时元素，准备后续绘图
@@ -2098,9 +2109,11 @@ if __name__ == "__main__":
                      cr_map_dir="vmas/scenarios_data/cr_maps/debug",
                      max_ref_v=15/3.6 ,
                      min_lane_width=2.9, 
+                     min_lane_len=120,
                      device=device, 
                      sample_gap=1, 
                      is_constant_ref_v=False,
                      rod_len=30.0)
     
-    road.plot_road_debug_paper()
+    road.plot_road_debug()
+    #road.plot_road_debug_paper()
