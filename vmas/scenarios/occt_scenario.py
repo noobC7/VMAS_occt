@@ -86,6 +86,9 @@ class Scenario(BaseScenario):
             "total": 0.0,          # 函数总耗时
             "reset_agents_loop": 0.0,   # 10. 重置智能体循环（距离/碰撞）
         }
+        # episode step 追踪（向量化，每个并行环境独立计数）
+        self.env_current_step = torch.zeros(batch_dim, device=device, dtype=torch.long)
+        self.env_total_step = torch.zeros(batch_dim, device=device, dtype=torch.long)
         # world params
         self.device = device
         self.batch_dim = batch_dim
@@ -226,6 +229,7 @@ class Scenario(BaseScenario):
             rod_len=self.rod_len,
             n_agents=self.n_agents,
         )
+        self.road_total_step = torch.zeros_like(self.road.batch_id.unique())
         self.lane_width = self.road.get_lane_width("mean")
         
         # 直接使用Road对象的边界点
@@ -569,7 +573,7 @@ class Scenario(BaseScenario):
         )  # Threshold above which agents will be penalized for changing acceleration too quick [m/s^2]
 
         threshold_near_boundary_high = kwargs.pop(
-            "threshold_near_boundary_high", self.lane_width/2
+            "threshold_near_boundary_high", self.agent_width/2
         )  # Threshold beneath which agents will started be
         # Penalized for being too close to lanelet boundaries
         threshold_near_boundary_low = kwargs.pop(
@@ -964,7 +968,7 @@ class Scenario(BaseScenario):
         s_start_buffer = 5.0
         s_end_buffer = 15.0
         if self.is_rand_arc_pos:
-            last_vehicle_s = self.get_random_tensor() * self.road.get_s_max()
+            last_vehicle_s = self.get_random_tensor() * self.road.get_s_max() * 0.7 #260128
         else:
             last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos
         last_vehicle_s = torch.clamp(last_vehicle_s, s_start_buffer * torch.ones(B,device=device),
@@ -1275,6 +1279,8 @@ class Scenario(BaseScenario):
                     return_ref_v=True,
                     env_j=env_j
                 )
+            if self.task_class==TaskClass.SIMPLE_PLATOON and i_agent!=0:
+                self.ref_paths_agent_related.short_term[env_j, i_agent,:,-1] = self.ref_paths_agent_related.short_term[env_j, 0,:,-1]
         else:
             (
                 self.ref_paths_agent_related.short_term[env_j, i_agent, :, 0:2],
@@ -1664,12 +1670,15 @@ class Scenario(BaseScenario):
 
         # update arch of agents[Current]
         start_time = time.time()
+        agent_vel_vector = torch.stack([torch.linalg.norm(self.world.agents[i].state.vel,dim=-1) for i in range(self.n_agents)],dim=-1)
+        desire_agent_ds = agent_vel_vector * self.dt    
         new_agent_s = calibrate_agent_s_by_road_pts(
             agent_pos=agents_pos,          # [B, F, 2]
-            ref_agent_s=self.observations.agent_s.clone(), # [B, F]
+            ref_agent_s=self.observations.agent_s.clone()+desire_agent_ds, # [B, F]
             road_get_pts_func=self.road.get_pts,
             interval=0.25,
             precision=0.025,
+            forward_search=False,
             device=self.observations.agent_s.device
         )
         end_time = time.time()
@@ -2118,7 +2127,16 @@ class Scenario(BaseScenario):
         )  # In local coordinate system, only the first component is interesting, as the second is always 0
 
         # Self-observations
+        encode_val = 0 if agent_index == 0 else 1
+        agent_attr_encode = torch.full(
+                size=(self.world.batch_dim, 1),  # 1维编码，形状和原有特征统一
+                fill_value=encode_val,
+                dtype=torch.float32,
+                device=self.device
+            )
         obs_self = [
+            # [own] agent attribute encode
+            agent_attr_encode if self.task_class == TaskClass.OCCT_PLATOON else None,
             # [own] velocity
             self.observations.past_vel.get_latest()[indexing_tuple_vel].reshape(
                 self.world.batch_dim, -1
@@ -2381,11 +2399,12 @@ class Scenario(BaseScenario):
         ready_to_hinge = (((block_order==0) | (block_order==2)) & is_block)
         return ready_to_hinge
     def reward(self, agent: Agent):
+        agent_index = self.world.agents.index(agent)
+        if agent_index == 0:
+            self.env_current_step += 1
         # Initialize
         reward_details=self.reward_details
         self.rew[:] = 0
-        # Get the index of the current agent
-        agent_index = self.world.agents.index(agent)
         # we exclude the front vehicle and end vehicle
         # [update] mutual distances between agents, vertices of each agent, and collision matrices
         t0=time.time()
@@ -2396,7 +2415,6 @@ class Scenario(BaseScenario):
         if self.task_class == TaskClass.OCCT_PLATOON and agent_index in self.TRACTOR_SLICE:
             self.update_state_after_rewarding(agent_index)
             return self.rew
-
         # [penalty] close to other agents
         mutual_distance_exp_fcn = exponential_decreasing_fcn(
             x=self.distances.agents[:, agent_index, :],
@@ -2422,13 +2440,15 @@ class Scenario(BaseScenario):
             - self.thresholds.change_steering,  # Not forget to denormalize
             min=0,
         )
-        if self.observations.past_action_steering.valid_size>3:
+        if self.observations.past_action_steering.valid_size==self.observations.n_stored_steps:
             penalty_change_steering = (
                 (steering_change/torch.deg2rad(torch.tensor(3,device=self.device)))**2 * self.penalties.change_steering
             )
-            penalty_change_steering = torch.clamp(penalty_change_steering,min=-50,max=0)
-            reward_details["penalty_change_steering"][:,agent_index] = penalty_change_steering
-            self.rew += penalty_change_steering
+            penalty_change_steering = torch.clamp(penalty_change_steering,min=-5,max=0)
+        else:
+            penalty_change_steering = 0.0
+        reward_details["penalty_change_steering"][:,agent_index] = penalty_change_steering
+        self.rew += penalty_change_steering
 
 
         # [penalty] changing acc too quick
@@ -2445,13 +2465,15 @@ class Scenario(BaseScenario):
             min=0,
         )
         acc_nor=0.1
-        if self.observations.past_action_acc.valid_size>3:
+        if self.observations.past_action_acc.valid_size==self.observations.n_stored_steps:
             penalty_change_acc = (
                 (acc_change/acc_nor)**2 * self.penalties.change_acc
             )
-            penalty_change_acc = torch.clamp(penalty_change_acc,min=-50,max=0)
-            reward_details["penalty_change_acc"][:,agent_index] = penalty_change_acc
-            self.rew += penalty_change_acc
+            penalty_change_acc = torch.clamp(penalty_change_acc,min=-5,max=0)
+        else:
+            penalty_change_acc = 0.0
+        reward_details["penalty_change_acc"][:,agent_index] = penalty_change_acc
+        self.rew += penalty_change_acc
 
         # [penalty] colliding with other agents
         is_collide_with_agents = self.collisions.with_agents[:, agent_index]
@@ -2470,9 +2492,11 @@ class Scenario(BaseScenario):
         self.rew += penalty_outside_boundaries
 
         # [penalty] close to lanelet boundaries
+        current_lane_width = torch.linalg.norm(self.ref_paths_agent_related.nearing_points_left_boundary[:, agent_index, 1] -\
+              self.ref_paths_agent_related.nearing_points_right_boundary[:, agent_index, 1],dim=-1)
         penalty_near_boundary = (
             torch.max(exponential_decreasing_fcn(
-                x=self.distances.boundaries[:, agent_index],
+                x=self.distances.boundaries[:, agent_index]/current_lane_width,
                 x0=self.thresholds.near_boundary_low,
                 x1=self.thresholds.near_boundary_high,
             ),is_collide_with_lanelets.float())
@@ -2534,12 +2558,19 @@ class Scenario(BaseScenario):
             ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
             agent_vel = torch.linalg.norm(agent.state.vel, dim=-1)
             error_vel = agent_vel - ref_vel
-
-        reward_track_ref_vel = torch.clamp(1 - self.rewards.reward_track_ref_vel* (error_vel)**2, min=0)
+        # if (agent_index==0 and self.task_class==TaskClass.SIMPLE_PLATOON) or self.task_class==TaskClass.OCCT_PLATOON:
+        #     reward_track_ref_vel = torch.clamp(1 - self.rewards.reward_track_ref_vel* (error_vel)**2, min=0)
+        # else:
+        #     reward_track_ref_vel = 0.0
+        reward_track_ref_vel = torch.clamp(1 - self.rewards.reward_track_ref_vel* error_vel**2, min=0)
         reward_details["reward_track_ref_vel"][:,agent_index] =  reward_track_ref_vel
         self.rew += reward_track_ref_vel
-
-        # last_space_errors = self.observations.error_space.get_latest(n=2)[:, agent_index, 0] # only consider front space
+        # if (agent_index!=0 and self.task_class==TaskClass.SIMPLE_PLATOON) or self.task_class==TaskClass.OCCT_PLATOON:
+        #     # last_space_errors = self.observations.error_space.get_latest(n=2)[:, agent_index, 0] # only consider front space
+        #     space_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0]
+        #     reward_track_ref_space = torch.clamp(1 - self.rewards.reward_track_ref_space * space_errors**2, min=0)
+        # else:
+        #     reward_track_ref_space = 0.0
         space_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0]
         reward_track_ref_space = torch.clamp(1 - self.rewards.reward_track_ref_space * space_errors**2, min=0)
         reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
@@ -2567,17 +2598,17 @@ class Scenario(BaseScenario):
         max_delta_angle=torch.deg2rad(torch.tensor(15, device=self.device, dtype=torch.float32))
         constant_k=1/(1-torch.cos(max_delta_angle))
         costant_b=1-constant_k
-        reward_track_ref_heading = self.rewards.reward_track_ref_heading * \
-                                   (constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b)
-        reward_track_ref_heading = - self.rewards.reward_track_ref_heading * \
-                                   torch.abs(torch.acos(torch.clamp(
-                                       torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0
-                                       ))/max_delta_angle)
+        reward_track_ref_heading = torch.clamp(self.rewards.reward_track_ref_heading * \
+                                   (constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b),-1.0,1.0)
+        # reward_track_ref_heading = - self.rewards.reward_track_ref_heading * \
+        #                            torch.abs(torch.acos(torch.clamp(
+        #                                torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0
+        #                                ))/max_delta_angle)
         reward_details["reward_track_ref_heading"][:,agent_index] =  reward_track_ref_heading
         self.rew += reward_track_ref_heading
-        reward_track_ref_path = torch.clamp(1 - \
-                                                torch.mean(self.distances.lookahead_pts[:, agent_index], dim=-1) * \
-                                                    self.rewards.reward_track_ref_path, min=0)
+        ratio=0.7
+        weighted_ref_dis = ratio*self.distances.lookahead_pts[:, agent_index, 0]+(1-ratio)*self.distances.lookahead_pts[:, agent_index, 1]
+        reward_track_ref_path = 1 - self.rewards.reward_track_ref_path * weighted_ref_dis**2
         reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
         self.rew += reward_track_ref_path
         reward_details["reward_total"][:,agent_index] = self.rew
@@ -2679,6 +2710,8 @@ class Scenario(BaseScenario):
                         return_ref_v=True,
                         line='center',
                     )
+                if self.task_class==TaskClass.SIMPLE_PLATOON and a_i!=0:
+                    self.ref_paths_agent_related.short_term[:, a_i,:,-1] = self.ref_paths_agent_related.short_term[:, 0,:,-1]
 
                 # Get nearing points on boundaries
                 if self.use_boundary_frenet_ref:
@@ -2838,6 +2871,59 @@ class Scenario(BaseScenario):
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
         is_collision_with_exit_segments = self.collisions.with_exit_segments.any(dim=-1)
         is_done = is_collision_with_agents | is_collision_with_exit_segments | is_collision_with_lanelets
+        # is_fail = is_collision_with_agents | is_collision_with_lanelets
+        # is_success = is_collision_with_exit_segments
+        # if is_fail.sum() > 0:
+        #     fail_path_ids = self.road.batch_id[is_fail].detach().cpu().numpy()
+        #     fail_steps = self.env_current_step[is_fail].detach().cpu().numpy()
+        #     path_step_dict = {}
+        #     for pid, step in zip(fail_path_ids, fail_steps):
+        #         pid_int = int(pid)
+        #         step_float = float(step)
+        #         if pid_int not in path_step_dict:
+        #             path_step_dict[pid_int] = []
+        #         path_step_dict[pid_int].append(step_float)
+        #     path_mean_step = {}
+        #     for pid in path_step_dict:
+        #         step_list = path_step_dict[pid]
+        #         mean_step = np.mean(step_list)
+        #         path_mean_step[pid] = int(mean_step) if mean_step.is_integer() else round(mean_step, 1)
+        #     sorted_pids = sorted(path_mean_step.keys())
+        #     fail_info_list = [f"path{pid}-step{path_mean_step[pid]}" for pid in sorted_pids]
+        #     fail_info_str = ", ".join(fail_info_list) + " [END]"
+        #     torchrl_logger.info(f"fail info: {fail_info_str}")
+
+        # if is_success.sum() > 0:
+        #     success_path_ids = self.road.batch_id[is_success].detach().cpu().numpy()
+        #     success_steps = self.env_current_step[is_success].detach().cpu().numpy()
+        #     success_path_dict = {}
+        #     for pid, step in zip(success_path_ids, success_steps):
+        #         pid_int = int(pid)
+        #         step_float = float(step)
+        #         if pid_int not in success_path_dict:
+        #             success_path_dict[pid_int] = []
+        #         success_path_dict[pid_int].append(step_float)
+            
+        #     success_mean_step = {}
+        #     for pid in success_path_dict:
+        #         mean_step = np.mean(success_path_dict[pid])
+        #         success_mean_step[pid] = int(mean_step) if mean_step.is_integer() else round(mean_step, 1)
+            
+        #     sorted_success_pids = sorted(success_mean_step.keys())
+        #     success_info_list = [f"path{pid}-step{success_mean_step[pid]}" for pid in sorted_success_pids]
+        #     success_info_str = ", ".join(success_info_list) + " [END]"
+            
+        #     torchrl_logger.info(f"success info: {success_info_str}")
+
+        self.env_total_step[is_done] = self.env_current_step[is_done]
+        self.env_current_step[is_done] = 0
+        self.road_total_step.scatter_reduce_(
+            dim=0,
+            index=self.road.batch_id,
+            src=self.env_total_step,
+            reduce='mean',
+            include_self=False
+        )
         return is_done
     def get_desire_agent_pos(self, agent_index, lookahead_idx = None):
         """
@@ -2904,6 +2990,10 @@ class Scenario(BaseScenario):
             "error_space": agent_error_space,
             "error_vel": self.observations.error_vel[:, agent_index],
             "ref_vel": self.ref_paths_agent_related.short_term[:, agent_index, 0, 2],
+            # episode 步数信息
+            "episode_step": self.env_current_step,
+            "env_total_step": self.env_total_step,  # 全局最大步数
+            "road_total_step": self.road_total_step[None,:].expand(self.batch_dim,-1),  # 道路最小步数
             **hinge_dict,
             **agent_reward_details,
             }
