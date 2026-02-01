@@ -965,8 +965,8 @@ class Scenario(BaseScenario):
 
         # ============== 阶段3：计算最后一辆车弧长 ==============
         stage3_start = time.time()
-        s_start_buffer = 5.0
-        s_end_buffer = 15.0
+        s_start_buffer = 0.0
+        s_end_buffer = 0.0
         if self.is_rand_arc_pos:
             last_vehicle_s = self.get_random_tensor() * self.road.get_s_max() * 0.7 #260128
         else:
@@ -1677,7 +1677,7 @@ class Scenario(BaseScenario):
             ref_agent_s=self.observations.agent_s.clone()+desire_agent_ds, # [B, F]
             road_get_pts_func=self.road.get_pts,
             interval=0.25,
-            precision=0.025,
+            precision=0.005,
             forward_search=False,
             device=self.observations.agent_s.device
         )
@@ -1873,12 +1873,15 @@ class Scenario(BaseScenario):
             for i in range(self.n_agents):
                 # 计算与前一辆车的间距误差（第一个车没有前车，保持为0）
                 if i > 0:
-                    actual_distance = self.distances.agents_frenet[:, i, i-1]
+                    # 260131 revise
+                    #actual_distance = self.distances.agents_frenet[:, i, i-1]
+                    actual_distance = self.distances.agents[:, i, i-1]
                     error_space[:, i, 0] = (actual_distance - self.platoon_space_batch)
                 
                 # 计算与后一辆车的间距误差（最后一个车没有后车，保持为0）
                 if i < self.n_agents - 1:
-                    actual_distance = self.distances.agents_frenet[:, i, i+1]
+                    #actual_distance = self.distances.agents_frenet[:, i, i+1]
+                    actual_distance = self.distances.agents[:, i, i+1]
                     error_space[:, i, 1] = (actual_distance - self.platoon_space_batch)
             self.observations.error_space.add(error_space)
             if self.is_ego_view:
@@ -2141,6 +2144,12 @@ class Scenario(BaseScenario):
             self.observations.past_vel.get_latest()[indexing_tuple_vel].reshape(
                 self.world.batch_dim, -1
             ),
+            # self.observations.past_action_acc.get_latest()[:,agent_index].reshape(
+            #     self.world.batch_dim, -1
+            # ),
+            # self.observations.past_action_steering.get_latest()[:,agent_index].reshape(
+            #     self.world.batch_dim, -1
+            # ),
             # [own] reference and boundary
             self.observations.past_short_term_ref_points.get_latest()[..., :2][
                 indexing_tuple_3
@@ -2548,15 +2557,32 @@ class Scenario(BaseScenario):
         reward_details["reward_goal"][:,agent_index] = reward_goal
         self.rew += reward_goal  # Relative to the maximum possible movement
 
+        # [reward] 横向跟踪
+        ref_vector = torch.mean(ref_points_vecs,dim=1) # or ref_points_vecs[:,0,:]
+        ref_vector_normalized = ref_vector / (torch.norm(ref_vector, dim=-1, keepdim=True) + 1e-8)
+        move_vector = move_vec[:,0,:]
+        move_vector_normalized = move_vector/ (torch.norm(move_vector, dim=-1, keepdim=True) + 1e-8)
+        max_delta_angle=torch.deg2rad(torch.tensor(15, device=self.device, dtype=torch.float32))
+        constant_k=1/(1-torch.cos(max_delta_angle))
+        costant_b=1-constant_k
+        reward_track_ref_heading = torch.clamp(self.rewards.reward_track_ref_heading * \
+                                   (constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b),-1.0,1.0)
+        # reward_track_ref_heading = - self.rewards.reward_track_ref_heading * \
+        #                            torch.abs(torch.acos(torch.clamp(
+        #                                torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0
+        #                                ))/max_delta_angle)
+        reward_details["reward_track_ref_heading"][:,agent_index] =  reward_track_ref_heading
+        self.rew += reward_track_ref_heading
+
         # [reward] 编队跟踪
+        agent_raw_vel = torch.linalg.norm(agent.state.vel, dim=-1)
+        agent_vel = agent_raw_vel*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)
         if self.task_class==TaskClass.OCCT_PLATOON:
             leader_index = 0
             leader_vel = torch.linalg.norm(self.world.agents[leader_index].state.vel, dim=-1)
-            agent_vel = torch.linalg.norm(agent.state.vel, dim=-1)
             error_vel = agent_vel - leader_vel
         else:
             ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
-            agent_vel = torch.linalg.norm(agent.state.vel, dim=-1)
             error_vel = agent_vel - ref_vel
         # if (agent_index==0 and self.task_class==TaskClass.SIMPLE_PLATOON) or self.task_class==TaskClass.OCCT_PLATOON:
         #     reward_track_ref_vel = torch.clamp(1 - self.rewards.reward_track_ref_vel* (error_vel)**2, min=0)
@@ -2590,24 +2616,9 @@ class Scenario(BaseScenario):
             reward_details["reward_track_hinge"][:, agent_index] = reward_track_hinge
             self.rew += reward_track_hinge
 
-        # [reward] 横向跟踪
-        ref_vector = torch.mean(ref_points_vecs,dim=1) # or ref_points_vecs[:,0,:]
-        ref_vector_normalized = ref_vector / (torch.norm(ref_vector, dim=-1, keepdim=True) + 1e-8)
-        move_vector = move_vec[:,0,:]
-        move_vector_normalized = move_vector/ (torch.norm(move_vector, dim=-1, keepdim=True) + 1e-8)
-        max_delta_angle=torch.deg2rad(torch.tensor(15, device=self.device, dtype=torch.float32))
-        constant_k=1/(1-torch.cos(max_delta_angle))
-        costant_b=1-constant_k
-        reward_track_ref_heading = torch.clamp(self.rewards.reward_track_ref_heading * \
-                                   (constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b),-1.0,1.0)
-        # reward_track_ref_heading = - self.rewards.reward_track_ref_heading * \
-        #                            torch.abs(torch.acos(torch.clamp(
-        #                                torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0
-        #                                ))/max_delta_angle)
-        reward_details["reward_track_ref_heading"][:,agent_index] =  reward_track_ref_heading
-        self.rew += reward_track_ref_heading
         ratio=0.7
         weighted_ref_dis = ratio*self.distances.lookahead_pts[:, agent_index, 0]+(1-ratio)*self.distances.lookahead_pts[:, agent_index, 1]
+        #reward_track_ref_path = 1 - self.rewards.reward_track_ref_path * torch.clamp((weighted_ref_dis-0.05), min=0)
         reward_track_ref_path = 1 - self.rewards.reward_track_ref_path * weighted_ref_dis**2
         reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
         self.rew += reward_track_ref_path
@@ -2841,12 +2852,36 @@ class Scenario(BaseScenario):
             ),
             dim=-1,
         )
-        theta = agent.state.rot
         for idx in range(self.lookahead_idx):
-            lookahead_pts = agent.state.pos + idx*self.sample_interval * torch.hstack([torch.cos(theta), torch.sin(theta)])
+            if idx==0:
+                lookahead_pts = agent.state.pos
+            else:
+                # dist_travelled=torch.ones_like(agent.action.u[:, 1])*self.sample_interval*idx
+                # lookahead_pts = self.compute_lookahead_kinematics(agent, agent.action.u[:, 1], dist_travelled)
+                lookahead_pts = agent.state.pos + idx*self.sample_interval * torch.hstack([torch.cos(agent.state.rot), torch.sin(agent.state.rot)])
             self.distances.lookahead_pts[:, agent_index, idx] = \
                 torch.linalg.norm(self.ref_paths_agent_related.short_term[:, agent_index, idx, :2] - lookahead_pts, dim=-1)
-
+    def compute_lookahead_kinematics(self, agent, delta, dist_travelled):
+        """
+        使用匀速圆弧模型预测车辆在 dt 时间后的位置
+        delta: agent.action[:, 1], 弧度单位
+        dt: 预测的时间跨度 (sample_dt * idx)
+        """
+        theta = agent.state.rot.squeeze(-1)
+        L = agent.dynamics.l_f + agent.dynamics.l_r
+        kappa = torch.tan(delta) / L
+        delta_theta = dist_travelled * kappa
+        is_straight = torch.abs(kappa) < 1e-4
+        inv_kappa = 1.0 / (kappa + 1e-8)
+        lookahead_pos_curve = agent.state.pos + inv_kappa.unsqueeze(-1) * torch.stack([
+            torch.sin(theta + delta_theta) - torch.sin(theta),
+            -(torch.cos(theta + delta_theta) - torch.cos(theta))
+        ], dim=-1)
+        lookahead_pos_straight = agent.state.pos + dist_travelled.unsqueeze(-1) * torch.stack([
+            torch.cos(theta), torch.sin(theta)
+        ], dim=-1)
+        lookahead_pts = torch.where(is_straight.unsqueeze(-1), lookahead_pos_straight, lookahead_pos_curve)
+        return lookahead_pts
     def update_state_after_rewarding(self, agent_index):
         """Update some states (such as previous positions and short-term reference paths) after rewarding agents."""
         if agent_index == (self.n_agents - 1):  # Avoid repeated updating
