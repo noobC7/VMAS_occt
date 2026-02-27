@@ -13,6 +13,135 @@ import vmas.simulator.core
 import vmas.simulator.utils
 from vmas.simulator.dynamics.common import Dynamics
 
+class KinematicBicycle(Dynamics):
+    # Kinematic Bicycle model with acceleration and steering angle as direct actions
+    def __init__(
+        self,
+        world: vmas.simulator.core.World,
+        width: float,
+        l_f: float,
+        l_r: float,
+        max_steering_angle: float,
+        max_acceleration: float = 5.0,  # Maximum acceleration in m/s^2
+        integration: str = "rk4",  # one of "euler", "rk4"
+    ):
+        super().__init__()
+        assert integration in (
+            "rk4",
+            "euler",
+        ), "Integration method must be 'euler' or 'rk4'."
+        self.width = width
+        self.l_f = l_f  # Distance between the front axle and the center of gravity
+        self.l_r = l_r  # Distance between the rear axle and the center of gravity
+        self.max_delta = max_steering_angle
+        self.max_acceleration = max_acceleration
+        self.dt = world.dt
+        self.integration = integration
+        self.world = world
+        
+        # Actual steering angle is now a direct control, not a state, 
+        # but we keep this for history/logging compatibility
+        self.cur_delta = None 
+
+    def f(self, state, acceleration, delta):
+        assert torch.isnan(state).any() == False, f"state is nan"
+        assert torch.isnan(acceleration).any() == False, f"acceleration is nan"
+        assert torch.isnan(delta).any() == False, f"delta is nan"
+        
+        # State includes: [x, y, theta, v]
+        theta = state[:, 2]  # Yaw angle
+        v = state[:, 3]      # Linear velocity
+        
+        # Calculate slip angle beta
+        beta = torch.atan2(
+            torch.tan(delta) * self.l_r / (self.l_f + self.l_r),
+            torch.tensor(1.0, device=self.world.device),
+        )
+        
+        dx = v * torch.cos(theta + beta)
+        dy = v * torch.sin(theta + beta)
+        dtheta = (v / (self.l_f + self.l_r)) * torch.cos(beta) * torch.tan(delta)
+        dv = acceleration
+        
+        # Return derivatives for [x, y, theta, v]
+        new_state = torch.stack((dx, dy, dtheta, dv), dim=1)  
+        assert torch.isnan(new_state).any() == False, f"new_state is nan"
+        return new_state
+    
+    def euler(self, state, acceleration, delta):
+        return self.dt * self.f(state, acceleration, delta)
+    
+    def runge_kutta(self, state, acceleration, delta):
+        k1 = self.f(state, acceleration, delta)
+        k2 = self.f(state + self.dt * k1 / 2, acceleration, delta)
+        k3 = self.f(state + self.dt * k2 / 2, acceleration, delta)
+        k4 = self.f(state + self.dt * k3, acceleration, delta)
+        return (self.dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+    
+    @property
+    def needed_action_size(self) -> int:
+        return 2  # [acceleration, steering_angle]
+
+    def process_action(self):
+        batch_size = self.agent.state.pos.shape[0]
+        
+        # Extract actions
+        acceleration = self.agent.action.u[:, 0]
+        delta = self.agent.action.u[:, 1]
+        
+        # Apply constraints
+        acceleration = torch.clamp(
+            acceleration, -self.max_acceleration, self.max_acceleration
+        )
+        delta = torch.clamp(
+            delta, -self.max_delta, self.max_delta
+        )
+        
+        # Current state: [x, y, theta, v]
+        pos = self.agent.state.pos  
+        theta = self.agent.state.rot  
+        
+        # Get scalar velocity with sign
+        vel_mag = torch.norm(self.agent.state.vel, dim=1, keepdim=True)
+        vel_dir = self.agent.state.vel / (vel_mag + 1e-8)
+        heading_vec = torch.cat([torch.cos(theta), torch.sin(theta)], dim=1)
+        direction_sign = torch.sign(torch.sum(vel_dir * heading_vec, dim=1, keepdim=True))
+        cur_v = vel_mag * direction_sign
+        
+        # Pack state for integration
+        state = torch.cat((pos, theta, cur_v), dim=1)
+        
+        # Select integration method
+        if self.integration == "euler":
+            delta_state = self.euler(state, acceleration, delta)
+        else:
+            delta_state = self.runge_kutta(state, acceleration, delta)
+
+        # VMAS expects force/torque updates to move the agent
+        v_cur_x = self.agent.state.vel[:, 0]
+        v_cur_y = self.agent.state.vel[:, 1]
+        v_cur_angular = self.agent.state.ang_vel[:, 0]
+
+        acceleration_x = (delta_state[:, 0] - v_cur_x * self.dt) / self.dt**2
+        acceleration_y = (delta_state[:, 1] - v_cur_y * self.dt) / self.dt**2
+        acceleration_angular = (delta_state[:, 2] - v_cur_angular * self.dt) / self.dt**2
+
+        self.agent.state.force[:, vmas.simulator.utils.X] = self.agent.mass * acceleration_x
+        self.agent.state.force[:, vmas.simulator.utils.Y] = self.agent.mass * acceleration_y
+        self.agent.state.torque = (self.agent.moment_of_inertia * acceleration_angular).unsqueeze(-1)
+
+        # Update cur_delta for history and synchronization
+        self.cur_delta = delta.unsqueeze(1)
+        
+        # Store history
+        if batch_size == 1:
+            self.history['pos'].append(pos.cpu().numpy().copy()[0])
+            self.history['yaw'].append(theta.cpu().numpy().copy()[0][0])
+            self.history['vel'].append(cur_v.cpu().numpy().copy()[0][0])
+            self.history['delta'].append(self.cur_delta.cpu().numpy().copy()[0][0])
+            self.history['target_delta'].append(delta.cpu().numpy().copy()[0])
+            self.history['acc'].append(acceleration.cpu().numpy().copy()[0])
+
 class DelayedSteeringKinematicBicycle(Dynamics):
     # Kinematic Bicycle model with acceleration and target steering angle as actions
     # and steering actuator delay modeled as first-order inertia

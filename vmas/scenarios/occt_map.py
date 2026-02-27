@@ -374,7 +374,6 @@ class OcctCRMap(MapBase):
                  min_lane_len: float = 70,
                  max_ref_v: float = 20/3.6,
                  is_constant_ref_v: bool = False,
-                 eval_mode: bool = False,
                  rod_len = None,
                  extend_len = None,
                  n_agents: int = 4): # 采样间隔
@@ -396,7 +395,6 @@ class OcctCRMap(MapBase):
         self.min_lane_len = min_lane_len
         self.max_ref_v = max_ref_v # max ref vel in m/s
         self.is_constant_ref_v = is_constant_ref_v # if True, then ref_v is constant and equal to max_ref_v
-        self.eval_mode = eval_mode # if True, then the batch id is in order and fixed
         self.rod_len = rod_len # 车辆长度
         self.extend_len = rod_len if extend_len is None else 0.0
         self.start_end_distance_threshold = 25 # 起始点和结束点的距离阈值，小于该阈值的路径会被过滤
@@ -801,7 +799,10 @@ class OcctCRMap(MapBase):
                 # if not(path_ids[0]==128 and path_ids[-1]==106):
                 # if not((path_ids[0]==100 and path_ids[-1]==169)):
                 #     continue
-
+                # for chapter 2 paper illustration
+                # if not ((path_ids[0]==177 and path_ids[-1]==129) or \
+                #    (path_ids[0]==153 and path_ids[-1]==175)):
+                #     continue
                 if map_name == "USA_Roundabout_EP_repaired.xml":
                     if (path_ids[-1]==124) or \
                         (path_ids[0]==100 and path_ids[-1]==169) or \
@@ -991,15 +992,11 @@ class OcctCRMap(MapBase):
         使用torchcubicspline初始化路径样条
         """
         start_time=time.time()
-        #print(f"开始reset_splines, env_index: {env_index}")
-        if self.eval_mode:
-            assert self.batch_dim==len(self.path_library), f"batch_dim(got {self.batch_dim}) must equal to len(self.path_library)(got {len(self.path_library)})"
-            self.batch_id = torch.arange(0, len(self.path_library), dtype=torch.int64, device=self.device)
-        else:
-            self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
-            # 260128 revise
-            for i in range(self.batch_dim):
-                self.batch_id[i] = torch.tensor(i % len(self.path_library), dtype=torch.int64, device=self.device)
+        self.batch_id = torch.randint(0, len(self.path_library), (self.batch_dim,), device=self.device)
+        # 260128 revise
+        for i in range(self.batch_dim):
+            self.batch_id[i] = torch.tensor(i % len(self.path_library), dtype=torch.int64, device=self.device)
+        #self.batch_id[0] = 3
         # 准备batch数据
         B = self.batch_dim
         max_path_pts_num = len(self.max_path_s_list)
@@ -1477,141 +1474,212 @@ class OcctCRMap(MapBase):
                 plt.pause(0.01)
                 fig3_path = f"{self.vis_dir}/Path{path_id:04d}_hinge_{i:04d}.svg"
                 fig3.savefig(fig3_path, dpi=300, format="svg", bbox_inches='tight')
-    def plot_road_debug_paper(self):
+    def plot_road_for_paper(self,vis_dir):
+        import matplotlib.pyplot as plt
         import matplotlib.font_manager as fm
         from commonroad.visualization.mp_renderer import MPRenderer, DynamicObstacleParams
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import Normalize
-        import matplotlib.pyplot as plt
-        font_path = '/usr/share/fonts/truetype/msttcorefonts/SongTi.ttf'
-        font_prop = fm.FontProperties(fname=font_path, size=12)
+        from scipy.interpolate import UnivariateSpline  # 引入UnivariateSpline
         
-        # 字体大小统一配置（论文常用尺寸）
-        font_size_label = 16    # 坐标轴标签字体大小
-        font_size_tick = 14     # 刻度字体大小（数字用新罗马）
-        font_size_legend = 14   # 图例字体大小
-        font_size_cbar = 14     # 颜色条标签字体大小
+        def calc_traj_curvature(traj_xy, delta=3):
+            """
+            修改版：使用平滑样条拟合代替硬插值，消除直线段的曲率噪点
+            """
+            delta_xy = np.diff(traj_xy, axis=0)
+            segment_lengths = np.linalg.norm(delta_xy, axis=1)
+            s_arr = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+            
+            x = traj_xy[:, 0]
+            y = traj_xy[:, 1]
 
-        # ===================== 创建绘图画布（适配论文排版）=====================
-        fig1, ax1 = plt.subplots(figsize=(9, 7))  # 微调宽度，适配中文标签
-        rnd = MPRenderer(ax=ax1)
-        fig2, ax2 = plt.subplots(figsize=(8, 5))  # 优化高度，符合论文图表比例
-        fig3, ax3 = plt.subplots(figsize=(8, 5))  # 保留备用，若需扩展绘图
+            # -------------------------- 核心修改开始 --------------------------
+            # s=5: 经验平滑因子
+            smooth_factor = 5  
+            # k=3: 三次样条
+            sx = UnivariateSpline(s_arr, x, k=3, s=smooth_factor)
+            sy = UnivariateSpline(s_arr, y, k=3, s=smooth_factor)
+            # -------------------------- 核心修改结束 --------------------------
+
+            s_max = s_arr[-1]
+            s_eval_arr = np.linspace(0, s_max, int(s_max))
+            curv_arr = np.zeros_like(s_eval_arr)
+
+            for idx, s in enumerate(s_eval_arr):
+                if s <= delta:
+                    s0, s1, s2 = s, s + delta, s + 2 * delta
+                elif s >= s_max - delta:
+                    s0, s1, s2 = s - 2 * delta, s - delta, s
+                else:
+                    s0, s1, s2 = s - delta, s, s + delta
+
+                x0, y0 = sx(s0), sy(s0)
+                x1, y1 = sx(s1), sy(s1)
+                x2, y2 = sx(s2), sy(s2)
+
+                if s <= delta:
+                    dx = (x2 - x1) / delta
+                    dy = (y2 - y1) / delta
+                elif s >= s_max - delta:
+                    dx = (x1 - x0) / delta
+                    dy = (y1 - y0) / delta
+                else:
+                    dx = (x2 - x0) / (2 * delta)
+                    dy = (y2 - y0) / (2 * delta)
+
+                if s <= delta:
+                    ddx = (sx(s2) - 2 * sx(s1) + sx(s0)) / (delta ** 2)
+                    ddy = (sy(s2) - 2 * sy(s1) + sy(s0)) / (delta ** 2)
+                elif s >= s_max - delta:
+                    ddx = (sx(s2) - 2 * sx(s1) + sx(s0)) / (delta ** 2)
+                    ddy = (sy(s2) - 2 * sy(s1) + sy(s0)) / (delta ** 2)
+                else:
+                    ddx = (sx(s + delta) - 2 * sx(s) + sx(s - delta)) / (delta ** 2)
+                    ddy = (sy(s + delta) - 2 * sy(s) + sy(s - delta)) / (delta ** 2)
+
+                denominator = (dx ** 2 + dy ** 2) ** (3 / 2)
+                if abs(denominator) < 1e-6:
+                    curv_arr[idx] = 0.0
+                else:
+                    curv_arr[idx] = (dx * ddy - ddx * dy) / denominator
+
+            return np.abs(curv_arr), s_eval_arr
+
+        # -------------------------- 核心配置：适配 3x3 小尺寸画布 --------------------------
+        # 1. 强制设定画布尺寸 (英寸)
+        fig_size_small = (4, 3)  
         
-        # ===================== 渲染参数设置（论文级样式）=====================
-        # 动态障碍物渲染参数
+        # 2. 缩小字号以适配小画布
+        font_size_label = 8      # 坐标轴标签
+        font_size_tick = 6       # 刻度数字
+        font_size_legend = 5     # 图例文字
+        
+        font_path = '/usr/share/fonts/truetype/msttcorefonts/SongTi.ttf'
+        font_prop_chinese = fm.FontProperties(fname=font_path, size=font_size_label)
+
+        # 全局参数调整
+        plt.rcParams["figure.dpi"] = 300
+        plt.rcParams["axes.unicode_minus"] = False
+        plt.rcParams["legend.frameon"] = False
+        plt.rcParams["axes.labelsize"] = font_size_label
+        plt.rcParams["xtick.labelsize"] = font_size_tick
+        plt.rcParams["ytick.labelsize"] = font_size_tick
+        plt.rcParams["legend.fontsize"] = font_size_legend
+        
+        # -------------------------- 创建画布 --------------------------
+        fig1, ax1 = plt.subplots(figsize=fig_size_small)
+        fig2, ax2 = plt.subplots(figsize=fig_size_small)
+        
+        rnd = MPRenderer(ax=ax1)
         rnd.draw_params.dynamic_obstacle.draw_icon = True
         rnd.draw_params.dynamic_obstacle.draw_bounding_box = True
         rnd.draw_params.dynamic_obstacle.show_label = False
         rnd.draw_params.dynamic_obstacle.state.draw_arrow = False
         rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.facecolor = "white"
-        rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD"  # 深蓝色
-        # 自车渲染参数
+        rnd.draw_params.dynamic_obstacle.vehicle_shape.occupancy.shape.edgecolor = "#0000CD"
+        
         ego_params = DynamicObstacleParams()
         ego_params.draw_icon = True
         ego_params.vehicle_shape.occupancy.shape.facecolor = "white"
-        ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400"  # 深绿色
+        ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400"
         ego_params.vehicle_shape.occupancy.shape.zorder = 20
+        
+        xy_limit={0:((20,80),(-40,20)), 1:((30,100),(-40,30))}
 
-        # ===================== 遍历路径并绘图 =====================
         for path_id, path_data in enumerate(self.path_library):
-            if path_id != 5:  # 仅绘制第5条路径，可根据需求调整
-                continue
             
-            # 提取路径数据（从张量转换为numpy数组）
             map_name = path_data["map_name"]
-            path_ids = path_data["path_ids"]
             center_vertices = path_data["center_vertices"].detach().cpu().numpy()
             left_vertices = path_data["left_vertices"].detach().cpu().numpy()
             right_vertices = path_data["right_vertices"].detach().cpu().numpy()
-            ref_v = path_data["ref_v"].detach().cpu().numpy()
             s = path_data["s"].detach().cpu().numpy()
-            lane_width = path_data["lane_width"].detach().cpu().numpy()
-            hinge_trajs = path_data["hinge_trajs"].detach().cpu().numpy()  # [n_agents, length, 2]
-            hinge_status = path_data["hinge_status"].detach().cpu().numpy()  # [n_agents, length]
-            
-            # 获取场景并绘制
+            hinge_trajs = path_data["hinge_trajs"].detach().cpu().numpy()
+            hinge_status = path_data["hinge_status"].detach().cpu().numpy()
             scenario = self.scenario_library[map_name]
-            for i in range(0, 1):  # 仅绘制第0帧，可扩展多帧
-                # --------------------- 图1：道路场景+参考速度色带 ---------------------
-                plt.figure(fig1.number)  # 显式指定画布，避免错位
+
+            # 计算曲率
+            center_curv, center_s_arr = calc_traj_curvature(center_vertices)
+            hinge2_curv, hinge2_s_arr = calc_traj_curvature(hinge_trajs[2])
+            hinge3_curv, hinge3_s_arr = calc_traj_curvature(hinge_trajs[3])
+
+            for i in range(0, 1):
+                # -------------------------- 绘制地图 (fig1) --------------------------
+                plt.figure(fig1.number)
                 rnd.draw_params.time_begin = i
                 rnd.draw_params.time_end = i
                 ego_params.time_begin = i
                 ego_params.time_end = i
                 scenario.draw(rnd)
-                rnd.render(show=False)  # 关闭实时显示，提升效率
+                rnd.render(show=True)
                 
-                # 绘制道路边界/中心线（中文图例）
-                linewidth = 0.3
-                rnd.ax.grid(alpha=0.3)  # 增加浅网格，提升论文图表可读性
+                linewidth = 0.8 # 线宽也相应改细
+                rnd.ax.plot(left_vertices[:, 0], left_vertices[:, 1], c='r', label='左边界', zorder=20, linewidth=linewidth)
+                rnd.ax.plot(right_vertices[:, 0], right_vertices[:, 1], c='b', label='右边界', zorder=20, linewidth=linewidth)
+                rnd.ax.plot(center_vertices[:, 0], center_vertices[:, 1], c='purple', label='中心线', zorder=20, linestyle='--', linewidth=linewidth)
                 
-                rnd.ax.scatter(left_vertices[:, 0], left_vertices[:, 1], 
-                            s=0.5, c='r', label='左边界', zorder=20, linewidth=linewidth)
-                rnd.ax.scatter(right_vertices[:, 0], right_vertices[:, 1], 
-                            s=0.5, c='b', label='右边界', zorder=20, linewidth=linewidth)
-                rnd.ax.scatter(center_vertices[:, 0], center_vertices[:, 1], 
-                            s=0.5, c='gray', label='中心线', zorder=20, linewidth=linewidth, alpha=0.5)
-                
-                # 绘制参考速度色带（彩虹色系）
-                points = center_vertices.reshape(-1, 1, 2)
-                segments = np.concatenate([points[:-1], points[1:]], axis=1)
-                norm = Normalize(vmin=ref_v.min(), vmax=ref_v.max())
-                lc = LineCollection(segments, cmap='viridis', norm=norm, 
-                                    linewidth=linewidth, linestyle='--', zorder=19)
-                lc.set_array(ref_v)
-                line = rnd.ax.add_collection(lc)
-                
-                # 添加颜色条（中文标注+单位/s）
-                cbar = fig1.colorbar(line, ax=ax1, shrink=0.9, pad=0.05)
-                cbar.set_label('参考速度 (m/s)', fontproperties=font_prop)
-                # 修复：替换fontproperties为labelfontfamily，设置刻度字体为新罗马
-                cbar.ax.tick_params(labelsize=font_size_tick, labelfontfamily='Times New Roman')
-                
-                # 设置坐标轴（中文标签+数字新罗马+单位/s）
-                rnd.ax.set_xlim(25, 100)
-                rnd.ax.set_ylim(-60, 5)
-                rnd.ax.set_xlabel("x/m", fontproperties=font_prop)
-                rnd.ax.set_ylabel("y/m", fontproperties=font_prop)
-                # 修复：刻度字体用labelfontfamily指定新罗马
-                rnd.ax.tick_params(axis='both', direction='in', labelsize=font_size_tick, 
-                                top=False, right=False, labelfontfamily='Times New Roman')
-                # 图例中文显示
-                rnd.ax.legend(prop=font_prop)
-                
-                # 保存场景图（论文级分辨率）
-                fig1_path = f"{self.vis_dir}/Path{path_id:04d}_map_{i:04d}.pdf"
-                plt.show()
+                rnd.ax.set_xlabel("x/m", fontproperties=font_prop_chinese, fontsize=font_size_label)
+                rnd.ax.set_ylabel("y/m", fontproperties=font_prop_chinese, fontsize=font_size_label)
+                rnd.ax.set_xlim(xy_limit[path_id][0])
+                rnd.ax.set_ylim(xy_limit[path_id][1])
+                rnd.ax.tick_params(
+                    axis="both", 
+                    labelsize=font_size_tick, 
+                    pad=1,
+                    direction='in',
+                    top=False, right=False,
+                    labelfontfamily='Times New Roman'
+                )
+
+                # 绘制 hinge 轨迹
+                n_agents = hinge_trajs.shape[0]
+                cmap = plt.get_cmap('tab10') 
+                for agent_idx in range(1,n_agents-1):
+                    agent_color = cmap(agent_idx % 10)
+                    traj_x = hinge_trajs[agent_idx, :, 0]
+                    traj_y = hinge_trajs[agent_idx, :, 1]
+                    rnd.ax.plot(traj_x, traj_y, color=agent_color, linewidth=0.5, alpha=0.7, linestyle='-', zorder=18, label=f'铰接点{agent_idx+1}')
+                    
+                    out_of_road_mask = hinge_status[agent_idx, :] == 0
+                    if np.any(out_of_road_mask):
+                        out_x = traj_x[out_of_road_mask]
+                        out_y = traj_y[out_of_road_mask]
+                        rnd.ax.scatter(out_x, out_y, marker='x', s=2, c=agent_color, linewidths=0.5, zorder=22, label=f'不可结合')
+
+                legend = rnd.ax.legend(fontsize=font_size_legend, prop=font_prop_chinese, frameon=False)
+                legend.set_zorder(100)
+                plt.pause(0.01)
+                fig1_path = f"{vis_dir}/Path{path_id:04d}_map_{i:04d}.pdf"
                 fig1.savefig(fig1_path, dpi=300, format="pdf", bbox_inches='tight')
                 
-                # 清除临时元素，准备后续绘图
-                cbar.remove()
-                line.remove()
-                
-                # --------------------- 图2：参考速度-路径长度曲线 ---------------------
+                # -------------------------- 绘制曲率 (fig2) --------------------------
                 plt.figure(fig2.number)
                 ax2.clear()
-                ax2.plot(s, ref_v, 'b', label='参考速度', zorder=20, linewidth=1.5)
-                # 坐标轴配置（中文标签+单位/s+数字新罗马）
-                ax2.set_xlabel("累计路程/m", fontproperties=font_prop)
-                ax2.set_ylabel("参考速度/(m/s)", fontproperties=font_prop)  # 单位改为/s
-                # 修复：同样用labelfontfamily设置刻度字体
-                ax2.tick_params(axis='both', direction='in', labelsize=font_size_tick, 
-                                top=False, right=False, labelfontfamily='Times New Roman')
-                #ax2.legend(prop=font_prop)
-                ax2.grid(alpha=0.3)  # 增加浅网格，提升论文图表可读性
+                ax2.plot(center_s_arr, center_curv, c='purple', linestyle='--', linewidth=0.8, label='中心线曲率')
+                ax2.plot(hinge2_s_arr, hinge2_curv, c='#FF6347', linewidth=0.8, label='铰接点2曲率')
+                ax2.plot(hinge3_s_arr, hinge3_curv, c='#FFD700', linewidth=0.8, label='铰接点3曲率')
                 
-                # 保存速度曲线图
-                fig2_path = f"{self.vis_dir}/Path{path_id:04d}_ref_v_{i:04d}.pdf"
+                # [关键] 强制正方形比例
+                ax2.set_box_aspect(1)
+                
+                ax2.set_xlabel("累计弧长/m", fontproperties=font_prop_chinese, fontsize=font_size_label)
+                ax2.set_ylabel("曲率/$m^{-1}$", fontproperties=font_prop_chinese, fontsize=font_size_label)
+                ax2.legend(fontsize=font_size_legend, prop=font_prop_chinese, frameon=False)
+                ax2.tick_params(
+                    axis="both",
+                    labelsize=font_size_tick,
+                    pad=1,
+                    direction='in',
+                    top=False, right=False,
+                    labelfontfamily='Times New Roman'
+                )
+                
+                all_curv = np.concatenate([center_curv, hinge2_curv, hinge3_curv])
+                y_min, y_max = np.min(all_curv) * 0.9, np.max(all_curv) * 1.1
+                ax2.set_ylim(y_min, y_max)
+                ax2.set_xlim(30,160)
+
+                fig2_path = f"{vis_dir}/Path{path_id:04d}_curvature_{i:04d}.pdf"
                 fig2.savefig(fig2_path, dpi=300, format="pdf", bbox_inches='tight')
                 
-                # 暂停仅用于调试，发布版可注释
-                plt.pause(0.01)
-        
-        # 关闭画布，释放资源
-        plt.close(fig1)
-        plt.close(fig2)
-        plt.close(fig3)
+                rnd.ax.clear()
 # try separate each path, but more time cost, deprecated
 # class OcctCRMapNew(MapBase):
 #     def __init__(
@@ -2115,5 +2183,5 @@ if __name__ == "__main__":
                      is_constant_ref_v=False,
                      rod_len=30.0)
     
-    road.plot_road_debug()
-    #road.plot_road_debug_paper()
+    #road.plot_road_debug()
+    road.plot_road_for_paper(vis_dir="vmas/scenarios_data/cr_maps/debug/vis_paper")

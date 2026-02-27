@@ -92,7 +92,7 @@ class Scenario(BaseScenario):
         # world params
         self.device = device
         self.batch_dim = batch_dim
-        self.task_class=kwargs.pop("task_class", TaskClass.SIMPLE_PLATOON)
+        self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
         self.n_agents=kwargs.pop("n_agents", 4)
         # platoon params
@@ -102,7 +102,7 @@ class Scenario(BaseScenario):
         self.use_boundary_frenet_ref=kwargs.pop("use_boundary_frenet_ref", True)
         self.mask_ref_v=kwargs.pop("mask_ref_v", False)
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", False)
-        self.init_arc_pos = kwargs.pop("init_arc_pos", 67.0)
+        self.init_arc_pos = kwargs.pop("init_arc_pos", 20.0)
         self.init_vel_mean = kwargs.pop("init_vel_mean", 1.0)
         self.init_vel_std = kwargs.pop("init_vel_std", 0.0) 
         self.still_space = kwargs.pop("still_space", 10.0)
@@ -225,7 +225,6 @@ class Scenario(BaseScenario):
             cr_map_dir="/home/yons/Graduation/VMAS_occt/vmas/scenarios_data/cr_maps/debug",
             max_ref_v=self.max_speed,
             is_constant_ref_v=True,
-            eval_mode=kwargs.pop("eval_mode", False),
             rod_len=self.rod_len,
             n_agents=self.n_agents,
         )
@@ -1442,7 +1441,7 @@ class Scenario(BaseScenario):
         v_front = (s_front - self.observations.agent_s[:, self.HINGE_FIRST_INDEX])/self.dt
         return v_front, v_rear
         
-    def pre_step(self):
+    def pre_step_old(self):
         """
         每次 world.step() 之前：
         1) 推进前端弧长 s_front
@@ -1453,11 +1452,22 @@ class Scenario(BaseScenario):
         """
         if self.task_class==TaskClass.SIMPLE_PLATOON:
             return
+        SIMULATE_WAY = 3 # 0 means correct way, 1 or 2 mean use front or rear caculation, 3 means use ref_v calculation
         v_front1, v_rear1 = self.get_front_rear_v_use_front()
         v_front2, v_rear2 = self.get_front_rear_v_use_rear()
         select_idx = torch.max(v_front1, v_rear1)<torch.max(v_front2, v_rear2)
-        v_front = torch.where(select_idx, v_front1, v_front2)
-        v_rear = torch.where(select_idx, v_rear1, v_rear2)
+        if SIMULATE_WAY==0:
+            v_front = torch.where(select_idx, v_front1, v_front2)
+            v_rear = torch.where(select_idx, v_rear1, v_rear2)
+        elif SIMULATE_WAY==1:
+            v_front = v_front1
+            v_rear = v_rear1
+        elif SIMULATE_WAY==2:
+            v_front = v_front2
+            v_rear = v_rear2
+        else:
+            v_front = v_front1
+            v_rear = v_rear2
         s_front = v_front * self.dt + self.observations.agent_s[:, self.HINGE_FIRST_INDEX]# [B]
         # 不要超过道路最大 s；留一点 eps 免得插值越界
         s_max = self.road.get_s_max() - 1e-6
@@ -1467,7 +1477,11 @@ class Scenario(BaseScenario):
         # ---- 2) 固定弦长解 Δs -> s_rear ----
         delta_s, infeasible = self.road.solve_delta_s(s_front, self.rod_len*torch.ones_like(s_front))
         assert not infeasible.any(), "Infeasible delta_s"
-        s_rear = s_front - delta_s
+        if SIMULATE_WAY==3:
+            # ignore cargo constraint
+            s_rear = v_rear * self.dt + self.observations.agent_s[:, self.HINGE_LAST_INDEX]# [B]
+        else:
+            s_rear = s_front - delta_s
         s_rear = torch.clamp(s_rear, min=s_min, max=s_max)
 
         # update the s of first and last agent
@@ -1494,7 +1508,88 @@ class Scenario(BaseScenario):
         self.compute_latch_targets()  # 这个函数我们之前已经给了实现
         if TRADITIONAL_CONTROL:
             self._pure_pursuit_control()
+    def pre_step(self):
+        if self.task_class == TaskClass.SIMPLE_PLATOON:
+            return
+        self.M_total = 5000.0  # 总质量 (2辆小车 + 扇叶)
+        self.L_cargo = 30.0     # 扇叶长度
+        self.K_rigid = 1000.0  # 虚拟刚性系数 (弹簧系数)，越大越接近刚体
+        self.D_rigid = 1000.0   # 虚拟阻尼系数，防止震荡
+        self.K_drive = 10000.0 
+        # 1. 获取运动学建议速度 (Kinematic candidates)
+        v_front1, v_rear1 = self.get_front_rear_v_use_front()
+        v_front2, v_rear2 = self.get_front_rear_v_use_rear()
+        
+        # 依然保留你的保守速度选择逻辑，作为“驱动力”的输入
+        select_idx = torch.max(v_front1, v_rear1) < torch.max(v_front2, v_rear2)
+        v_target_f = torch.where(select_idx, v_front1, v_front2)
+        v_target_r = torch.where(select_idx, v_rear1, v_rear2)
 
+        # 2. 获取当前状态
+        s_f_curr = self.observations.agent_s[:, self.HINGE_FIRST_INDEX]
+        s_r_curr = self.observations.agent_s[:, self.HINGE_LAST_INDEX]
+        
+        # 3. 计算刚体动力学约束力
+        # 计算当前实际弦长距离 (可以通过 get_front_rear_pts 得到欧式距离)
+        p_f, p_r = self.get_front_rear_pts(self.observations.agent_s[:, self.TRACTOR_SLICE])
+        current_dist = torch.norm(p_f - p_r, dim=1)
+        dist_error = current_dist - self.L_cargo
+        
+        # 计算距离变化率 (用于阻尼)
+        v_f_curr =  torch.linalg.norm(self.tractor_front.state.vel, dim=-1)
+        v_r_curr = torch.linalg.norm(self.tractor_rear.state.vel, dim=-1)
+        dist_rate = v_f_curr - v_r_curr # 简化表达
+
+        # 虚拟内部约束力 (Internal Force)
+        f_internal = self.K_rigid * dist_error + self.D_rigid * dist_rate
+
+        # 4. 计算驱动力 (Driving Force)
+        # 基于理想运动学速度与当前速度的偏差来产生驱动力
+        f_drive_f = self.K_drive * (v_target_f - v_f_curr)
+        f_drive_r = self.K_drive * (v_target_r - v_r_curr)
+
+        # 5. 应用牛顿定律更新加速度 (考虑巨大的质量 M)
+        # a = (F_drive + F_internal) / M
+        # 注意：首车受向后的拉力，尾车受向前的拉力
+        a_f = (f_drive_f - f_internal) / (self.M_total / 2) 
+        a_r = (f_drive_r + f_internal) / (self.M_total / 2)
+
+        # 6. 积分得到新速度和新位移
+        v_f_new = v_f_curr + a_f * self.dt
+        v_r_new = v_r_curr + a_r * self.dt
+        s_f_new = s_f_curr + v_f_new * self.dt
+        s_r_new = s_r_curr + v_r_new * self.dt
+
+        # 7. 更新状态与位姿 (保持你的道路映射逻辑)
+        s_max = self.road.get_s_max() - 1e-6
+        self.observations.agent_s[:, self.HINGE_FIRST_INDEX] = torch.clamp(s_f_new, max = s_max)
+        self.observations.agent_s[:, self.HINGE_LAST_INDEX] = torch.clamp(s_r_new, max = s_max)
+        
+        p_front_dyn, p_rear_dyn = self.get_front_rear_pts(self.observations.agent_s[:, self.TRACTOR_SLICE])
+
+        # ---- 2. 获取对应的航向角 ----
+        front_rear_theta_dyn = self.road.get_tangent_heading(self.observations.agent_s[:, self.TRACTOR_SLICE])
+        front_theta_dyn = front_rear_theta_dyn[:, 0]
+        rear_theta_dyn = front_rear_theta_dyn[:, 1]
+
+        # ---- 3. 改写 _set_pose 调用 ----
+        # 使用动力学积分得到的速度 v_f_new 和 v_r_new，而不是运动学解算的建议速度
+        idx_mask = torch.ones(self.batch_dim, dtype=torch.bool, device=self.device)
+        self._set_pose(
+            self.tractor_front, 
+            p_front_dyn, 
+            front_theta_dyn, 
+            v_f_new,       # 动力学平滑后的速度
+            idx_mask
+        )
+
+        self._set_pose(
+            self.tractor_rear, 
+            p_rear_dyn, 
+            rear_theta_dyn, 
+            v_r_new,       # 动力学平滑后的速度
+            idx_mask
+        )
     def _pure_pursuit_control(self):
         """
         纯跟踪控制器 - 用于batch_size=1时的手动控制
@@ -2139,7 +2234,7 @@ class Scenario(BaseScenario):
             )
         obs_self = [
             # [own] agent attribute encode
-            agent_attr_encode if self.task_class == TaskClass.OCCT_PLATOON else None,
+            # agent_attr_encode,
             # [own] velocity
             self.observations.past_vel.get_latest()[indexing_tuple_vel].reshape(
                 self.world.batch_dim, -1
@@ -2906,6 +3001,7 @@ class Scenario(BaseScenario):
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
         is_collision_with_exit_segments = self.collisions.with_exit_segments.any(dim=-1)
         is_done = is_collision_with_agents | is_collision_with_exit_segments | is_collision_with_lanelets
+        is_done = is_collision_with_exit_segments
         # is_fail = is_collision_with_agents | is_collision_with_lanelets
         # is_success = is_collision_with_exit_segments
         # if is_fail.sum() > 0:
@@ -2952,13 +3048,15 @@ class Scenario(BaseScenario):
 
         self.env_total_step[is_done] = self.env_current_step[is_done]
         self.env_current_step[is_done] = 0
-        self.road_total_step.scatter_reduce_(
-            dim=0,
-            index=self.road.batch_id,
-            src=self.env_total_step,
-            reduce='mean',
-            include_self=False
-        )
+        if self.batch_dim > 1:
+            # ignore this function when play interactively
+            self.road_total_step.scatter_reduce_(
+                dim=0,
+                index=self.road.batch_id,
+                src=self.env_total_step,
+                reduce='mean',
+                include_self=False
+            )
         return is_done
     def get_desire_agent_pos(self, agent_index, lookahead_idx = None):
         """
@@ -3006,6 +3104,7 @@ class Scenario(BaseScenario):
         #print(f"agent_index: {agent_index}, hinge_status: {hinge_status}, hinge_dis: {hinge_dis}")
         info = {
             "pos": agent.state.pos,
+            "s":self.observations.agent_s[:, agent_index],
             "rot": angle_eliminate_two_pi(agent.state.rot),
             "vel": agent.state.vel,
             "vel_norm": torch.norm(agent.state.vel, dim=-1),
@@ -3373,5 +3472,5 @@ if __name__ == "__main__":
         control_two_agents=True,
         display_info=True,
         seed=None,
-        agent_index_focus=1,
+        agent_index_focus=0,
     )
