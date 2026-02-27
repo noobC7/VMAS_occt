@@ -409,7 +409,10 @@ class OcctCRMap(MapBase):
         self.max_path_s_list = None
         
         # 处理CommonRoad地图
-        self._cr_map_process(cr_map_dir)
+        if cr_map_dir.split('/')[-1]=="chapter4":
+            self._cr_map_process_chapter4(cr_map_dir)
+        else:
+            self._cr_map_process(cr_map_dir)
         
         print(f"[OcctCRMap]共{len(self.path_library)}条路径数据,最长为{self.max_path_length:.2f}米,顶点有{len(self.max_path_s_list)}个,平均宽度为{self.get_lane_width():.2f}米")
         # 确保有路径数据
@@ -800,9 +803,9 @@ class OcctCRMap(MapBase):
                 # if not((path_ids[0]==100 and path_ids[-1]==169)):
                 #     continue
                 # for chapter 2 paper illustration
-                # if not ((path_ids[0]==177 and path_ids[-1]==129) or \
-                #    (path_ids[0]==153 and path_ids[-1]==175)):
-                #     continue
+                if not ((path_ids[0]==177 and path_ids[-1]==129) or \
+                   (path_ids[0]==153 and path_ids[-1]==175)):
+                    continue
                 if map_name == "USA_Roundabout_EP_repaired.xml":
                     if (path_ids[-1]==124) or \
                         (path_ids[0]==100 and path_ids[-1]==169) or \
@@ -924,6 +927,204 @@ class OcctCRMap(MapBase):
                     self.max_path_length = center_cum_len[-1]
                     self.max_path_s_list = center_cum_len
         dump_file = os.path.join(self.cr_map_dir, "map_data.pkl")
+        pickle.dump((self.scenario_library,self.path_library,\
+                     self.max_path_length,self.max_path_s_list), open(dump_file, "wb"))
+    def _cr_map_process_chapter4(self, map_dir: str, extend_left_boundary=False) -> None:
+        """
+        处理CommonRoad地图和车道信息
+        
+        Args:
+            map_dir: 地图所在的文件夹路径
+        """
+        boundary_calculator = OcctBoundaryCalculator()
+        dump_file = os.path.join(self.cr_map_dir, "map_data.pkl")
+        if os.path.exists(dump_file):
+            self.scenario_library, self.path_library,\
+                self.max_path_length,self.max_path_s_list = pickle.load(open(dump_file, "rb"))
+            self.max_path_length=self.max_path_length.to(self.device)
+            self.max_path_s_list=self.max_path_s_list.to(self.device)
+            return
+        # 递归读取文件夹中所有XML文件
+        map_files = glob.glob(os.path.join(map_dir, "**/*.xml"), recursive=True)
+        
+        assert self.rod_len is not None, "请先设置货物长度 L"
+        # 打印地图库信息
+        print(f"找到 {len(map_files)} 个地图文件:")
+        for i, map_file in enumerate(map_files):
+            print(f"  {i+1}. {os.path.basename(map_file)}")
+        
+        # 处理每个地图文件
+        for map_file in map_files:
+            map_name = os.path.basename(map_file)
+            print(f"\n处理地图: {map_name}")
+            
+            # 读取地图场景
+            scenario = get_cr_scenario(map_file)
+
+            self.scenario_library[map_name] = scenario
+            
+            # 获取所有车道段
+            lanelets = scenario.lanelet_network.lanelets
+            
+            # 找到所有起点车道段（predecessor为空）
+            start_lanelets = [lanelet for lanelet in lanelets if not lanelet.predecessor]
+            
+            # 初始化路径ID库
+            path_id_library = []
+            
+            # 使用BFS获取所有可能的路径
+            for start_lanelet in start_lanelets:
+                queue = deque()
+                queue.append([start_lanelet.lanelet_id])
+                
+                while queue:
+                    current_path = queue.popleft()
+                    current_lanelet_id = current_path[-1]
+                    
+                    # 获取当前车道段对象
+                    current_lanelet = scenario.lanelet_network.find_lanelet_by_id(current_lanelet_id)
+                    
+                    # 如果没有后继，说明是路径终点
+                    if not current_lanelet.successor:
+                        path_id_library.append(current_path)
+                    else:
+                        # 遍历所有后继
+                        for successor_id in current_lanelet.successor:
+                        # 检查后继车道段是否已经在当前路径中，如果是则跳过（避免回环）
+                            if successor_id not in current_path:
+                                new_path = current_path.copy()
+                                new_path.append(successor_id)
+                                queue.append(new_path)
+            
+            # 打印路径ID库信息
+            print(f"找到 {len(path_id_library)} 条路径:")
+            for i, path in enumerate(path_id_library):
+                print(f"  路径 {i+1}: {path}")
+            
+            # 处理每条路径，生成路径数据
+            for path_ids in tqdm(path_id_library, desc="处理路径"):
+                path_data = {
+                    "center_vertices": [],
+                    "left_vertices": [],
+                    "right_vertices": []
+                }
+                
+                # for chapter 4
+                if not ((path_ids[0]==127 and path_ids[-1]==102) or \
+                   (path_ids[0]==100 and path_ids[-1]==129)):
+                    continue
+                for i, lanelet_id in enumerate(path_ids):
+                    lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
+                    center_vertices = np.array(lanelet.center_vertices)
+                    if i == 0 and len(center_vertices) > 2:
+                        center_vertices[1] = (center_vertices[2] + center_vertices[0]) / 2
+                    if i == len(path_ids)-1 and len(center_vertices) > 2:
+                        center_vertices[-2] = (center_vertices[-1] + center_vertices[-3]) / 2
+
+                    center_vertices, left_vertices, right_vertices = OcctCRMap.extend_road(center_vertices,
+                                                        lanelet.left_vertices,
+                                                        lanelet.right_vertices, 
+                                                        head_extend_len=self.extend_len if i==0 else 0, 
+                                                        tail_extend_len=self.extend_len if i==len(path_ids)-1 else 0)
+                    slice_range = slice(None) if i == len(path_ids) - 1 else slice(-1)
+                    for key, vertices in zip(
+                        ["center_vertices", "left_vertices", "right_vertices"],
+                        [center_vertices, left_vertices, right_vertices]
+                    ):
+                        path_data[key].extend([v.tolist() for v in vertices[slice_range]])
+                raw_left_vertices = np.array(path_data["left_vertices"])
+                # calculate correspond boundary pts
+                center_vertices = np.array(path_data["center_vertices"])
+                center_vertices = smooth_road_centerline(
+                    center_vertices,
+                    sample_step=1  # 与校准精度一致
+                )
+                center_vertices, _ = self._resample_path(center_vertices)
+
+                right_vertices = np.array(path_data["right_vertices"])
+                # revise road boundary for [127, 128, 131, 133, 136, 137, 142, 145, 147, 151, 106, 102]
+                if path_ids[0]==127 and extend_left_boundary:
+                    left_vertices = torch.tensor(self.path_library[0]["raw_left_vertices"]).to(right_vertices.device)
+                    left_vertices = torch.flip(left_vertices, dims=[0])
+
+                    right_vertices, _ = self._resample_path(right_vertices, len(center_vertices))
+                    left_vertices, _ = self._resample_path(left_vertices, len(right_vertices))
+                    left_vertices = left_vertices.cpu().numpy()
+                else:
+                    left_vertices = np.array(path_data["left_vertices"])
+
+                left_vertices, right_vertices = boundary_calculator._calculate_boundary_pts(center_vertices, left_vertices, right_vertices)
+
+                lane_width=([np.linalg.norm(left_vertices[i]-right_vertices[i]) for i in range(len(center_vertices))])
+                center_vertices = torch.tensor(center_vertices, device=self.device, dtype=torch.float32)
+                left_vertices = torch.tensor(left_vertices, device=self.device, dtype=torch.float32)
+                right_vertices = torch.tensor(right_vertices, device=self.device, dtype=torch.float32)
+                center_cum_len = self._get_cum_len(center_vertices)  # [N]
+                if min(lane_width)<self.min_lane_width or center_cum_len[-1]<self.min_lane_len:
+                    print(f"path:{path_ids} is too short or too narrow, continue")
+                    continue
+                if torch.linalg.norm(center_vertices[0]-center_vertices[-1])<self.start_end_distance_threshold:
+                    print(f"path:{path_ids} start and end point is too close, continue")
+                    continue
+                #对中心路径进行重采样
+                coeffs = natural_cubic_spline_coeffs(center_cum_len, left_vertices)
+                left_splines = NaturalCubicSpline(coeffs)
+                coeffs = natural_cubic_spline_coeffs(center_cum_len, right_vertices)
+                right_splines = NaturalCubicSpline(coeffs)
+                is_loop,_=self._detect_loop(center_vertices)
+                if is_loop:
+                    print(f"path:{path_ids} is a loop, continue")
+                    continue
+                resampled_lane_width=torch.linalg.norm(left_vertices-right_vertices, dim=-1)
+                 # caculate ref vel according to curvature
+                coeffs = natural_cubic_spline_coeffs(center_cum_len, center_vertices)
+                center_splines = NaturalCubicSpline(coeffs)
+                center_curvature = self.compute_curvature_2d(center_splines, center_cum_len, smooth_distance=10)
+                factor=0.15 #factor=0.3 # for INTERACTION
+                if self.is_constant_ref_v:
+                    ref_v = self.max_ref_v * torch.ones_like(center_curvature)
+                else:
+                    ref_v = torch.clamp_max(factor * 1.0 / torch.sqrt(center_curvature+1e-8)**2, self.max_ref_v) 
+                    ref_v = self.gaussian_smooth_1d(ref_v, sigma=8.0)
+                assert len(center_vertices) == len(ref_v), "重采样后的中心路径长度与参考速度长度不一致"
+                # 保存重采样后的路径数据
+                hinge_status, hinge_trajs = self._detect_hinge_status(center_cum_len, center_splines, left_splines, right_splines)
+                if (hinge_status==1).all():
+                    print(f"path:{path_ids} has no corner, continue")
+                    # means no corner, we dont want this path
+                    continue
+
+                # TODO: how the define hinge reward and status
+                # we want to make hinge ready only pass the corner, but cant make sure all hinge has 0 status through the corner
+                # make hinge status consistent through the corner
+                for hinge_idx in range(hinge_status.shape[0]):
+                    if (hinge_status[hinge_idx]==0).any():#exclude first and last hinge pts
+                        begin_idx = torch.where(hinge_status[hinge_idx] == 0)[0][0]
+                        pass_corner_idx = torch.where(hinge_status[hinge_idx] == 0)[0][-1]
+                        hinge_status[hinge_idx, begin_idx:pass_corner_idx] = 0
+                # pass_corner_idx = torch.where(hinge_status == 0)[0][-1]
+                # hinge_status[:pass_corner_idx] = 0
+                self.path_library.append({
+                    "map_name": map_name,
+                    "path_ids": path_ids,
+                    "center_vertices": center_vertices,
+                    "left_vertices": left_vertices,
+                    "raw_left_vertices": raw_left_vertices,
+                    "right_vertices": right_vertices,
+                    "s": center_cum_len,
+                    "ref_v": ref_v,
+                    "lane_width": resampled_lane_width,
+                    "hinge_status": hinge_status,
+                    "hinge_trajs": hinge_trajs,
+                })
+                assert hinge_status.shape[0]==self.n_agents, "hinge个数必须与n_agents一致"
+                assert hinge_trajs.shape[0]==self.n_agents and hinge_trajs.shape[-1]==2, "hinge轨迹必须为2维"
+                # 更新最大路径长度
+                if center_cum_len[-1] > self.max_path_length and path_ids[0]==127:
+                    self.max_path_length = center_cum_len[-1]
+                    self.max_path_s_list = center_cum_len
+        dump_file = os.path.join(self.cr_map_dir, "map_data.pkl")
+        self.path_library.remove(self.path_library[0])
         pickle.dump((self.scenario_library,self.path_library,\
                      self.max_path_length,self.max_path_s_list), open(dump_file, "wb"))
     def _detect_hinge_status(self, s, center_splines: NaturalCubicSpline, left_splines: NaturalCubicSpline, right_splines: NaturalCubicSpline):
@@ -2168,7 +2369,7 @@ class OcctCRMap(MapBase):
 #             self.path_library[self.batch_id[i].item()]["right_vertices"] for i in range(self.batch_dim)
 #         ], dim=0)
 
-if __name__ == "__main__":
+if __name__ == "__main__chapter23":
     device = torch.device("cuda")
     # road = OcctMap(batch_dim=1, device=device)
     # road.plot_road_debug()
@@ -2183,5 +2384,18 @@ if __name__ == "__main__":
                      is_constant_ref_v=False,
                      rod_len=30.0)
     
-    #road.plot_road_debug()
+    road.plot_road_debug()
     road.plot_road_for_paper(vis_dir="vmas/scenarios_data/cr_maps/debug/vis_paper")
+if __name__ == "__main__":
+    device = torch.device("cuda")
+    road = OcctCRMap(batch_dim=200, 
+                     cr_map_dir="vmas/scenarios_data/cr_maps/chapter4",
+                     max_ref_v=15/3.6 ,
+                     min_lane_width=2.4, 
+                     min_lane_len=120,
+                     device=device, 
+                     sample_gap=1, 
+                     is_constant_ref_v=False,
+                     rod_len=30.0)
+    
+    road.plot_road_debug()
