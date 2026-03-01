@@ -1,9 +1,9 @@
-from vmas.scenarios.road_traffic import CircularBuffer
+from vmas.scenarios.road_traffic import CircularBuffer, get_perpendicular_distances
 import torch
 from torch import Tensor
 from vmas.scenarios.occt_map import OcctMap,OcctCRMap,MapBase
 from vmas.simulator.core import World, Agent, Sphere, Box
-
+import torch.nn.functional as F
 class OcctConstants:
     # Predefined constants that may be used during simulations
     def __init__(
@@ -70,6 +70,7 @@ class OcctRewards:
         reward_track_ref_heading=None,
         reward_track_ref_path=None,
         reward_track_hinge=None,  # 新增：铰接距离奖励权重
+        reward_hinge=None,  # 新增：铰接奖励权重
     ):
         self.progress = progress
         self.weighting_ref_directions = weighting_ref_directions
@@ -81,6 +82,7 @@ class OcctRewards:
         self.reward_track_ref_heading = reward_track_ref_heading
         self.reward_track_ref_path = reward_track_ref_path
         self.reward_track_hinge = reward_track_hinge  # 铰接距离奖励权重
+        self.reward_hinge = reward_hinge  # 铰接奖励权重
 
 class OcctPenalties:
     """Penalties for collisions, being too close to other agents or lane boundaries, etc."""
@@ -179,12 +181,14 @@ class OcctObservations:
         n_observed_steps=None,
         error_vel=None,
         error_space: CircularBuffer = None,
-        error_hinge_dis=None,  # 铰接距离误差（米）
+        error_hinge_dis=None,
+        agent_hinge_status: CircularBuffer = None,
         agent_s=None,
         past_pos: CircularBuffer = None,
         past_rot: CircularBuffer = None,
         past_vertices: CircularBuffer = None,
         past_vel: CircularBuffer = None,
+        past_steering: CircularBuffer = None,
         past_short_term_ref_points: CircularBuffer = None,
         past_short_term_hinge_points: CircularBuffer = None,
         past_action_acc: CircularBuffer = None,
@@ -206,12 +210,14 @@ class OcctObservations:
         self.error_vel = error_vel  # Velocity error relative to reference velocity
         self.error_space = error_space  # Gap error relative to reference gap (unnormalized)
         self.error_hinge_dis = error_hinge_dis  # 铰接距离误差（米）
+        self.agent_hinge_status = agent_hinge_status  # 车辆铰接状态（0：未铰接，1：铰接），铰接后车辆被动行驶且奖励屏蔽
         self.agent_s = agent_s  # Arc length position
         
         self.past_pos = past_pos  # Past positions
         self.past_rot = past_rot  # Past rotations
         self.past_vertices = past_vertices  # Past vertices
         self.past_vel = past_vel  # Past velocites
+        self.past_steering = past_steering  # Past steering actions
 
         self.past_short_term_ref_points = (
             past_short_term_ref_points  # Past short-term reference points
@@ -452,7 +458,119 @@ def get_short_term_reference_path_by_s(
     if agent_s.dim()==0:
         return short_term_path[0,...]
     return short_term_path
+def check_hinge_points_in_boundary(
+    ref_left_boundary: torch.Tensor,  # [B, 24, 2] 左边界点集
+    ref_right_boundary: torch.Tensor, # [B, 24, 2] 右边界点集
+    hinge_short_term: torch.Tensor,   # [B, 4, 4, 2] 预瞄点 (x,y)
+    K: float = 1.0                    # 与边界的最小距离（米）
+) -> torch.Tensor:
+    """
+    并行判断预瞄点是否在左右边界内且与边界至少距离K米
+    核心修复：仅针对「最近的边界线段」判断位置合法性，适配弯道边界
+    返回形状：[B, n_agent, n_pts, 1] 的布尔张量（True=满足条件，False=不满足）
+    """
+    # ========== 1. 预处理维度，适配广播 ==========
+    B = ref_left_boundary.shape[0]
+    n_agent = hinge_short_term.shape[1]  # 4
+    n_pts = hinge_short_term.shape[2]    # 4
+    
+    # 提取预瞄点 (x,y)：[B, 4, 4, 2]
+    hinge_pts = hinge_short_term[..., :2].contiguous()  # 确保内存连续
+    
+    # ---------------- 左边界预处理 ----------------
+    left_seg_start = ref_left_boundary[:, :-1, :]  # [B,23,2] 23条线段的起点
+    left_seg_end = ref_left_boundary[:, 1:, :]    # [B,23,2] 23条线段的终点
+    left_seg_vec = left_seg_end - left_seg_start  # [B,23,2] 线段向量
+    # 扩维适配广播：[B,23,2] → [B,1,1,23,2]
+    left_seg_start_exp = left_seg_start.unsqueeze(1).unsqueeze(1)
+    left_seg_end_exp = left_seg_end.unsqueeze(1).unsqueeze(1)
+    left_seg_vec_exp = left_seg_vec.unsqueeze(1).unsqueeze(1)
+    
+    # ---------------- 右边界预处理 ----------------
+    right_seg_start = ref_right_boundary[:, :-1, :]  # [B,23,2]
+    right_seg_end = ref_right_boundary[:, 1:, :]    # [B,23,2]
+    right_seg_vec = right_seg_end - right_seg_start  # [B,23,2]
+    # 扩维适配广播：[B,23,2] → [B,1,1,23,2]
+    right_seg_start_exp = right_seg_start.unsqueeze(1).unsqueeze(1)
+    right_seg_vec_exp = right_seg_vec.unsqueeze(1).unsqueeze(1)
+    
+    # ---------------- 预瞄点扩维 ----------------
+    hinge_pts_exp = hinge_pts.unsqueeze(3)  # [B,4,4,1,2] → 适配23条线段的广播
 
+    # ========== 2. 通用化计算：最近线段+位置判断+距离 ==========
+    def get_nearest_seg_info(pt_exp, seg_start_exp, seg_vec_exp, is_left_bound: bool):
+        """
+        计算点到边界的「最近线段」的距离 + 位置合法性
+        步骤：1. 找最近线段 → 2. 仅对最近线段判断位置 → 3. 计算垂直距离
+        返回：min_dist [B,4,4], in_bound [B,4,4]
+        """
+        # ------------ 步骤1：计算点到每条线段的「原始距离」（无限制，找最近线段） ------------
+        pt_to_start = pt_exp - seg_start_exp  # [B,4,4,23,2]
+        # 投影比例（不限制0~1）
+        seg_len_sq = torch.sum(seg_vec_exp**2, dim=-1, keepdim=False)  # [B,1,1,23]
+        seg_len_sq = torch.clamp(seg_len_sq, min=1e-8)
+        proj = torch.sum(pt_to_start * seg_vec_exp, dim=-1) / seg_len_sq  # [B,4,4,23]
+        # 线段上的最近点（投影超出线段则取端点）
+        proj_clamped = torch.clamp(proj, 0.0, 1.0).unsqueeze(-1)  # [B,4,4,23,1]
+        closest_pt = seg_start_exp + proj_clamped * seg_vec_exp  # [B,4,4,23,2]
+        # 点到每条线段的原始距离（用于找最近线段）
+        seg_dist = torch.norm(pt_exp - closest_pt, dim=-1)  # [B,4,4,23]
+        # 找到最近线段的索引：[B,4,4]
+        nearest_seg_idx = torch.argmin(seg_dist, dim=-1)  # 每个点对应1条最近线段
+        
+        # ------------ 步骤2：仅对「最近线段」判断位置合法性 ------------
+        # 生成最近线段的掩码：[B,4,4,23] → 仅最近线段为True，其余为False
+        B_idx = torch.arange(B).view(B,1,1).expand(-1, n_agent, n_pts)
+        agent_idx = torch.arange(n_agent).view(1,n_agent,1).expand(B, -1, n_pts)
+        pt_idx = torch.arange(n_pts).view(1,1,n_pts).expand(B, n_agent, -1)
+        nearest_mask = torch.zeros_like(seg_dist, dtype=torch.bool)  # [B,4,4,23]
+        nearest_mask[B_idx, agent_idx, pt_idx, nearest_seg_idx] = True  # 仅最近线段为True
+        
+        # 计算叉乘（位置判断）：仅保留最近线段的叉乘结果
+        cross = pt_to_start[..., 0] * seg_vec_exp[..., 1] - pt_to_start[..., 1] * seg_vec_exp[..., 0]  # [B,4,4,23]
+        nearest_cross = torch.masked_select(cross, nearest_mask).reshape(B, n_agent, n_pts)  # [B,4,4]
+        
+        # 位置合法性判断（仅针对最近线段）
+        if is_left_bound:
+            # 左边界：点应在最近线段的右侧 → cross > 0（适配竖直/弯道线段）
+            pos_valid = nearest_cross > 0
+        else:
+            # 右边界：点应在最近线段的左侧 → cross < 0
+            pos_valid = nearest_cross < 0
+        
+        # ------------ 步骤3：计算到最近线段的垂直距离 ------------
+        # 提取最近线段的距离：[B,4,4]
+        min_dist = torch.gather(seg_dist, dim=-1, index=nearest_seg_idx.unsqueeze(-1)).squeeze(-1)
+        
+        # 位置合法 = 最近线段的位置正确
+        in_bound = pos_valid  # [B,4,4]
+        
+        return min_dist, in_bound
+
+    # ========== 3. 计算左/右边界的最近线段信息 ==========
+    # 左边界：最近线段+位置+距离
+    left_min_dist, left_in_bound = get_nearest_seg_info(
+        hinge_pts_exp, left_seg_start_exp, left_seg_vec_exp, is_left_bound=True
+    )
+    # 右边界：最近线段+位置+距离
+    right_min_dist, right_in_bound = get_nearest_seg_info(
+        hinge_pts_exp, right_seg_start_exp, right_seg_vec_exp, is_left_bound=False
+    )
+
+    # ========== 4. 最终条件判断 ==========
+    # 条件1：在左右边界内（仅需最近线段位置合法）
+    cond_in_bound = left_in_bound & right_in_bound  # [B,4,4]
+    # 条件2：与左边界距离 ≥ K
+    cond_left_dist = (left_min_dist >= K)  # [B,4,4]
+    # 条件3：与右边界距离 ≥ K
+    cond_right_dist = (right_min_dist >= K)  # [B,4,4]
+    
+    # 最终条件：同时满足所有条件
+    final_cond = cond_in_bound & cond_left_dist & cond_right_dist  # [B,4,4]
+    # 调整形状为 [B,4,4,1]
+    final_cond = final_cond.unsqueeze(-1)
+    
+    return final_cond.to(dtype=torch.bool)
 def get_short_term_hinge_path_by_s(
     occt_map: OcctCRMap,
     agents : Agent, 
@@ -463,6 +581,9 @@ def get_short_term_hinge_path_by_s(
     sample_dt: int = 1,
     sample_ds: int = None,
     env_j: int = None,
+    hinge_relative_pos: Tensor = None,
+    hinge_edge_buffer: float = 0.0,
+    corner_s: Tensor = None,
 ):
     """
     Args:
@@ -492,10 +613,39 @@ def get_short_term_hinge_path_by_s(
     first_last_pred_traj = occt_map.get_pts(torch.cat([first_agent_s_query, last_agent_s_query], dim=1), env_j)
     first_pred_traj = first_last_pred_traj[:,:n_points_to_return] #[B, n_points_to_return, 2]
     last_pred_traj = first_last_pred_traj[:,n_points_to_return:] #[B, n_points_to_return, 2]
-    for i in range(len(agents)):
-        hinge_short_term[...,i,:,:2] = first_pred_traj + (i/(len(agents)-1))*(last_pred_traj - first_pred_traj)
-    hinges_status = occt_map.get_hinge_status(first_agent_s_query, env_j).transpose(-2,-1) # [batch_size, 2] or [2]
-    hinge_short_term[...,-1] = hinges_status
+
+    if hinge_relative_pos is None:
+        for i in range(len(agents)):
+            hinge_short_term[...,i,:,:2] = first_pred_traj + (i/(len(agents)-1))*(last_pred_traj - first_pred_traj)
+    else:
+        # TODO: hinge is some where in the cargo, not linear interpolation
+        raise NotImplementedError("Hinge relative position is not None, not implemented yet!")
+    # old way face the problem that the hinge status is not accurate after the curve, so we change to real time update way
+    # hinges_status = occt_map.get_hinge_status(first_agent_s_query, env_j).transpose(-2,-1) # [batch_size, 2] or [2]
+    # new way
+    end = first_agent_s_query[:, -1:].float()  # [B, 1]
+    start = last_agent_s_query[:, 0:1].float()     # [B, 1]
+    size = torch.round(torch.max(torch.max(end-start, dim=-1).values)).long()  # [B]
+    start_end = torch.cat([start, end], dim=1)    # [B, 2]
+    start_end = start_end.unsqueeze(1)  # [B, 1, 2]
+    interpolated = F.interpolate(
+        start_end, 
+        size=size,  # 目标长度
+        mode='linear',  # 线性插值
+        align_corners=True  # 保证首尾值准确
+    )
+    # 恢复形状为 [B, steps]
+    interpolated = interpolated.squeeze(1)  # [B, steps]
+    ref_left_boundary = occt_map.get_pts(interpolated, env_j,line = "left")
+    ref_right_boundary = occt_map.get_pts(interpolated, env_j,line = "right")
+    is_in_boundary = check_hinge_points_in_boundary(
+        ref_left_boundary=ref_left_boundary,
+        ref_right_boundary=ref_right_boundary,
+        hinge_short_term=hinge_short_term,
+        K=hinge_edge_buffer,
+    )
+    is_after_corner = (torch.atleast_1d(first_agent_s) > corner_s)[:,None,None,None].expand(-1, len(agents), n_points_to_return, 1)
+    hinge_short_term[...,-1:] = (is_in_boundary & is_after_corner).to(dtype=hinge_short_term.dtype)
     return hinge_short_term
 
 def get_short_term_hinge_path_by_s_backup(
@@ -704,3 +854,79 @@ def polynomial_decreasing_fcn(x, x0, x1, power):
     normalized_x = (x_clamped - x0) / denominator
     y = torch.pow(1 - normalized_x, power)
     return y
+def calculate_max_min_acceleration(ref_v, center_cum_len):
+    """
+    基于v-s曲线计算离散点的最大/最小加速度
+    Args:
+        ref_v: tensor, shape=[M] 参考速度（m/s）
+        center_cum_len: tensor, shape=[M] 累计路程（m）
+    Returns:
+        max_acc: float 最大加速度（m/s²）
+        min_acc: float 最小加速度（m/s²）
+    """
+    # 1. 校验输入维度（避免维度不匹配）
+    assert ref_v.ndim == 1 and center_cum_len.ndim == 1, "输入必须是一维张量"
+    assert len(ref_v) == len(center_cum_len), "ref_v和center_cum_len长度必须一致"
+    assert len(ref_v) >= 2, "至少需要2个离散点才能计算加速度"
+
+    # 2. 计算相邻点的速度平方差和路程差
+    v_sq = ref_v **2  # 速度平方 [M]
+    delta_v_sq = v_sq[1:] - v_sq[:-1]  # 相邻速度平方差 [M-1]
+    delta_s = center_cum_len[1:] - center_cum_len[:-1]  # 相邻路程差 [M-1]
+
+    # 3. 过滤无效路程差（避免除以0）
+    valid_mask = delta_s != 0.0
+    delta_v_sq_valid = delta_v_sq[valid_mask]
+    delta_s_valid = delta_s[valid_mask]
+
+    # 4. 计算离散加速度（a = (v2² - v1²)/(2*Δs)）
+    acc = delta_v_sq_valid / (2 * delta_s_valid)
+
+    # 5. 计算最大/最小加速度
+    max_acc = torch.max(acc).item()
+    min_acc = torch.min(acc).item()
+
+    # 6. 打印结果（保留4位小数，清晰易读）
+    print("="*50)
+    print(f"v-s曲线离散点加速度计算结果：,离散点数：{len(ref_v)} 个,最大加速度：{max_acc:.4f} m/s²,最小加速度：{min_acc:.4f} m/s²")
+    print("="*50)
+
+    return max_acc, min_acc
+
+
+# ===================== 测试用例 =====================
+if __name__ == "__main__":
+    # 测试参数设置
+    B = 1  # batch size=1
+    K = 0.1  # 最小距离0.1米
+    n_agent = 4
+    n_pts = 4
+
+    # 1. 构造边界：左边界x=0（竖直线），右边界x=1（竖直线），y从0到23
+    ref_left_boundary = torch.zeros(B, 24, 2)
+    ref_left_boundary[..., 1] = torch.arange(24)  # y轴从0到23
+    ref_right_boundary = torch.ones(B, 24, 2)
+    ref_right_boundary[..., 1] = torch.arange(24)  # y轴从0到23
+
+    # 2. 构造预瞄点：3个关键测试点
+    hinge_short_term = torch.zeros(B, n_agent, n_pts, 2)
+    hinge_short_term[0, 0, 0] = torch.tensor([-1.0, 10.0])  # x=-1（左边界外）
+    hinge_short_term[0, 0, 1] = torch.tensor([2.0, 10.0])   # x=2（右边界外）
+    hinge_short_term[0, 0, 2] = torch.tensor([0.5, 10.0])   # x=0.5（边界内）
+
+    # 3. 调用函数
+    result = check_hinge_points_in_boundary(
+        ref_left_boundary=ref_left_boundary,
+        ref_right_boundary=ref_right_boundary,
+        hinge_short_term=hinge_short_term,
+        K=K
+    )
+
+    # 4. 输出测试结果
+    print("===== 测试结果 =====")
+    print(f"左边界：x=0，右边界：x=1，最小距离K={K}米")
+    print(f"点 (x=-1, y=10) → 是否满足条件：{result[0,0,0,0].item()}（预期False）")
+    print(f"点 (x=2, y=10)  → 是否满足条件：{result[0,0,1,0].item()}（预期False）")
+    print(f"点 (x=0.5, y=10)→ 是否满足条件：{result[0,0,2,0].item()}（预期True）")
+    print("\n完整输出形状:", result.shape)
+    print("完整输出张量:\n", result)

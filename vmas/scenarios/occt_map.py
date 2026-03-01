@@ -410,7 +410,8 @@ class OcctCRMap(MapBase):
         
         # 处理CommonRoad地图
         if cr_map_dir.split('/')[-1]=="chapter4":
-            self._cr_map_process_chapter4(cr_map_dir)
+            self._cr_map_process(cr_map_dir)
+            #self._cr_map_process_chapter4(cr_map_dir)
         else:
             self._cr_map_process(cr_map_dir)
         
@@ -803,9 +804,9 @@ class OcctCRMap(MapBase):
                 # if not((path_ids[0]==100 and path_ids[-1]==169)):
                 #     continue
                 # for chapter 2 paper illustration
-                if not ((path_ids[0]==177 and path_ids[-1]==129) or \
-                   (path_ids[0]==153 and path_ids[-1]==175)):
-                    continue
+                # if not ((path_ids[0]==177 and path_ids[-1]==129) or \
+                #    (path_ids[0]==153 and path_ids[-1]==175)):
+                #     continue
                 if map_name == "USA_Roundabout_EP_repaired.xml":
                     if (path_ids[-1]==124) or \
                         (path_ids[0]==100 and path_ids[-1]==169) or \
@@ -891,6 +892,8 @@ class OcctCRMap(MapBase):
                     ref_v = torch.clamp_max(factor * 1.0 / torch.sqrt(center_curvature+1e-8)**2, self.max_ref_v) 
                     ref_v = self.gaussian_smooth_1d(ref_v, sigma=8.0)
                 assert len(center_vertices) == len(ref_v), "重采样后的中心路径长度与参考速度长度不一致"
+                from occt_utils import calculate_max_min_acceleration
+                max_acc, min_acc = calculate_max_min_acceleration(ref_v, center_cum_len)
                 # 保存重采样后的路径数据
                 hinge_status, hinge_trajs = self._detect_hinge_status(center_cum_len, center_splines, left_splines, right_splines)
                 if (hinge_status==1).all():
@@ -901,11 +904,15 @@ class OcctCRMap(MapBase):
                 # TODO: how the define hinge reward and status
                 # we want to make hinge ready only pass the corner, but cant make sure all hinge has 0 status through the corner
                 # make hinge status consistent through the corner
+                corner_begin_s = center_cum_len[-1]
+                corner_end_s = center_cum_len[0]
                 for hinge_idx in range(hinge_status.shape[0]):
                     if (hinge_status[hinge_idx]==0).any():#exclude first and last hinge pts
                         begin_idx = torch.where(hinge_status[hinge_idx] == 0)[0][0]
                         pass_corner_idx = torch.where(hinge_status[hinge_idx] == 0)[0][-1]
                         hinge_status[hinge_idx, begin_idx:pass_corner_idx] = 0
+                        corner_begin_s = min(center_cum_len[begin_idx],corner_begin_s)
+                        corner_end_s = max(center_cum_len[pass_corner_idx],corner_end_s)
                 # pass_corner_idx = torch.where(hinge_status == 0)[0][-1]
                 # hinge_status[:pass_corner_idx] = 0
                 self.path_library.append({
@@ -919,6 +926,8 @@ class OcctCRMap(MapBase):
                     "lane_width": resampled_lane_width,
                     "hinge_status": hinge_status,
                     "hinge_trajs": hinge_trajs,
+                    "corner_begin_s": corner_begin_s,
+                    "corner_end_s": corner_end_s,
                 })
                 assert hinge_status.shape[0]==self.n_agents, "hinge个数必须与n_agents一致"
                 assert hinge_trajs.shape[0]==self.n_agents and hinge_trajs.shape[-1]==2, "hinge轨迹必须为2维"
@@ -1120,7 +1129,7 @@ class OcctCRMap(MapBase):
                 assert hinge_status.shape[0]==self.n_agents, "hinge个数必须与n_agents一致"
                 assert hinge_trajs.shape[0]==self.n_agents and hinge_trajs.shape[-1]==2, "hinge轨迹必须为2维"
                 # 更新最大路径长度
-                if center_cum_len[-1] > self.max_path_length and path_ids[0]==127:
+                if path_ids[0]==127:
                     self.max_path_length = center_cum_len[-1]
                     self.max_path_s_list = center_cum_len
         dump_file = os.path.join(self.cr_map_dir, "map_data.pkl")
@@ -1211,6 +1220,7 @@ class OcctCRMap(MapBase):
         self.batch_hinge_status = torch.ones(B, max_path_pts_num, self.n_agents, device=self.device)
         self.batch_s_max = torch.empty(B, device=self.device).fill_(float('nan'))
         self.batch_map_name = [None]*B
+        self.batch_corner_s = torch.zeros(B, device=self.device)
         max_s_len=0
         max_s_len_id=0
         for batch_idx, path_id in enumerate(self.batch_id):
@@ -1230,6 +1240,7 @@ class OcctCRMap(MapBase):
             self.batch_s_max[batch_idx] = s_max
             self.batch_ref_v[batch_idx, :length, 0] = path_data["ref_v"]
             self.batch_hinge_status[batch_idx, :length, :] = path_data["hinge_status"].transpose(0, 1) #[length, n_agents]
+            self.batch_corner_s[batch_idx] = (path_data["corner_begin_s"] + path_data["corner_end_s"]) / 2
         # 对长度不足的道路样本进行延伸填充
         for batch_idx in range(B):
             current_length = torch.count_nonzero(~torch.isnan(self.batch_center_vertices[batch_idx, :, 0])).item()
@@ -1245,6 +1256,7 @@ class OcctCRMap(MapBase):
                         vertices[batch_idx, current_length - 1 + i] = new_point
                 last_ref_v = self.batch_ref_v[batch_idx, current_length - 1]
                 self.batch_ref_v[batch_idx, current_length:] = last_ref_v
+
 
         
         longest_s = self.max_path_s_list
@@ -2392,10 +2404,12 @@ if __name__ == "__main__":
                      cr_map_dir="vmas/scenarios_data/cr_maps/chapter4",
                      max_ref_v=15/3.6 ,
                      min_lane_width=2.4, 
-                     min_lane_len=120,
+                     min_lane_len=80,
                      device=device, 
                      sample_gap=1, 
                      is_constant_ref_v=False,
-                     rod_len=30.0)
+                     rod_len=18.0,
+                     extend_len=None,#0.0,
+                     n_agents=4)
     
     road.plot_road_debug()

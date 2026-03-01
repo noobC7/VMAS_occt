@@ -39,9 +39,12 @@ class KinematicBicycle(Dynamics):
         self.integration = integration
         self.world = world
         
-        # Actual steering angle is now a direct control, not a state, 
-        # but we keep this for history/logging compatibility
-        self.cur_delta = None 
+        self.cur_delta = torch.zeros(
+            (self.world.batch_dim, 1),
+            device=self.world.device,
+            dtype=torch.float32,
+        )
+        self.reset_history()
 
     def f(self, state, acceleration, delta):
         assert torch.isnan(state).any() == False, f"state is nan"
@@ -82,6 +85,16 @@ class KinematicBicycle(Dynamics):
     def needed_action_size(self) -> int:
         return 2  # [acceleration, steering_angle]
 
+    def reset_history(self):
+        """Reset the history for a new simulation run"""
+        self.history = {
+            'pos': [],
+            'yaw': [],
+            'vel': [],
+            'delta': [],
+            'target_delta': [],
+            'acc': [],
+        }
     def process_action(self):
         batch_size = self.agent.state.pos.shape[0]
         
@@ -172,7 +185,11 @@ class DelayedSteeringKinematicBicycle(Dynamics):
         self.world = world
         
         # Additional state variables
-        self.cur_delta = None  # Actual steering angle state (with delay)
+        self.cur_delta = torch.zeros(
+            (self.world.batch_dim, 1),
+            device=self.world.device,
+            dtype=torch.float32,
+        )  # Actual steering angle state (with delay)
 
         # For debugging and visualization
         self.reset_history()
