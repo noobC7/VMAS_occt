@@ -597,7 +597,7 @@ class Scenario(BaseScenario):
         )  # Threshold above which agents will be penalized for being too close to lanelet boundaries
 
         threshold_near_other_agents_c2c_high = kwargs.pop(
-            "threshold_near_other_agents_c2c_high", 2 * (self.agent_length**2 + self.agent_width**2)**0.5
+            "threshold_near_other_agents_c2c_high", 1.8 * (self.agent_length**2 + self.agent_width**2)**0.5
         )  # Threshold beneath which agents will started be
         # Penalized for being too close to other agents (for center-to-center distance)
         threshold_near_other_agents_c2c_low = kwargs.pop(
@@ -988,7 +988,8 @@ class Scenario(BaseScenario):
         s_end_buffer = 0.0
         if self.is_rand_arc_pos:
             last_vehicle_s = self.get_random_tensor() * self.road.get_s_max() * 0.7 #260128
-            last_vehicle_s=torch.normal(mean=self.road.batch_corner_s, std=self.road.batch_corner_s/2)
+            last_vehicle_s=torch.normal(mean=self.road.batch_corner_s, std=self.road.batch_corner_s/2) #260301
+            last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
         else:
             last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos
         last_vehicle_s = torch.clamp(last_vehicle_s, s_start_buffer * torch.ones(B,device=device),
@@ -2776,17 +2777,26 @@ class Scenario(BaseScenario):
         agent_raw_vel = torch.linalg.norm(agent.state.vel, dim=-1)
         agent_vel = agent_raw_vel*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)
         if self.task_class==TaskClass.OCCT_PLATOON:
+            # way1
+            # ref_vel1 = torch.linalg.norm(self.world.agents[agent_index-1].state.vel, dim=-1)
+            # ref_vel2 = torch.linalg.norm(self.world.agents[agent_index+1].state.vel, dim=-1)
+            # dis_from_front = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 0]+self.platoon_space_batch-self.agent_length,min=0.01)
+            # dis_from_rear = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 1]+self.platoon_space_batch-self.agent_length,min=0.01)
+            # ref_vel = (ref_vel1+ref_vel2)/2
+            # ref_vel = (dis_from_rear*ref_vel1+dis_from_front*ref_vel2)/(dis_from_front+dis_from_rear)
+            # error_vel = agent_raw_vel - ref_vel
+            # way2
+            ref_vel1 = torch.linalg.norm(self.world.agents[0].state.vel, dim=-1)
+            ref_vel2 = torch.linalg.norm(self.world.agents[self.n_agents-1].state.vel, dim=-1)
+            ref_vel = (ref_vel1+ref_vel2)/2
+            error_vel = agent_raw_vel - ref_vel
+            # # way3
+            # error_vel = agent_raw_vel - agent_raw_vel
+        else:
+            #ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
             leader_index = 0
             leader_vel = torch.linalg.norm(self.world.agents[leader_index].state.vel, dim=-1)
             error_vel = agent_vel - leader_vel
-        else:
-            #ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
-            ref_vel1 = torch.linalg.norm(self.world.agents[agent_index-1].state.vel, dim=-1)
-            ref_vel2 = torch.linalg.norm(self.world.agents[agent_index+1].state.vel, dim=-1)
-            error_vel = agent_raw_vel - (ref_vel1+ref_vel2)/2
-            # leader_index = 0
-            # leader_vel = torch.linalg.norm(self.world.agents[leader_index].state.vel, dim=-1)
-            # error_vel = agent_vel - leader_vel
         # if (agent_index==0 and self.task_class==TaskClass.SIMPLE_PLATOON) or self.task_class==TaskClass.OCCT_PLATOON:
         #     reward_track_ref_vel = torch.clamp(1 - self.rewards.reward_track_ref_vel* (error_vel)**2, min=0)
         # else:
@@ -2815,7 +2825,7 @@ class Scenario(BaseScenario):
             desire_distance = torch.norm(
                 hinge_desire_pos - agent_desire_pos, dim=-1
             )  # shape: [batch_dim]
-            reward_track_hinge =  torch.clamp(1 - self.rewards.reward_track_hinge * desire_distance**2, min=0) * hinge_status - 1
+            reward_track_hinge =  self.rewards.reward_track_hinge * torch.clamp(1 -  desire_distance**2, min=0) * hinge_status
             reward_details["reward_track_hinge"][:, agent_index] = reward_track_hinge
             self.rew += reward_track_hinge
             reward_hinge = self.rewards.reward_hinge * self.observations.agent_hinge_status.get_latest(n=1)[:, agent_index]
