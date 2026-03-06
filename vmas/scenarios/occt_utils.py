@@ -181,7 +181,6 @@ class OcctObservations:
         n_observed_steps=None,
         error_vel=None,
         error_space: CircularBuffer = None,
-        error_hinge_dis=None,
         agent_hinge_status: CircularBuffer = None,
         agent_s=None,
         past_pos: CircularBuffer = None,
@@ -209,7 +208,6 @@ class OcctObservations:
         self.n_observed_steps = n_observed_steps  # Number of past steps to observe
         self.error_vel = error_vel  # Velocity error relative to reference velocity
         self.error_space = error_space  # Gap error relative to reference gap (unnormalized)
-        self.error_hinge_dis = error_hinge_dis  # 铰接距离误差（米）
         self.agent_hinge_status = agent_hinge_status  # 车辆铰接状态（0：未铰接，1：铰接），铰接后车辆被动行驶且奖励屏蔽
         self.agent_s = agent_s  # Arc length position
         
@@ -292,6 +290,9 @@ class OcctReferencePathsAgentRelated:
         short_term: Tensor = None,
         hinge_short_term: Tensor = None,
         short_term_indices: Tensor = None,
+        agent_hinge_status: CircularBuffer = None,
+        agent_target_hinge_idx: Tensor = None,
+        agent_target_hinge_short_term: Tensor = None,
         exit: Tensor = None,
     ):
         self.long_term = long_term  # Actual long-term reference paths of agents
@@ -302,6 +303,9 @@ class OcctReferencePathsAgentRelated:
         self.short_term_indices = short_term_indices  # Indices that indicate which part of the long-term reference path is used to build the short-term reference path
         self.nearing_points_left_boundary = nearing_points_left_boundary  # Nearing left boundary
         self.nearing_points_right_boundary = nearing_points_right_boundary  # Nearing right boundary
+        self.agent_hinge_status = agent_hinge_status  # Hinge status for each agent
+        self.agent_target_hinge_idx = agent_target_hinge_idx  # Index of the target hinge point for each agent
+        self.agent_target_hinge_short_term = agent_target_hinge_short_term  # Index of the target hinge point for each agent in the short-term reference path
         self.exit = exit  # Exit segment
         
 def check_validity(obj):
@@ -585,67 +589,142 @@ def get_short_term_hinge_path_by_s(
     hinge_edge_buffer: float = 0.0,
     corner_s: Tensor = None,
 ):
-    """
-    Args:
-        occt_map:                   OcctMap or OcctCRMap.
-        agent_s:                    [batch_size, 1] or [1] or []. In the case of the latter, batch_dim is deemed as 1.
-        n_points_to_return:         [1] or []. In the case of the latter, batch_dim is deemed as 1.
-        sample_interval:            Sample interval to match specific purposes;
-                                    set to 2 when using this function to get the short-term reference path;
-                                    set to 1 when using this function to get the nearing boundary points."""
     if device is None:
         device = torch.device("cpu")
-    HINGE_FIRST_INDEX=tractor_slice[0]
-    HINGE_LAST_INDEX=tractor_slice[-1]
+    
+    # --- DEBUG START ---
+    # print(f"\n[DEBUG] === Entering get_short_term_hinge_path_by_s ===")
+    # print(f"[DEBUG] agent_s shape: {agent_s.shape}")
+    # print(f"[DEBUG] n_points_to_return: {n_points_to_return}")
+    # --- DEBUG END ---
+
+    HINGE_FIRST_INDEX = tractor_slice[0]
+    HINGE_LAST_INDEX = tractor_slice[-1]
     first_agent_s = agent_s[env_j, HINGE_FIRST_INDEX]
     last_agent_s = agent_s[env_j, HINGE_LAST_INDEX]
-    B=agent_s.shape[0] if agent_s.dim() else 1
-    hinge_short_term=torch.zeros((B, len(agents), n_points_to_return , 3), device=device, dtype=torch.float32)
+    B = agent_s.shape[0] if agent_s.dim() else 1
+    hinge_pts_num = len(agents) if hinge_relative_pos is None else hinge_relative_pos.shape[0]
+    hinge_short_term = torch.zeros((B, hinge_pts_num, n_points_to_return, 5), device=device, dtype=torch.float32)
+    # print(f"[DEBUG] Initialized hinge_short_term shape: {hinge_short_term.shape}")
+
+    # 提取速度
+    first_agent_vel_vec = agents[HINGE_FIRST_INDEX].state.vel  # [B?, 2]
+    last_agent_vel_vec = agents[HINGE_LAST_INDEX].state.vel    # [B?, 2]
+    # print(f"[DEBUG] first_agent_vel_vec shape: {first_agent_vel_vec.shape}")
+
+    first_vel_expanded = first_agent_vel_vec.unsqueeze(1).expand(-1, n_points_to_return, -1)
+    last_vel_expanded = last_agent_vel_vec.unsqueeze(1).expand(-1, n_points_to_return, -1)
+    # print(f"[DEBUG] first_vel_expanded shape: {first_vel_expanded.shape}")
+
     if sample_ds is None:
-        first_agent_vel = 2*torch.ones_like(torch.linalg.norm(agents[HINGE_FIRST_INDEX].state.vel, dim=-1))
-        last_agent_vel = 2*torch.ones_like(torch.linalg.norm(agents[HINGE_LAST_INDEX].state.vel, dim=-1))
-        first_agent_s_query = torch.stack([first_agent_s+i*sample_dt*first_agent_vel for i in range(n_points_to_return)],dim=-1)
-        last_agent_s_query = torch.stack([last_agent_s+i*sample_dt*last_agent_vel for i in range(n_points_to_return)],dim=-1)
+        first_agent_vel_mag = 2 * torch.ones_like(torch.linalg.norm(first_agent_vel_vec, dim=-1))
+        last_agent_vel_mag = 2 * torch.ones_like(torch.linalg.norm(last_agent_vel_vec, dim=-1))
+        first_agent_s_query = torch.stack([first_agent_s + i * sample_dt * first_agent_vel_mag for i in range(n_points_to_return)], dim=-1)
+        last_agent_s_query = torch.stack([last_agent_s + i * sample_dt * last_agent_vel_mag for i in range(n_points_to_return)], dim=-1)
     else:
-        tmp = torch.ones_like(torch.linalg.norm(agents[HINGE_FIRST_INDEX].state.vel, dim=-1))
-        first_agent_s_query = torch.stack([first_agent_s+i*sample_ds*tmp for i in range(n_points_to_return)],dim=-1)
-        last_agent_s_query = torch.stack([last_agent_s+i*sample_ds*tmp for i in range(n_points_to_return)],dim=-1)
+        tmp = torch.ones_like(torch.linalg.norm(first_agent_vel_vec, dim=-1))
+        first_agent_s_query = torch.stack([first_agent_s + i * sample_ds * tmp for i in range(n_points_to_return)], dim=-1)
+        last_agent_s_query = torch.stack([last_agent_s + i * sample_ds * tmp for i in range(n_points_to_return)], dim=-1)
+    
     first_last_pred_traj = occt_map.get_pts(torch.cat([first_agent_s_query, last_agent_s_query], dim=1), env_j)
-    first_pred_traj = first_last_pred_traj[:,:n_points_to_return] #[B, n_points_to_return, 2]
-    last_pred_traj = first_last_pred_traj[:,n_points_to_return:] #[B, n_points_to_return, 2]
+    first_pred_traj = first_last_pred_traj[:, :n_points_to_return] 
+    last_pred_traj = first_last_pred_traj[:, n_points_to_return:] 
+    # print(f"[DEBUG] first_pred_traj shape: {first_pred_traj.shape}")
 
     if hinge_relative_pos is None:
         for i in range(len(agents)):
-            hinge_short_term[...,i,:,:2] = first_pred_traj + (i/(len(agents)-1))*(last_pred_traj - first_pred_traj)
+            ratio = i / (len(agents) - 1) if len(agents) > 1 else 0.0
+            hinge_short_term[..., i, :, :2] = first_pred_traj + ratio * (last_pred_traj - first_pred_traj)
+            hinge_short_term[..., i, :, 2:4] = first_vel_expanded + ratio * (last_vel_expanded - first_vel_expanded)
     else:
-        # TODO: hinge is some where in the cargo, not linear interpolation
-        raise NotImplementedError("Hinge relative position is not None, not implemented yet!")
-    # old way face the problem that the hinge status is not accurate after the curve, so we change to real time update way
-    # hinges_status = occt_map.get_hinge_status(first_agent_s_query, env_j).transpose(-2,-1) # [batch_size, 2] or [2]
-    # new way
-    end = first_agent_s_query[:, -1:].float()  # [B, 1]
-    start = last_agent_s_query[:, 0:1].float()     # [B, 1]
-    size = torch.round(torch.max(torch.max(end-start, dim=-1).values)).long()  # [B]
-    start_end = torch.cat([start, end], dim=1)    # [B, 2]
-    start_end = start_end.unsqueeze(1)  # [B, 1, 2]
-    interpolated = F.interpolate(
+        rod_vector = last_pred_traj - first_pred_traj 
+        rod_length = torch.norm(rod_vector, dim=-1, keepdim=True) 
+        rod_length_safe = torch.where(rod_length > 1e-6, rod_length, torch.ones_like(rod_length))
+        rod_dir = rod_vector / rod_length_safe 
+        rod_perp = torch.stack([rod_dir[..., 1], -rod_dir[..., 0]], dim=-1) 
+
+        rel = hinge_relative_pos.unsqueeze(0).unsqueeze(2)  # [1, N_hinge, 1, 2]
+        rod_dir_exp = rod_dir.unsqueeze(1)  # [B, 1, n_points, 2]
+        rod_perp_exp = rod_perp.unsqueeze(1) 
+        
+        offset = rel[..., 0:1] * rod_perp_exp + rel[..., 1:2] * rod_dir_exp
+        # print(f"[DEBUG] offset shape: {offset.shape}")
+
+        r_ap = offset 
+        vel_diff = last_vel_expanded - first_vel_expanded 
+        vel_diff_dot_perp = torch.sum(vel_diff * rod_perp, dim=-1, keepdim=True)
+        vel_diff_dot_perp_exp = vel_diff_dot_perp.unsqueeze(1) 
+        
+        omega = vel_diff_dot_perp_exp / rod_length_safe.unsqueeze(1)
+        # print(f"[DEBUG] omega shape: {omega.shape}")
+
+        # 计算转动速度
+        rot_vel_raw = torch.stack([
+            -omega * r_ap[..., 1:2], 
+            omega * r_ap[..., 0:1]    
+        ], dim=-1)
+        # print(f"[DEBUG] rot_vel_raw (before squeeze) shape: {rot_vel_raw.shape}")
+        
+        rot_vel = rot_vel_raw.squeeze(-2) 
+        # print(f"[DEBUG] rot_vel (after squeeze) shape: {rot_vel.shape}")
+
+        first_vel_exp = first_vel_expanded.unsqueeze(1) 
+        # print(f"[DEBUG] first_vel_exp shape: {first_vel_exp.shape}")
+        
+        n = hinge_relative_pos.size(0)
+        target_slice_shape = hinge_short_term[:, :n, :, 2:4].shape
+        # print(f"[DEBUG] Target slice shape: {target_slice_shape}")
+        
+        hinge_short_term[:, :n, :, 2:4] = first_vel_exp + rot_vel 
+        first_pos_exp = first_pred_traj.unsqueeze(1)
+        hinge_short_term[:, :n, :, 0:2] = first_pos_exp + offset
+    # print(f"[DEBUG] Proceeding to ready bit calculation...")
+    
+    # 1. 基础 S 坐标处理
+    end = first_agent_s_query[:, -1:].float()    # [B, 1]
+    start = last_agent_s_query[:, 0:1].float()   # [B, 1]
+    
+    # size 计算（防止空插值）
+    size_val = torch.max(end - start).item()
+    size = max(int(round(size_val)), 1)
+    
+    start_end = torch.cat([start, end], dim=1).unsqueeze(1) # [B, 1, 2]
+    interpolated = torch.nn.functional.interpolate(
         start_end, 
-        size=size,  # 目标长度
-        mode='linear',  # 线性插值
-        align_corners=True  # 保证首尾值准确
-    )
-    # 恢复形状为 [B, steps]
-    interpolated = interpolated.squeeze(1)  # [B, steps]
-    ref_left_boundary = occt_map.get_pts(interpolated, env_j,line = "left")
-    ref_right_boundary = occt_map.get_pts(interpolated, env_j,line = "right")
+        size=size, 
+        mode='linear', 
+        align_corners=True
+    ).squeeze(1) # [B, steps]
+    
+    # 2. 获取边界
+    ref_left_boundary = occt_map.get_pts(interpolated, env_j, line="left")
+    ref_right_boundary = occt_map.get_pts(interpolated, env_j, line="right")
+    
+    # 3. 计算在边界内的掩码
+    # 确保 check_hinge_points_in_boundary 返回的是 [B, N_hinge, n_points, 1]
     is_in_boundary = check_hinge_points_in_boundary(
         ref_left_boundary=ref_left_boundary,
         ref_right_boundary=ref_right_boundary,
         hinge_short_term=hinge_short_term,
         K=hinge_edge_buffer,
     )
-    is_after_corner = (torch.atleast_1d(first_agent_s) > corner_s)[:,None,None,None].expand(-1, len(agents), n_points_to_return, 1)
-    hinge_short_term[...,-1:] = (is_in_boundary & is_after_corner).to(dtype=hinge_short_term.dtype)
+    
+    # 4. 【关键修复】判定是否已经过了拐角
+    # 确保 is_after_corner 维度为 [B, 1, 1, 1] 然后广播到 [B, N_hinge, n_points_to_return, 1]
+    is_after_corner = (torch.atleast_1d(first_agent_s) > corner_s).view(B, 1, 1, 1)
+    is_after_corner = is_after_corner.expand(-1, hinge_pts_num, n_points_to_return, 1)
+    is_in_straight = (torch.atleast_1d(first_agent_s) < (corner_s-40)).view(B, 1, 1, 1)
+    is_in_straight = is_in_straight.expand(-1, hinge_pts_num, n_points_to_return, 1)
+    # 5. 【关键修复】判定是否是侧向 Hinge
+    # 创建一个 [1, N_hinge, 1, 1] 的索引张量
+    hinge_idx_raw = torch.arange(hinge_pts_num, device=device).view(1, hinge_pts_num, 1, 1)
+    # 逻辑：物理 Agent 索引之外的点都是侧向点
+    is_side_hinge = (hinge_idx_raw >= len(agents)).expand(B, -1, n_points_to_return, 1)
+
+    # 6. 合并计算 Ready 位
+    # 维度对齐：[B, 8, 4, 1] = [B, 8, 4, 1] & ([B, 8, 4, 1] | [B, 8, 4, 1])
+    hinge_short_term[..., 4:5] = (is_in_boundary & ((is_after_corner | is_in_straight | is_side_hinge))).to(dtype=hinge_short_term.dtype)
+    
     return hinge_short_term
 
 def get_short_term_hinge_path_by_s_backup(
