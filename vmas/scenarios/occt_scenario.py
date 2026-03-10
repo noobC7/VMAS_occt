@@ -91,12 +91,26 @@ class Scenario(BaseScenario):
         self.env_current_step = torch.zeros(batch_dim, device=device, dtype=torch.long)
         self.env_total_step = torch.zeros(batch_dim, device=device, dtype=torch.long)
         self.agent_index_focus = kwargs.pop("agent_index_focus", AGENT_INDEX_FOCUS)
+        self.enable_obs_audit = kwargs.pop("enable_obs_audit", True)
+        self.obs_audit_interval = int(kwargs.pop("obs_audit_interval", 100))
+        self.obs_audit_agent_index = int(
+            kwargs.pop("obs_audit_agent_index", self.agent_index_focus)
+        )
+        self.obs_audit_small_threshold = float(
+            kwargs.pop("obs_audit_small_threshold", 1e-2)
+        )
+        self.obs_audit_large_threshold = float(
+            kwargs.pop("obs_audit_large_threshold", 3.0)
+        )
+        self.obs_audit_last_logged_step = -1
+        self.obs_audit_prev_groups = {}
         # world params
         self.device = device
         self.batch_dim = batch_dim
         self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
         self.n_agents=kwargs.pop("n_agents", 4)
+        self.obs_audit_agent_index = min(max(self.obs_audit_agent_index, 0), self.n_agents - 1)
         # platoon params
         self.is_loop=kwargs.pop("is_loop", False)
         # use agents_s to get ref pts for short term
@@ -104,7 +118,7 @@ class Scenario(BaseScenario):
         self.use_boundary_frenet_ref=kwargs.pop("use_boundary_frenet_ref", True)
         self.mask_ref_v=kwargs.pop("mask_ref_v", False)
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", False)
-        self.init_arc_pos = kwargs.pop("init_arc_pos", 20.0)
+        self.init_arc_pos = kwargs.pop("init_arc_pos", 0.0)
         self.init_vel_mean = kwargs.pop("init_vel_mean", 1.0)
         self.init_vel_std = kwargs.pop("init_vel_std", 0.0) 
         self.still_space = kwargs.pop("still_space", 6.0)
@@ -148,12 +162,12 @@ class Scenario(BaseScenario):
         self.visualize_semidims=True
         self.viewer_zoom = float(kwargs.get("viewer_zoom", 20)) #7
         self.world_x_dim = kwargs.pop(
-            "world_x_dim", 100
+            "world_x_dim", 150
         )  # The x-dimension of the world in [m]
         self.world_y_dim = kwargs.pop(
             "world_y_dim", 100
         )  # The y-dimension of the world in [m]
-        self.resolution_factor = kwargs.pop("resolution_factor", 10)  # Default 5
+        self.resolution_factor = kwargs.pop("resolution_factor", 5)  # Default 5
         self.render_origin = kwargs.pop(
             "render_origin", [self.world_x_dim / 2, self.world_y_dim / 2]
         )
@@ -195,39 +209,36 @@ class Scenario(BaseScenario):
         B = batch_dim
         self.lane_width = 6  # 道路宽度
         if self.task_class == TaskClass.OCCT_PLATOON:
-            # agent params
-            F = self.n_followers
-            self.n_latch = self.n_followers
-            self.cargo_half_width = float(kwargs.get("cargo_half_width", 6))
-            # ---- 锚点（沿杆的比例 alpha）----
-            self.latch_alpha = torch.linspace(0.0, 1.0, self.n_latch, device=device)  # [n_latch]
-            self.latch_pos_world = torch.zeros(B, self.n_latch, 2, device=device)   # [B,nL,2]
-            self.latch_theta_world = torch.zeros(B, self.n_latch, device=device)    # [B,nL]
-    
-            self.dock_state = torch.zeros(B, F, dtype=torch.bool, device=device) # 全部 free
-            self.bound_latch_id = torch.full((B, F), -1, dtype=torch.long, device=device)
-    
-            # 目标位姿缓存（post_step 投影用）
-            self.target_pos = torch.zeros(B, F, 2, device=device)
-            self.target_theta = torch.zeros(B, F, device=device)
-    
-            # 计时器（奖励/日志可用）
-            self.dock_timer = torch.zeros(B, F, device=device)
-            
             self.rod_len = (self.n_followers+1) * self.still_space   # 货物长度 L
             self.hinge_side_width = float(kwargs.get("hinge_side_width", 5))
             self.corner_prepare_len = float(kwargs.get("corner_prepare_len", 40))
-            self.hinge_relative_pos= torch.tensor([[0,0], 
-                    [0,self.rod_len/3], 
-                    [0,2*self.rod_len/3], 
-                    [0,self.rod_len],
-                    [self.hinge_side_width,self.rod_len/3],
-                    [self.hinge_side_width,2*self.rod_len/3],
-                    [-self.hinge_side_width,self.rod_len/3],
-                    [-self.hinge_side_width,2*self.rod_len/3]],
-                    device=device
-                    )
+            # self.hinge_relative_pos= torch.tensor([[0,0], 
+            #         [0,self.rod_len/3], 
+            #         [0,2*self.rod_len/3], 
+            #         [0,self.rod_len],
+            #         [self.hinge_side_width,self.rod_len/3],
+            #         [self.hinge_side_width,2*self.rod_len/3],
+            #         [-self.hinge_side_width,self.rod_len/3],
+            #         [-self.hinge_side_width,2*self.rod_len/3]],
+            #         device=device
+            #         )
+            # self.agent_hinge_priority = {
+            #     1: (1, [4, 6]),  
+            #     2: (2, [5, 7])   
+            # }
+            # self.cargo_half_width = float(kwargs.get("cargo_half_width", 6))
+            self.hinge_relative_pos = torch.tensor(
+                [
+                    [0, i * self.rod_len / (self.n_agents - 1)] 
+                    for i in range(self.n_agents - 1)
+                ] + [[0, self.rod_len]],
+                device=device,
+                dtype=torch.float32
+            )
+            self.agent_hinge_priority = {i: (i, [i]) for i in range(1, self.n_agents - 1)}
+            self.cargo_half_width = float(kwargs.get("cargo_half_width", 2))
             self.n_hinges = self.hinge_relative_pos.size(0)
+            self.dock_agent_when_hinged = kwargs.pop("dock_agent_when_hinged", False)
         # self.road = OcctMap(
         #     batch_dim=B,
         #     device=device,
@@ -343,9 +354,21 @@ class Scenario(BaseScenario):
             * 1.2,
         )
 
+        obs_relative_velocity_scale = kwargs.pop(
+            "obs_relative_velocity_scale", max(self.max_speed / 4, 1.0)
+        )
+        obs_relative_acceleration_scale = kwargs.pop(
+            "obs_relative_acceleration_scale", max(self.max_acceleration, 0.5)
+        )
+
         self.normalizers = OcctNormalizers(
             pos=torch.tensor(
-                [self.agent_length * 10, self.agent_width * 10],
+                [self.agent_length * 5, self.agent_width * 5],
+                device=device,
+                dtype=torch.float32,
+            ),
+            error_pos=torch.tensor(
+                self.agent_length,
                 device=device,
                 dtype=torch.float32,
             ),
@@ -353,6 +376,11 @@ class Scenario(BaseScenario):
                 [self.world_x_dim, self.world_y_dim], device=device, dtype=torch.float32
             ),
             v=torch.tensor(self.max_speed, device=device, dtype=torch.float32),
+            error_v=torch.tensor(
+                obs_relative_velocity_scale,
+                device=device,
+                dtype=torch.float32,
+            ),
             rot=torch.tensor(2 * torch.pi, device=device, dtype=torch.float32),
             action_steering=self.max_steering_angle,
             action_vel=torch.tensor(self.max_speed, device=device, dtype=torch.float32),
@@ -367,6 +395,16 @@ class Scenario(BaseScenario):
             distance_agent=torch.tensor(
                 self.agent_length * 10, device=device, dtype=torch.float32
             ),
+        )
+        self.obs_relative_velocity_scale = torch.tensor(
+            obs_relative_velocity_scale,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.obs_relative_acceleration_scale = torch.tensor(
+            obs_relative_acceleration_scale,
+            device=device,
+            dtype=torch.float32,
         )
         self.observations = OcctObservations(
             is_partial=torch.tensor(
@@ -385,7 +423,7 @@ class Scenario(BaseScenario):
                 n_observed_steps, device=device, dtype=torch.int32
             ),
             error_vel=torch.zeros(
-                (batch_dim, self.n_agents), device=device, dtype=torch.float32
+                (batch_dim, self.n_agents, 2), device=device, dtype=torch.float32
             ),
             error_space=CircularBuffer(
                 torch.zeros(
@@ -638,9 +676,6 @@ class Scenario(BaseScenario):
             "threshold_no_reward_if_too_close_to_other_agents", self.agent_width / 6
         )
 
-        # Hinge threshold parameters
-        threshold_hinge_close = kwargs.pop("threshold_hinge_close", 0.5)  # 理想铰接距离（米），reward=1
-        threshold_hinge_far = kwargs.pop("threshold_hinge_far", 5.0)      # 最大有效铰接距离（米），reward=0
         self.thresholds = OcctThresholds(
             reach_goal=torch.tensor(
                 threshold_reach_goal, device=device, dtype=torch.float32
@@ -677,8 +712,6 @@ class Scenario(BaseScenario):
                 dtype=torch.float32,
             ),
             distance_mask_agents=self.normalizers.pos[0],
-            hinge_close=torch.tensor(threshold_hinge_close, device=device, dtype=torch.float32),
-            hinge_far=torch.tensor(threshold_hinge_far, device=device, dtype=torch.float32),
         )
         # Initialize collision matrix
         self.collisions = Collisions(
@@ -1046,23 +1079,6 @@ class Scenario(BaseScenario):
             self._set_pose(self.tractor_front, p_front, front_theta, self.platoon_vel_batch, idx_mask)
             self._set_pose(self.tractor_rear, p_rear, rear_theta, self.platoon_vel_batch, idx_mask)
 
-            # ---- 随动：初始 free & 随机放置在杆附近（不 dock）----
-            self.dock_state[idx_mask, :]     = False
-            self.bound_latch_id[idx_mask, :] = -1   
-            self.dock_timer[idx_mask, :]     = 0.0
-
-            # 在 rear→front 方向均匀分布随动车辆
-            alpha = torch.linspace(0.0, 1.0, self.n_agents, device=device)[1:-1]  # 首尾去掉(牵引车位置)
-            alpha = alpha.expand(B, -1)  # [B,F]
-            base = p_rear[:, None, :] + alpha[..., None] * rod_vec[:, None, :]  # [B,F,2]
-
-            # ---- 预计算锚点世界位姿（沿杆等间距）----
-            # latch_pos = p_rear + alpha * (p_front - p_rear)
-            self.latch_pos_world = p_rear[:, None, :] + self.latch_alpha[None, :, None] * rod_vec[:, None, :]
-            self.latch_theta_world = rod_theta[:, None].expand(-1, self.n_latch)
-
-            # 给一个初始的 target（free 也写当前位姿，post_step 会用 mask 过滤）
-            self.compute_latch_targets()
         else:
             s_front_new = (self.n_followers-1)* self.still_space + last_vehicle_s
         # ============== 阶段5：生成横向偏移/航向误差 ==============
@@ -1237,7 +1253,6 @@ class Scenario(BaseScenario):
             corner_s=self.road.batch_corner_s,
             hinge_relative_pos=self.hinge_relative_pos,
         )[env_j]
-        assert self.ref_paths_agent_related.hinge_short_term.shape[1] == 8
         
     def reset_init_distances_and_short_term_ref_path(self, env_j, i_agent, agents):
         """
@@ -1432,31 +1447,7 @@ class Scenario(BaseScenario):
             index=last_pts_idx
         ).squeeze(-2)
         self.ref_paths_agent_related.agent_target_hinge_idx[env_j, i_agent] = i_agent
-    # =========================
-    # 核心动作处理/几何解算
-    # =========================
-    def process_action(self, agent):
-        """
-        调用时序：在 world.step() 之前，且在 env 分发完 RL 动作之后
-        作用：docked 时覆盖随动车辆的物理动作；free 时保持 RL 动作
-        """
-        # 只处理随动车辆
-        if agent not in self.followers:
-            return
-        if self.task_class==TaskClass.SIMPLE_PLATOON:
-            return
-        i = self.followers.index(agent)            # 随动车辆在列表中的索引
-        docked_mask = self.dock_state[:, i]        # [B] bool
-
-        # ---- 硬约束：docked 时忽略物理控制（例如 [速度, 转向] 两维清零）----
-        # 动作张量形状通常是 [B, action_dim]；只改物理通道，保留你设计的 attach/undock 位
-        if docked_mask.any() and hasattr(agent, 'action') and agent.action is not None and hasattr(agent.action, 'u') and agent.action.u is not None:
-            # 把该 agent 在 batch 中 d==True 的样本的物理控制清零
-            u = agent.action.u                      # [B, action_dim]
-            # 假设前两维为物理控制（按你的动作定义改）
-            if u.shape[-1] >= 2:
-                u[docked_mask, :2] =  torch.zeros_like(u[docked_mask, :2])
-                agent.action.u = u
+    
     def get_front_rear_v_use_front(self):
         s_front=self.observations.agent_s[:, self.HINGE_FIRST_INDEX].clone()
         ref_v = self.road.get_ref_v(s_front[:,None])[:,0,0] # [B]
@@ -1554,14 +1545,6 @@ class Scenario(BaseScenario):
         self._set_pose(self.tractor_front, p_front, front_theta, v_front, idx_mask)
         self._set_pose(self.tractor_rear, p_rear, rear_theta, v_rear, idx_mask)
 
-        # ---- 4) 更新锚点世界位姿（等间距示例；若你有自定义分布，就替换这里）----
-        self.latch_pos_world   = p_rear[:, None, :] + self.latch_alpha[None, :, None] * rod_vec[:, None, :]
-        self.latch_theta_world = theta_rod[:, None].expand(-1, self.n_latch)   # 全部用杆朝向
-
-        # （可选）更新牵引车脚本动作的目标，这里只算，不写 action；你可在 env_process_action 里写入
-
-        # ---- 5) 计算随动车辆目标（按绑定锚点），shape 必须是 [B, nF, 2] / [B, nF] ----
-        self.compute_latch_targets()  # 这个函数我们之前已经给了实现
         if TRADITIONAL_CONTROL:
             self._pure_pursuit_control()
     def pre_step(self):
@@ -1646,25 +1629,25 @@ class Scenario(BaseScenario):
             v_r_new,       # 动力学平滑后的速度
             idx_mask
         )
-        #TODO: check set agent fix in cargo according to hinge status
-        follower_idx_mask = self.ref_paths_agent_related.agent_hinge_status.get_latest() # [B, n_agents]
-        target_hinge_info = self.ref_paths_agent_related.agent_target_hinge_short_term # [B, n_agents, 5]
-        for i, agent in enumerate(self.world.agents):
-            if i in self.TRACTOR_SLICE:
-                continue
-            target_hinge_pos = target_hinge_info[:, i, 0, :2] # [B, 2]
-            target_hinge_heading = target_hinge_info[:, i, 1, :2] - target_hinge_info[:, i, 0, :2]
-            target_hinge_theta = torch.atan2(target_hinge_heading[:, 1],target_hinge_heading[:, 0]) # [B]
-            # TODO: vx and vy in target_hinge_info is not correct in visualzation, need check
-            #target_hinge_theta = torch.atan2(target_hinge_info[:, i, 0, 3], target_hinge_info[:, i, 0, 2]) # [B]
-            target_hinge_speed = torch.linalg.norm(target_hinge_info[:, i, 0, 2:4], dim=1) # [B]
-            self._set_pose(
-                agent, 
-                target_hinge_pos, 
-                target_hinge_theta, 
-                target_hinge_speed,
-                follower_idx_mask[:,i]
-            )
+        if self.dock_agent_when_hinged:
+            follower_idx_mask = self.ref_paths_agent_related.agent_hinge_status.get_latest() # [B, n_agents]
+            target_hinge_info = self.ref_paths_agent_related.agent_target_hinge_short_term # [B, n_agents, 5]
+            for i, agent in enumerate(self.world.agents):
+                if i in self.TRACTOR_SLICE:
+                    continue
+                target_hinge_pos = target_hinge_info[:, i, 0, :2] # [B, 2]
+                target_hinge_heading = target_hinge_info[:, i, 1, :2] - target_hinge_info[:, i, 0, :2]
+                target_hinge_theta = torch.atan2(target_hinge_heading[:, 1],target_hinge_heading[:, 0]) # [B]
+                # TODO: vx and vy in target_hinge_info is not correct in visualzation, need check
+                #target_hinge_theta = torch.atan2(target_hinge_info[:, i, 0, 3], target_hinge_info[:, i, 0, 2]) # [B]
+                target_hinge_speed = torch.linalg.norm(target_hinge_info[:, i, 0, 2:4], dim=1) # [B]
+                self._set_pose(
+                    agent, 
+                    target_hinge_pos, 
+                    target_hinge_theta, 
+                    target_hinge_speed,
+                    follower_idx_mask[:,i]
+                )
     def _pure_pursuit_control(self):
         """
         纯跟踪控制器 - 用于batch_size=1时的手动控制
@@ -1674,8 +1657,6 @@ class Scenario(BaseScenario):
         2. 使用PD控制器计算加速度
         3. 手动积分计算下一个状态
         4. 调用_set_pose直接设置状态（绕过VMAS的dynamics）
-
-        注意：必须在pre_step中调用，因为action已在env_process_action中读取完毕
         """
         # 纯跟踪控制器参数
         LOOKAHEAD_DIST = 5.0  # 前瞻距离（米）
@@ -1856,13 +1837,7 @@ class Scenario(BaseScenario):
         # 初始化为 -1
         target_idx = torch.full((B, n_agents), -1, dtype=torch.long, device=device)
         
-        # 优先级配置
-        agent_hinge_priority = {
-            1: (1, [4, 6]),  
-            2: (2, [5, 7])   
-        }
-        
-        for agent_idx, (priority_hinge, backup_hinges) in agent_hinge_priority.items():
+        for agent_idx, (priority_hinge, backup_hinges) in self.agent_hinge_priority.items():
             # --- 安全性检查：防止传入的 hinge_points 维度不足 ---
             max_needed_idx = max([priority_hinge] + backup_hinges)
             if max_needed_idx >= n_hinges:
@@ -1976,129 +1951,6 @@ class Scenario(BaseScenario):
                 self.ref_paths_agent_related.hinge_short_term,
                 self.ref_paths_agent_related.agent_target_hinge_idx
             )# (B,n_agents,n_hinges,n_pts,5) 
-        if self.task_class==TaskClass.SIMPLE_PLATOON:
-            return
-        for i, agent in enumerate(self.followers):
-            docked_mask = self.dock_state[:, i]      # [B] bool
-            if not docked_mask.any():
-                continue
-
-            # 注意：这里的 target_* 是 [B, n_followers, ...]
-            pos_i   = self.target_pos[:, i, :]       # [B, 2]
-            theta_i = self.target_theta[:, i]        # [B]
-
-            self._project_agent_to_pose(
-                agent,
-                pos_i[docked_mask, :],               # [M,2]
-                theta_i[docked_mask],               # [M]
-                mask=docked_mask,                   # [B]
-            )
-
-        # 计时器（可用于奖励）：每步给 docked 的样本累加 dt
-        self.dock_timer += self.dock_state.to(self.dock_timer.dtype) * self.dt
-
-    def compute_latch_targets(self):
-        """
-        写出:
-        self.target_pos   : [B, n_followers, 2]
-        self.target_theta : [B, n_followers]
-        规则:
-        - 若某随动处于 docked 且有有效锚点 id(>=0)，目标=锚点位姿
-        - 否则(自由态或无效 id)，目标=当前车位姿(这样 post_step 的硬投影对自由态不产生影响)
-        """
-        device = self.device
-        B = self.batch_dim
-        nF = len(self.followers)
-
-        # 取出所有随动的当前位姿，拼成张量，方便向量化
-        # pos_f: [B, nF, 2], theta_f: [B, nF]
-        pos_f_list = []
-        theta_f_list = []
-        for ag in self.followers:
-            pos_f_list.append(ag.state.pos)         # [B,2]
-            # 兼容不同版本的朝向字段: rot / angle
-            if hasattr(ag.state, "rot"):
-                theta_f_list.append(ag.state.rot.squeeze(-1))   # [B] - remove last dimension if it's [B,1]
-            elif hasattr(ag.state, "angle"):
-                theta_f_list.append(ag.state.angle.squeeze(-1)) # [B] - remove last dimension if it's [B,1]
-            else:
-                raise AttributeError("Agent.state has no 'rot' or 'angle'")
-        pos_f   = torch.stack(pos_f_list, dim=1).to(device)   # [B,nF,2]
-        theta_f = torch.stack(theta_f_list, dim=1).to(device) # [B,nF]
-
-        # 目标张量初始化为"当前位姿"（自由态默认不动）
-        target_pos   = pos_f.clone()
-        target_theta = theta_f.clone()
-
-        # 锚点表
-        latch_pos   = self.latch_pos_world.to(device)     # [B, nL, 2]
-        latch_theta = self.latch_theta_world.to(device)   # [B, nL]
-        nL = latch_pos.shape[1]
-
-        # 有效(docked 且 id>=0)的掩码
-        dock = self.dock_state.to(device)                 # [B, nF]
-        ids  = self.bound_latch_id.to(device).long()      # [B, nF]
-        valid = dock & (ids >= 0)                         # [B, nF]
-
-        if valid.any():
-            # 为 gather 构造索引
-            # pos: [B,nF,2] <- latch_pos.gather(dim=1, idx=[B,nF,2])
-            idx_pos = ids.clamp(min=0, max=nL-1)[..., None].expand(-1, -1, 2)  # [B,nF,2]
-            sel_pos = torch.gather(latch_pos, dim=1, index=idx_pos)            # [B,nF,2]
-
-            # theta: [B,nF] <- take_along_dim(latch_theta, idx=[B,nF])
-            sel_theta = torch.take_along_dim(latch_theta, ids.clamp(min=0, max=nL-1), dim=1)  # [B,nF]
-
-            # 仅对 valid 的位置/朝向进行覆盖
-            valid_exp = valid.unsqueeze(-1)                                    # [B,nF,1]
-            target_pos   = torch.where(valid_exp, sel_pos,   target_pos)
-            target_theta = torch.where(valid,     sel_theta, target_theta)
-
-        # 缓存输出，供 post_step 使用
-        self.target_pos   = target_pos   # [B, nF, 2]
-        self.target_theta = target_theta # [B, nF]
-
-
-    def _project_agent_to_pose(self, agent, pos_batch: torch.Tensor, theta_batch: torch.Tensor, mask: torch.Tensor):
-        """
-        把该 agent 在 mask==True 的那些 batch 样本的状态(位置/朝向/速度)硬对齐到给定目标:
-        - agent.state.pos[mask] = pos_batch
-        - agent.state.rot/angle[mask] = theta_batch
-        - 速度: 为了稳定，清零(或按需设置为沿切向的目标速度)
-        形状:
-        - agent.state.pos : [B,2]
-        - pos_batch       : [sum(mask), 2]
-        - theta_batch     : [sum(mask)]
-        - mask            : [B] (bool)
-        """
-        if not mask.any():
-            return
-
-        # 取 mask 索引
-        idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [M], M = sum(mask)
-
-        # --- 位置 ---
-        agent.state.pos[idx] = pos_batch.to(agent.state.pos.dtype)
-
-        # --- 朝向 ---
-        if hasattr(agent.state, "rot"):
-            # Ensure theta_batch has the right shape for assignment
-            theta_reshaped = theta_batch.unsqueeze(-1) if theta_batch.dim() == 1 else theta_batch
-            agent.state.rot[idx] = theta_reshaped.to(agent.state.rot.dtype)
-        elif hasattr(agent.state, "angle"):
-            # Ensure theta_batch has the right shape for assignment
-            theta_reshaped = theta_batch.unsqueeze(-1) if theta_batch.dim() == 1 else theta_batch
-            agent.state.angle[idx] = theta_reshaped.to(agent.state.angle.dtype)
-        else:
-            raise AttributeError("Agent.state has no 'rot' or 'angle' to set orientation")
-
-        # --- 线速度/角速度（硬约束：清零最稳；如需更物理，可填入锚点切向速度） ---
-        if hasattr(agent.state, "vel"):
-            # vel: [B,2]
-            agent.state.vel[idx] = 0.0
-        if hasattr(agent.state, "omega"):
-            # 有的实现有角速度标量
-            agent.state.omega[idx] = 0.0
     def get_scenario_info(self):
         """获取场景信息，用于调试和验证"""
         return {
@@ -2108,7 +1960,6 @@ class Scenario(BaseScenario):
             "rod_len": self.rod_len,
             "dt": self.dt,
             "device": str(self.device),
-            "n_latch": self.n_latch
         }
     
     def update_observation_and_normalize(self, agent, agent_index):
@@ -2141,24 +1992,16 @@ class Scenario(BaseScenario):
                 self.distances.boundaries / self.normalizers.distance_lanelet
             )
 
-            short_term = self.ref_paths_agent_related.short_term[...,:2]
-            assert short_term.shape[-2]>=2 # path pts dim
-            ref_vec = short_term[...,1,:]-short_term[...,0,:]
-            ref_vec /= torch.clamp(torch.norm(ref_vec, dim=-1, keepdim=True),1e-5) #BUG FIXED: produce nan observation
-            agents_vel = (
-                torch.stack([a.state.vel for a in self.world.agents], dim=0)
-                .transpose(0, 1)
-                .squeeze(-1)
-            )
-            proj_v = torch.sum(agents_vel * ref_vec, dim=-1)
-            ref_vel = self.ref_paths_agent_related.short_term[:, :, 0, 2]
-            self.observations.error_vel = (proj_v - ref_vel)
-            assert not torch.isnan(self.observations.error_vel).any()
             # 初始化相对间距误差张量，形状为(batch_dim, self.n_agents, 2)
             error_space = torch.zeros(
                 (self.world.batch_dim, self.n_agents, 2), 
                 device=self.world.device, 
                 dtype=torch.float32
+            )
+            error_vel = torch.zeros(
+                (self.world.batch_dim, self.n_agents, 2),
+                device=self.world.device,
+                dtype=torch.float32,
             )
             for i in range(self.n_agents):
                 # 计算与前一辆车的间距误差（第一个车没有前车，保持为0）
@@ -2285,6 +2128,19 @@ class Scenario(BaseScenario):
                             rot_i=rot_i,
                         )
 
+                    ego_longitudinal_velocity = vel_i_others[:, a_i, a_i, 0]
+                    if a_i > 0:
+                        error_vel[:, a_i, 0] = (
+                            vel_i_others[:, a_i, a_i - 1, 0] - ego_longitudinal_velocity
+                        )
+                    if a_i < self.n_agents - 1:
+                        error_vel[:, a_i, 1] = (
+                            vel_i_others[:, a_i, a_i + 1, 0] - ego_longitudinal_velocity
+                        )
+
+                self.observations.error_vel = error_vel
+                assert not torch.isnan(self.observations.error_vel).any()
+
                 # Add new observations & normalize
                 self.observations.past_pos.add(
                     pos_i_others/self.normalizers.pos
@@ -2329,7 +2185,7 @@ class Scenario(BaseScenario):
                     / self.normalizers.action_steering
                 )
 
-    def observe_self(self, agent_index):
+    def observe_self(self, agent_index, return_groups: bool = False):
         """Observe the given agent itself."""
         indexing_tuple_3 = (
             (self.constants.env_idx_broadcasting,)
@@ -2367,51 +2223,73 @@ class Scenario(BaseScenario):
         )
         vel = self.observations.past_vel.get_latest()[indexing_tuple_vel]
         vel_mag = torch.linalg.norm(vel, dim=-1)
-        obs_self = [
-            # [own] velocityself.observations.past_vel
-            vel.reshape(self.world.batch_dim, -1),
-            vel_mag.reshape(self.world.batch_dim, -1),
-            self.observations.past_vel.get_latest()[indexing_tuple_vel].reshape(
-                self.world.batch_dim, -1
+        obs_self_groups = [
+            ("self_vel_local", vel.reshape(self.world.batch_dim, -1)),
+            ("self_speed", vel_mag.reshape(self.world.batch_dim, -1)),
+            (
+                "self_vel_longitudinal",
+                self.observations.past_vel.get_latest()[indexing_tuple_vel].reshape(
+                    self.world.batch_dim, -1
+                ),
             ),
-            self.observations.past_steering.get_latest()[:,agent_index].reshape(
-                self.world.batch_dim, -1
+            (
+                "self_steering",
+                self.observations.past_steering.get_latest()[:,agent_index].reshape(
+                    self.world.batch_dim, -1
+                ),
             ),
-            # self.observations.past_action_acc.get_latest()[:,agent_index].reshape(
-            #     self.world.batch_dim, -1
-            # ),
-            # self.observations.past_action_steering.get_latest()[:,agent_index].reshape(
-            #     self.world.batch_dim, -1
-            # ),
-            # [own] reference and boundary
-            self_short_term[...,2].reshape(self.world.batch_dim, -1) if not self.mask_ref_v else None,
-            self_short_term[...,:2].reshape(self.world.batch_dim, -1),
-            # self_left_boundary_pts.reshape(self.world.batch_dim, -1), 
-            # self_right_boundary_pts.reshape(self.world.batch_dim, -1),
-            self_left_dis.reshape(self.world.batch_dim, -1), 
-            self_right_dis.reshape(self.world.batch_dim, -1),
-            hinge_info.reshape(self.world.batch_dim, -1) \
+            (
+                "self_ref_velocity",
+                self_short_term[...,2].reshape(self.world.batch_dim, -1)
+                if not self.mask_ref_v
+                else None,
+            ),
+            ("self_ref_points", self_short_term[...,:2].reshape(self.world.batch_dim, -1)),
+            ("self_left_boundary_distance", self_left_dis.reshape(self.world.batch_dim, -1)),
+            ("self_right_boundary_distance", self_right_dis.reshape(self.world.batch_dim, -1)),
+            (
+                "self_hinge_info",
+                hinge_info.reshape(self.world.batch_dim, -1)
                 if self.task_class == TaskClass.OCCT_PLATOON
                 else None,
-            # [own] distance
-            self.observations.past_distance_to_ref_path.get_latest()[
-                :, agent_index
-            ].reshape(self.world.batch_dim, -1),
-            self.observations.past_distance_to_left_boundary.get_latest()[
-                :, agent_index
-            ].reshape(self.world.batch_dim, -1),
-            self.observations.past_distance_to_right_boundary.get_latest()[
-                :, agent_index
-            ].reshape(self.world.batch_dim, -1),
-            (self.observations.error_vel[:, agent_index]\
-                /self.normalizers.v).reshape(
-                self.world.batch_dim, -1
             ),
-            (self.observations.error_space.get_latest()[:, agent_index, :]\
-                /self.normalizers.pos[0]).reshape(
-                self.world.batch_dim, -1
+            (
+                "self_distance_to_ref",
+                self.observations.past_distance_to_ref_path.get_latest()[
+                    :, agent_index
+                ].reshape(self.world.batch_dim, -1),
+            ),
+            (
+                "self_distance_to_left_boundary",
+                self.observations.past_distance_to_left_boundary.get_latest()[
+                    :, agent_index
+                ].reshape(self.world.batch_dim, -1),
+            ),
+            (
+                "self_distance_to_right_boundary",
+                self.observations.past_distance_to_right_boundary.get_latest()[
+                    :, agent_index
+                ].reshape(self.world.batch_dim, -1),
+            ),
+            (
+                "self_error_vel",
+                (self.observations.error_vel[:, agent_index] / self.normalizers.error_v).reshape(
+                    self.world.batch_dim, -1
+                ),
+            ),
+            (
+                "self_error_space",
+                (self.observations.error_space.get_latest()[:, agent_index, :] / self.normalizers.error_pos).reshape(
+                    self.world.batch_dim, -1
+                ),
             ),
         ]
+        obs_self_groups = [
+            (name, tensor) for name, tensor in obs_self_groups if tensor is not None
+        ]
+        obs_self = [tensor for _, tensor in obs_self_groups]
+        if return_groups:
+            return obs_self, obs_self_groups
         return obs_self
     
     def observe_other_agents(self, agent_index):
@@ -2596,7 +2474,7 @@ class Scenario(BaseScenario):
         )  # [batch_size, -1]
 
         return obs_other_agents
-    def observe_other_agents_platoon(self, agent_index):
+    def observe_other_agents_platoon(self, agent_index, return_groups: bool = False):
         """Observe surrounding agents (按agent聚合特征排列)"""
         # Each agent observes only a fixed number of nearest agents
         nearing_agents_distances, nearing_agents_indices = torch.topk(
@@ -2620,12 +2498,20 @@ class Scenario(BaseScenario):
             indexing_tuple_1
         ]  # [batch_size, n_nearing_agents]
 
-        obs_speed_other_agents = torch.stack([torch.linalg.norm(self.observations.past_vel.get_latest(i+1)[
-            indexing_tuple_1
-        ],dim=-1) for i in range(self.observations.n_observed_steps)],dim=-1)  # [batch_size, n_nearing_agents, n_observed_steps]
-        
-        speed_diff = obs_speed_other_agents[..., 1:] - obs_speed_other_agents[..., :-1]  # 帧间速度差 [batch, n_nearing, n_steps-1]
-        obs_speed_delta_other_agents = torch.cat([torch.zeros_like(speed_diff[..., :1]), speed_diff], dim=-1)  # 补0对齐维度 [batch, n_nearing, n_steps]
+        relative_longitudinal_velocity_history = self.get_local_relative_longitudinal_velocity_history(
+            agent_index, indexing_tuple_1
+        )  # [batch_size, n_nearing_agents, n_observed_steps]
+        relative_acceleration_history = torch.cat(
+            [
+                torch.zeros_like(relative_longitudinal_velocity_history[..., :1]),
+                (
+                    relative_longitudinal_velocity_history[..., 1:]
+                    - relative_longitudinal_velocity_history[..., :-1]
+                )
+                / self.dt,
+            ],
+            dim=-1,
+        )
 
         # Distances to nearing agents
         obs_distance_other_agents = (
@@ -2637,23 +2523,46 @@ class Scenario(BaseScenario):
         )  # [batch_size, n_nearing_agents]
 
         # -------------------------- 核心修改：按agent聚合特征 --------------------------
-        # 1. 先将每个agent的所有特征在最后一维拼接（单个agent的pos+rot+speed+speed_delta+distance）
+        # 1. 先将每个agent的所有特征在最后一维拼接（单个agent的pos+rot+rel_long_vel+rel_acc+distance）
         # 先统一每个特征的维度为 [batch, n_nearing, feat_dim]
         obs_pos = obs_pos_other_agents  # [batch, n_nearing, 2]
         obs_rot = obs_rot_other_agents.unsqueeze(-1)  # [batch, n_nearing, 1]（扩维对齐）
-        obs_speed = obs_speed_other_agents[..., -1:].reshape(self.world.batch_dim, self.observations.n_nearing_agents, -1)  # [batch, n_nearing, 1]（取最后一帧速度）
-        obs_speed_delta = obs_speed_delta_other_agents.reshape(self.world.batch_dim, self.observations.n_nearing_agents, -1)  # [batch, n_nearing, n_steps]
+        obs_relative_longitudinal_velocity = (
+            relative_longitudinal_velocity_history[..., -1:]
+            / self.obs_relative_velocity_scale
+        ).reshape(self.world.batch_dim, self.observations.n_nearing_agents, -1)
+        obs_relative_acceleration = (
+            relative_acceleration_history / self.obs_relative_acceleration_scale
+        ).reshape(self.world.batch_dim, self.observations.n_nearing_agents, -1)
         obs_distance = obs_distance_other_agents.unsqueeze(-1)  # [batch, n_nearing, 1]（扩维对齐）
 
-        # 2. 拼接单个agent的所有特征：[pos(2) + rot(1) + speed(1) + speed_delta(n_steps) + distance(1)]
+        # 2. 拼接单个agent的所有特征：[pos(2) + rot(1) + rel_long_vel(1) + rel_acc(n_steps) + distance(1)]
         single_agent_feat = torch.cat([
-            obs_pos, obs_rot, obs_speed, obs_speed_delta, obs_distance
+            obs_pos,
+            obs_rot,
+            obs_relative_longitudinal_velocity,
+            obs_relative_acceleration,
+            obs_distance,
         ], dim=-1)  # [batch, n_nearing, total_feat_per_agent]
 
         # 3. 将所有agent的特征按顺序拼接（agent1的所有特征 → agent2的所有特征 → ...）
         # 先调整维度为 [batch, n_nearing * total_feat_per_agent]
         obs_other_agents = single_agent_feat.reshape(self.world.batch_dim, -1)
-
+        obs_other_agent_groups = [
+            ("others_pos", obs_pos.reshape(self.world.batch_dim, -1)),
+            ("others_rot", obs_rot.reshape(self.world.batch_dim, -1)),
+            (
+                "others_relative_longitudinal_velocity",
+                obs_relative_longitudinal_velocity.reshape(self.world.batch_dim, -1),
+            ),
+            (
+                "others_relative_acceleration",
+                obs_relative_acceleration.reshape(self.world.batch_dim, -1),
+            ),
+            ("others_distance", obs_distance.reshape(self.world.batch_dim, -1)),
+        ]
+        if return_groups:
+            return obs_other_agents, obs_other_agent_groups
         return obs_other_agents
     def observation(self, agent: Agent):
         agent_index = self.world.agents.index(agent)
@@ -2662,15 +2571,22 @@ class Scenario(BaseScenario):
 
         # Observation of other agents
         #obs_other_agents = self.observe_other_agents(agent_index)
-        obs_other_agents = self.observe_other_agents_platoon(agent_index) # simplify others observation
+        obs_other_agents, obs_other_agent_groups = self.observe_other_agents_platoon(
+            agent_index, return_groups=True
+        ) # simplify others observation
 
-        obs_self = self.observe_self(agent_index)
+        obs_self, obs_self_groups = self.observe_self(agent_index, return_groups=True)
 
         obs_self.append(obs_other_agents)  # Append the observations of other agents
 
         obs_all = [o for o in obs_self if o is not None]  # Filter out None values
 
         obs = torch.hstack(obs_all)  # Convert from list to tensor
+        if self.enable_obs_audit:
+            self._maybe_print_obs_audit(
+                agent_index,
+                obs_self_groups + obs_other_agent_groups + [("obs_total", obs)],
+            )
 
         check_validity(self.observations)
         check_validity(self.ref_paths_agent_related)
@@ -2683,6 +2599,72 @@ class Scenario(BaseScenario):
         else:
             # Return without sensor noise
             return obs
+    def _get_obs_audit_step(self) -> int:
+        if hasattr(self, "timer") and hasattr(self.timer, "step"):
+            return int(self.timer.step.max().item())
+        return int(self.env_current_step.max().item())
+    def _format_obs_audit_stats(self, obs_tensor: Tensor, previous_tensor: Optional[Tensor]):
+        flat = obs_tensor.detach().reshape(-1).to(dtype=torch.float32)
+        abs_flat = flat.abs()
+        flat_cpu = flat.cpu()
+        quantiles = torch.quantile(
+            flat_cpu,
+            torch.tensor([0.01, 0.50, 0.99], dtype=torch.float32),
+        )
+        stats = {
+            "dim": int(obs_tensor.shape[-1]),
+            "mean": flat.mean().item(),
+            "std": flat.std(unbiased=False).item() if flat.numel() > 1 else 0.0,
+            "mean_abs": abs_flat.mean().item(),
+            "max_abs": abs_flat.max().item(),
+            "p01": quantiles[0].item(),
+            "p50": quantiles[1].item(),
+            "p99": quantiles[2].item(),
+            "small_frac": (
+                (abs_flat < self.obs_audit_small_threshold).to(dtype=torch.float32).mean().item()
+            ),
+            "large_frac": (
+                (abs_flat > self.obs_audit_large_threshold).to(dtype=torch.float32).mean().item()
+            ),
+            "delta_std": float("nan"),
+        }
+        if previous_tensor is not None and previous_tensor.shape == obs_tensor.shape:
+            delta = (obs_tensor.detach() - previous_tensor).reshape(-1).to(dtype=torch.float32)
+            stats["delta_std"] = delta.std(unbiased=False).item() if delta.numel() > 1 else 0.0
+        return stats
+    def _maybe_print_obs_audit(self, agent_index: int, observation_groups: List[Tuple[str, Tensor]]):
+        if agent_index != self.obs_audit_agent_index:
+            return
+
+        current_step = self._get_obs_audit_step()
+        should_log = (
+            current_step > 0
+            and self.obs_audit_interval > 0
+            and current_step % self.obs_audit_interval == 0
+            and current_step != self.obs_audit_last_logged_step
+        )
+
+        if should_log:
+            print(
+                f"\n[OBS_AUDIT] step={current_step} agent={agent_index} "
+                f"small<{self.obs_audit_small_threshold:g} large>{self.obs_audit_large_threshold:g}"
+            )
+            for name, tensor in observation_groups:
+                previous_tensor = self.obs_audit_prev_groups.get(name)
+                stats = self._format_obs_audit_stats(tensor, previous_tensor)
+                print(
+                    f"  - {name:34s} dim={stats['dim']:4d} "
+                    f"mean={stats['mean']:+.3e} std={stats['std']:.3e} "
+                    f"|x|mean={stats['mean_abs']:.3e} |x|max={stats['max_abs']:.3e} "
+                    f"p01/p50/p99=({stats['p01']:+.3e}, {stats['p50']:+.3e}, {stats['p99']:+.3e}) "
+                    f"small={stats['small_frac']:.2%} large={stats['large_frac']:.2%} "
+                    f"delta_std={stats['delta_std']:.3e}"
+                )
+            print("[OBS_AUDIT] end\n")
+            self.obs_audit_last_logged_step = current_step
+
+        for name, tensor in observation_groups:
+            self.obs_audit_prev_groups[name] = tensor.detach().clone()
     def get_target_hinge_status(self, agent_index, ready_n=None):
         #hinge_short_term = self.ref_paths_agent_related.hinge_short_term[:, agent_index] # [B, n_points, 4]
         hinge_short_term = self.ref_paths_agent_related.agent_target_hinge_short_term[:, agent_index] # [B, n_points, 5]
@@ -2692,6 +2674,24 @@ class Scenario(BaseScenario):
         # 0=先0后1(过完弯），2=纯1(直道) is_block(不是反复可铰接)
         ready_to_hinge = (((block_order==0) | (block_order==2)) & is_block)
         return ready_to_hinge
+    def get_local_relative_longitudinal_velocity_history(self, agent_index, indexing_tuple_1):
+        n_observed_steps = int(self.observations.n_observed_steps.item())
+        other_local_vel_history = torch.stack(
+            [
+                self.observations.past_vel.get_latest(i + 1)[indexing_tuple_1]
+                for i in range(n_observed_steps)
+            ],
+            dim=-1,
+        ) * self.normalizers.v
+        ego_local_vel_history = torch.stack(
+            [
+                self.observations.past_vel.get_latest(i + 1)[:, agent_index, agent_index]
+                for i in range(n_observed_steps)
+            ],
+            dim=-1,
+        ) * self.normalizers.v
+        return other_local_vel_history[..., 0, :] - ego_local_vel_history[:, None, 0, :]
+    
     def reward(self, agent: Agent):
         agent_index = self.world.agents.index(agent)
         if agent_index == 0:
@@ -2707,6 +2707,11 @@ class Scenario(BaseScenario):
         #print(f"update_state_before_rewarding, agent_index: {agent_index}, time: {t1-t0:.6f}s")
     
         if self.task_class == TaskClass.OCCT_PLATOON and agent_index in self.TRACTOR_SLICE:
+            # copy reward from follower to self.TRACTOR_SLICE agent
+            for r in reward_details.keys():
+                mean_reward = torch.mean(reward_details[r][:,self.HINGE_FIRST_INDEX+1:self.HINGE_LAST_INDEX],dim=-1)
+                reward_details[r][:,0] = mean_reward
+                reward_details[r][:,self.n_agents-1] = mean_reward
             self.update_state_after_rewarding(agent_index)
             return self.rew
         # [penalty] close to other agents
@@ -2719,7 +2724,6 @@ class Scenario(BaseScenario):
             torch.sum(mutual_distance_exp_fcn, dim=1) * self.penalties.near_other_agents
         )
         reward_details["penalty_near_other_agents"][:,agent_index] = penalty_near_other_agents
-        self.rew += penalty_near_other_agents
 
 
         # [penalty] changing steering too quick
@@ -2742,7 +2746,6 @@ class Scenario(BaseScenario):
         else:
             penalty_change_steering = 0.0
         reward_details["penalty_change_steering"][:,agent_index] = penalty_change_steering
-        self.rew += penalty_change_steering
 
 
         # [penalty] changing acc too quick
@@ -2767,7 +2770,6 @@ class Scenario(BaseScenario):
         else:
             penalty_change_acc = 0.0
         reward_details["penalty_change_acc"][:,agent_index] = penalty_change_acc
-        self.rew += penalty_change_acc
 
         # [penalty] colliding with other agents
         is_collide_with_agents = self.collisions.with_agents[:, agent_index]
@@ -2775,7 +2777,6 @@ class Scenario(BaseScenario):
             is_collide_with_agents.any(dim=-1) * self.penalties.collide_with_agents
         )
         reward_details["penalty_collide_with_agents"][:,agent_index] = penalty_collide_with_agents
-        self.rew += penalty_collide_with_agents
 
         # [penalty] colliding with lanelet boundaries
         is_collide_with_lanelets = self.collisions.with_lanelets[:, agent_index]
@@ -2783,7 +2784,6 @@ class Scenario(BaseScenario):
             is_collide_with_lanelets * self.penalties.collide_with_boundaries
         )
         reward_details["penalty_outside_boundaries"][:,agent_index] = penalty_outside_boundaries
-        self.rew += penalty_outside_boundaries
 
         # [penalty] close to lanelet boundaries
         current_lane_width = torch.linalg.norm(self.ref_paths_agent_related.nearing_points_left_boundary[:, agent_index, 1] -\
@@ -2797,7 +2797,6 @@ class Scenario(BaseScenario):
             * self.penalties.near_boundary
         )
         reward_details["penalty_near_boundary"][:,agent_index] = penalty_near_boundary
-        self.rew += penalty_near_boundary
 
         ref_points_vecs = self.ref_paths_agent_related.short_term[:, agent_index, 1:, 0:2] -\
               self.ref_paths_agent_related.short_term[:, agent_index, :-1, 0:2] 
@@ -2809,7 +2808,6 @@ class Scenario(BaseScenario):
             * self.penalties.backward
         )
         reward_details["penalty_backward"][:,agent_index] = backward_penalty
-        self.rew += backward_penalty
 
         # [reward] forward movement
         latest_state = self.state_buffer.get_latest(n=1)
@@ -2821,27 +2819,23 @@ class Scenario(BaseScenario):
         move_projected_weighted = torch.matmul(
             move_projected, self.rewards.weighting_ref_directions
         )  # Put more weights on nearing reference points
-
+        # [reward] hinge tracking
         reward_progress = (
             move_projected_weighted
             / (agent.max_speed * self.world.dt)
             * self.rewards.progress
         )
         reward_details["reward_progress"][:,agent_index] = reward_progress
-        self.rew += reward_progress  # Relative to the maximum possible movement
 
         # [reward] high velocity
         reward_vel = v_proj / agent.max_speed * self.rewards.higth_v
         reward_details["reward_vel"][:,agent_index] = reward_vel
-        self.rew += reward_vel
 
         # [reward] reach goal
         reward_goal = (
             self.collisions.with_exit_segments[:, agent_index] * self.rewards.reach_goal
         )
         reward_details["reward_goal"][:,agent_index] = reward_goal
-        self.rew += reward_goal  # Relative to the maximum possible movement
-
         # [reward] 横向跟踪
         ref_vector = torch.mean(ref_points_vecs,dim=1) # or ref_points_vecs[:,0,:]
         ref_vector_normalized = ref_vector / (torch.norm(ref_vector, dim=-1, keepdim=True) + 1e-8)
@@ -2850,95 +2844,94 @@ class Scenario(BaseScenario):
         max_delta_angle=torch.deg2rad(torch.tensor(15, device=self.device, dtype=torch.float32))
         constant_k=1/(1-torch.cos(max_delta_angle))
         costant_b=1-constant_k
-        reward_track_ref_heading = torch.clamp(self.rewards.reward_track_ref_heading * \
-                                   (constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b),-1.0,1.0)
+        reward_track_ref_heading = 1 - torch.clamp(self.rewards.reward_track_ref_heading * \
+                                (constant_k*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)+costant_b),-1.0,1.0)
         # reward_track_ref_heading = - self.rewards.reward_track_ref_heading * \
         #                            torch.abs(torch.acos(torch.clamp(
         #                                torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0
         #                                ))/max_delta_angle)
         reward_details["reward_track_ref_heading"][:,agent_index] =  reward_track_ref_heading
-        self.rew += reward_track_ref_heading
-
-        # [reward] 编队跟踪
-        agent_raw_vel = torch.linalg.norm(agent.state.vel, dim=-1)
-        agent_vel = agent_raw_vel*torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1)
-        if self.task_class==TaskClass.OCCT_PLATOON:
-            # way1
-            # ref_vel1 = torch.linalg.norm(self.world.agents[agent_index-1].state.vel, dim=-1)
-            # ref_vel2 = torch.linalg.norm(self.world.agents[agent_index+1].state.vel, dim=-1)
-            # dis_from_front = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 0]+self.platoon_space_batch-self.agent_length,min=0.01)
-            # dis_from_rear = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 1]+self.platoon_space_batch-self.agent_length,min=0.01)
-            # ref_vel = (ref_vel1+ref_vel2)/2
-            # ref_vel = (dis_from_rear*ref_vel1+dis_from_front*ref_vel2)/(dis_from_front+dis_from_rear)
-            # error_vel = agent_raw_vel - ref_vel
-            # way2
-            ref_vel1 = torch.linalg.norm(self.world.agents[0].state.vel, dim=-1)
-            ref_vel2 = torch.linalg.norm(self.world.agents[self.n_agents-1].state.vel, dim=-1)
-            ref_vel = (ref_vel1+ref_vel2)/2
-            error_vel = agent_raw_vel - ref_vel
-            # # way3
-            # error_vel = agent_raw_vel - agent_raw_vel
+        hinge_status = self.get_target_hinge_status(agent_index)# lookahead hinge
+        if self.task_class==TaskClass.SIMPLE_PLATOON or (self.task_class==TaskClass.OCCT_PLATOON):
+            # [reward] 编队跟踪
+            error_vel_sq = torch.mean(
+                self.observations.error_vel[:, agent_index] ** 2,
+                dim=-1,
+            )
+            if self.task_class==TaskClass.OCCT_PLATOON:
+                # way1
+                # ref_vel1 = torch.linalg.norm(self.world.agents[agent_index-1].state.vel, dim=-1)
+                # ref_vel2 = torch.linalg.norm(self.world.agents[agent_index+1].state.vel, dim=-1)
+                # dis_from_front = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 0]+self.platoon_space_batch-self.agent_length,min=0.01)
+                # dis_from_rear = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 1]+self.platoon_space_batch-self.agent_length,min=0.01)
+                # ref_vel = (ref_vel1+ref_vel2)/2
+                # ref_vel = (dis_from_rear*ref_vel1+dis_from_front*ref_vel2)/(dis_from_front+dis_from_rear)
+                # error_vel = agent_raw_vel - ref_vel
+                # way2
+                space_errors = torch.mean(torch.abs(self.observations.error_space.get_latest(n=1)[:, agent_index, :]),dim=-1) # consider front and rear space
+                # # way3
+                # error_vel = agent_raw_vel - agent_raw_vel
+            else:
+                hinge_status =  False
+                #ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
+                space_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0] # only consider front space
+            reward_track_ref_vel = torch.clamp(
+                - self.rewards.reward_track_ref_vel * error_vel_sq,
+                min=-1.0,
+            ) * torch.logical_not(hinge_status)
+            reward_details["reward_track_ref_vel"][:,agent_index] =  reward_track_ref_vel
+            reward_track_ref_space = torch.clamp(- self.rewards.reward_track_ref_space * space_errors**2, min=-1.0) * torch.logical_not(hinge_status)
+            reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
+            ratio=0.7
+            ratio_list = [0.7,0.3]
+            weighted_ref_dis = 0
+            for idx, ratio in enumerate(ratio_list):
+                weighted_ref_dis += self.distances.lookahead_pts[:, agent_index, idx]
+            #reward_track_ref_path = 1 - self.rewards.reward_track_ref_path * torch.clamp((weighted_ref_dis-0.05), min=0)
+            reward_track_ref_path = torch.clamp(- self.rewards.reward_track_ref_path * weighted_ref_dis**2, min=-1.0) * torch.logical_not(hinge_status)
+            reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
+            reward_details["reward_track_hinge"][:, agent_index] = 0
+            reward_details["reward_hinge"][:, agent_index] = 0
         else:
-            #ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
-            leader_index = 0
-            leader_vel = torch.linalg.norm(self.world.agents[leader_index].state.vel, dim=-1)
-            error_vel = agent_vel - leader_vel
-        # if (agent_index==0 and self.task_class==TaskClass.SIMPLE_PLATOON) or self.task_class==TaskClass.OCCT_PLATOON:
-        #     reward_track_ref_vel = torch.clamp(1 - self.rewards.reward_track_ref_vel* (error_vel)**2, min=0)
-        # else:
-        #     reward_track_ref_vel = 0.0
-        reward_track_ref_vel = torch.clamp(1 - self.rewards.reward_track_ref_vel* error_vel**2, min=0)
-        reward_details["reward_track_ref_vel"][:,agent_index] =  reward_track_ref_vel
-        self.rew += reward_track_ref_vel
-        # if (agent_index!=0 and self.task_class==TaskClass.SIMPLE_PLATOON) or self.task_class==TaskClass.OCCT_PLATOON:
-        #     # last_space_errors = self.observations.error_space.get_latest(n=2)[:, agent_index, 0] # only consider front space
-        #     space_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0]
-        #     reward_track_ref_space = torch.clamp(1 - self.rewards.reward_track_ref_space * space_errors**2, min=0)
-        # else:
-        #     reward_track_ref_space = 0.0
-        space_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0]
-        reward_track_ref_space = torch.clamp(1 - self.rewards.reward_track_ref_space * space_errors**2, min=0)
-        reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
-        self.rew += reward_track_ref_space
-
-        if self.task_class==TaskClass.OCCT_PLATOON:
             # [reward] hinge tracking
-            hinge_status = self.get_target_hinge_status(agent_index)# lookahead hinge
-            agent_desire_pos = self.get_lookahead_agent_pos(agent_index, self.hinge_lookahead_idx)  # [batch_dim, 2]
-            # current_hinge_pos = hinge_points[:, 0, :] # dont know why use short term has constant error
-            hinge_desire_pos = self.get_target_hinge_pos(agent_index, self.hinge_lookahead_idx) # [batch_dim, 2]
-            desire_distance = torch.norm(
-                hinge_desire_pos - agent_desire_pos, dim=-1
-            )  # shape: [batch_dim]
-            reward_track_hinge =  self.rewards.reward_track_hinge * torch.clamp(1 -  desire_distance**2, min=0) * hinge_status
+            ratio_list = [0.7,0.3] # 0.7 for 1st pts, 0.3 for 2nd
+            weight_distance = 0
+            for idx, ratio in enumerate(ratio_list):
+                agent_desire_pos = self.get_lookahead_agent_pos(agent_index, idx)  # [batch_dim, 2]
+                hinge_desire_pos = self.get_target_hinge_pos(agent_index, idx) # [batch_dim, 2]
+                desire_distance = torch.norm(
+                    hinge_desire_pos - agent_desire_pos, dim=-1
+                )  # shape: [batch_dim]
+                weight_distance += ratio*desire_distance
+            reward_track_hinge = torch.clamp(- self.rewards.reward_track_hinge * weight_distance**2, min=-1.0) * hinge_status
             reward_details["reward_track_hinge"][:, agent_index] = reward_track_hinge
-            self.rew += reward_track_hinge
-            reward_hinge = self.rewards.reward_hinge * self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index]
+            hinge_once = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index] and \
+                  (not self.ref_paths_agent_related.agent_hinge_status.get_latest(n=2)[:, agent_index])
+            reward_hinge = self.rewards.reward_hinge * hinge_once * hinge_status
             reward_details["reward_hinge"][:, agent_index] = reward_hinge
-            self.rew += reward_hinge
+            reward_details["reward_track_ref_vel"][:,agent_index] =  0
+            reward_details["reward_track_ref_space"][:,agent_index] = 0
+            reward_details["reward_track_ref_path"][:,agent_index] = 0
 
-        ratio=0.7
-        weighted_ref_dis = ratio*self.distances.lookahead_pts[:, agent_index, 0]+(1-ratio)*self.distances.lookahead_pts[:, agent_index, 1]
-        #reward_track_ref_path = 1 - self.rewards.reward_track_ref_path * torch.clamp((weighted_ref_dis-0.05), min=0)
-        reward_track_ref_path = 1 - self.rewards.reward_track_ref_path * weighted_ref_dis**2
-        reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
-        self.rew += reward_track_ref_path
-        reward_details["reward_total"][:,agent_index] = self.rew
+        
         t2=time.time()
         # hinge之后就屏蔽奖励
-        if self.task_class==TaskClass.OCCT_PLATOON:
-            last_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=2)[:, agent_index]
-            current_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index]
-            agent_is_fixed = last_hinge_status & current_hinge_status
-            self.rew = self.rew * ~agent_is_fixed
-            for r in reward_details.keys():
-                reward_details[r][:,agent_index] = reward_details[r][:,agent_index] * ~agent_is_fixed
+        # if self.task_class==TaskClass.OCCT_PLATOON:
+        #     last_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=2)[:, agent_index]
+        #     current_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index]
+        #     agent_is_fixed = last_hinge_status & current_hinge_status
+        #     self.rew = self.rew * ~agent_is_fixed
+        #     for r in reward_details.keys():
+        #         reward_details[r][:,agent_index] = reward_details[r][:,agent_index] * ~agent_is_fixed
         #print(f"reward calc, agent_index: {agent_index}, time: {t2-t1:.6f}s")
         # [update] previous positions and short-term reference paths
         self.update_state_after_rewarding(agent_index)
         t3=time.time()
         #print(f"update_state_after_rewarding, agent_index: {agent_index}, time: {t3-t2:.6f}s")
-
+        for r in reward_details.keys():
+            if r!="reward_total":
+                self.rew+=reward_details[r][:,agent_index]
+        reward_details["reward_total"][:,agent_index] = self.rew
         self.reward_update_time += t3-t0
         #print(f"reward_update_time_total: {self.reward_update_time:.6f}s")
         return self.rew
@@ -3098,24 +3091,22 @@ class Scenario(BaseScenario):
                     env_j=slice(None),
                     hinge_edge_buffer=self.agent_width/2,
                     corner_s=self.road.batch_corner_s,
-                    hinge_relative_pos=self.hinge_relative_pos)
+                    hinge_relative_pos=self.hinge_relative_pos,
+                    )
                 hinge_info = self.ref_paths_agent_related.agent_target_hinge_short_term
                 hinge_pos = hinge_info[...,0,:2]
                 hinge_vel = hinge_info[...,0,2:4]
                 hinge_vel_mag =  torch.linalg.norm(hinge_vel, dim=-1, keepdim=True)
                 target_hinge_status = hinge_info[...,0,-1].to(dtype=torch.bool)
-                agent_pos = self.ref_paths_agent_related.short_term[...,0,:2]
-                agent_vel = self.ref_paths_agent_related.short_term[...,0,2]
-                agent_heading_vector = self.ref_paths_agent_related.short_term[...,1,:2] - self.ref_paths_agent_related.short_term[...,0,:2]
-                agent_tangent = agent_heading_vector / torch.linalg.norm(agent_heading_vector, dim=-1, keepdim=True)
-                #print(f"hinge_info shape:{hinge_info.shape}, hinge_vel shape{hinge_vel.shape}")
+                agent_pos = torch.stack([self.world.agents[i].state.pos for i in range(self.n_agents)], dim=1)
+                agent_vel = torch.stack([self.world.agents[i].state.vel for i in range(self.n_agents)], dim=1)
+                agent_vel_mag = torch.linalg.norm(agent_vel, dim=-1, keepdim=True)
+                agent_tangent = agent_vel / agent_vel_mag
                 hinge_tangent = hinge_vel / hinge_vel_mag
                 agent_pos_legal = torch.linalg.norm(agent_pos - hinge_pos, dim=-1) < 0.1
-                #print(f"hinge_tangent shape:{hinge_tangent.shape}, agent_tangent shape:{agent_tangent.shape}")
                 agent_heading_legal = (hinge_tangent*agent_tangent).sum(dim=-1) > torch.cos(torch.tensor(5/180*torch.pi, device=self.world.device))
-                agent_vel_legal = torch.abs(agent_vel-hinge_vel_mag[...,0]) < 0.1
+                agent_vel_legal = (torch.abs(agent_vel_mag-hinge_vel_mag) < 0.1).squeeze(-1)
                 agent_legal_to_hinge = agent_pos_legal & agent_heading_legal & agent_vel_legal
-                #agent_hinge_status = ((self.ref_paths_agent_related.agent_hinge_status.get_latest()).to(dtype=torch.bool) | agent_legal_to_hinge) & target_hinge_status
                 agent_hinge_status = agent_legal_to_hinge & target_hinge_status
                 self.ref_paths_agent_related.agent_hinge_status.add(agent_hinge_status)
                 
@@ -3440,12 +3431,13 @@ class Scenario(BaseScenario):
             #acc,steering = action[0],action[1]
             # text info render
             # [x,y,v,a]
+            space_errors = torch.mean(torch.abs(self.observations.error_space.get_latest(n=1)[env_index, agent_i, :]),dim=-1).detach().cpu()
             geom = rendering.TextLine(
-                #text=f"a{agent_i}-[{pos[0]:.2f},{pos[1]:.2f},{v:.2f},{acc:.2f}]",
-                text=f"a{agent_i} to h{target_hinge_idx}",
+                text=f"a{agent_i}->h{target_hinge_idx}:[{pos[0]:.1f},{pos[1]:.1f},{v:.1f},{acc:.1f},{space_errors:.1f}]",
+                #text=f"a{agent_i} to h{target_hinge_idx}",
                 x=2.5*(pos[0] - pos_origin[0]) * self.resolution_factor + self.viewer_size[0]/2,
                 y=2.5*(pos[1] - pos_origin[1]) * self.resolution_factor + self.viewer_size[1]/2,
-                font_size=14,
+                font_size=int(2*self.resolution_factor),
             )
             xform = rendering.Transform()
             geom.add_attr(xform)
@@ -3535,8 +3527,8 @@ class Scenario(BaseScenario):
                 geom = rendering.TextLine(
                     text=f"h{hinge_i}",
                     x=2.5*(pos[0] - pos_origin[0]) * self.resolution_factor + self.viewer_size[0]/2,
-                    y=2.5*(pos[1] - pos_origin[1]) * self.resolution_factor + self.viewer_size[1]/2-10,
-                    font_size=10,
+                    y=2.5*(pos[1] - pos_origin[1]) * self.resolution_factor + self.viewer_size[1]/2-2*self.resolution_factor,
+                    font_size=int(2*self.resolution_factor),
                 )
                 xform = rendering.Transform()
                 geom.add_attr(xform)
@@ -3601,31 +3593,6 @@ class Scenario(BaseScenario):
                 )
                 compartment_line.set_color(*Color.BLACK.value, alpha=0.9)
                 geoms.append(compartment_line)
-
-            # hinge rendering
-            if hasattr(self, "latch_pos_world") and hasattr(self, "n_latch"):
-                latch_xy = self.latch_pos_world[env_index]  # [nL,2]
-                nL = int(self.n_latch)
-
-                # 计算占用：该 env 下，是否有随动 docked 且绑定此 latch_id
-                occ = torch.zeros(nL, dtype=torch.bool, device=latch_xy.device)
-                if hasattr(self, "bound_latch_id") and hasattr(self, "dock_state"):
-                    ids = self.bound_latch_id[env_index]    # [F]
-                    dkd = self.dock_state[env_index]        # [F] bool
-                    for j in range(nL):
-                        occ[j] = torch.any((ids == j) & dkd)
-
-                for j in range(nL):
-                    x, y = latch_xy[j].detach().cpu().tolist()
-                    circle = rendering.make_circle(radius=0.15, filled=True)
-                    xform = rendering.Transform()
-                    circle.add_attr(xform)
-                    xform.set_translation(float(x), float(y))
-                    if bool(occ[j].item()):
-                        circle.set_color(*(0.2, 0.8, 0.2), alpha=1.0)  # 绿色：占用
-                    else:
-                        circle.set_color(*(0.5, 0.5, 0.5), alpha=0.9)  # 灰色：空闲
-                    geoms.append(circle)
         return geoms
     def extra_render_extend_road(self, env_index: int = 0):
         """
@@ -3739,7 +3706,7 @@ if __name__ == "__main__":
     render_interactively(
         __file__,
         control_two_agents=True,
-        display_info=True,
+        display_info=False,
         seed=None,
         agent_index_focus=AGENT_INDEX_FOCUS,
     )
