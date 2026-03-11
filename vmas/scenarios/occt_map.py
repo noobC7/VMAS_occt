@@ -411,7 +411,7 @@ class OcctCRMap(MapBase):
         # 处理CommonRoad地图
         if cr_map_dir.split('/')[-1]=="chapter4":
             self._cr_map_process(cr_map_dir)
-            #self._cr_map_process_chapter4(cr_map_dir)
+            #self._cr_map_process_chapter4(cr_map_dir,extend_left_boundary=True)
         else:
             self._cr_map_process(cr_map_dir)
         
@@ -807,6 +807,8 @@ class OcctCRMap(MapBase):
                 # if not ((path_ids[0]==177 and path_ids[-1]==129) or \
                 #    (path_ids[0]==153 and path_ids[-1]==175)):
                 #     continue
+                if (path_ids[0]==112 and path_ids[-1]==129):
+                    continue
                 if map_name == "USA_Roundabout_EP_repaired.xml":
                     if (path_ids[-1]==124) or \
                         (path_ids[0]==100 and path_ids[-1]==169) or \
@@ -1042,6 +1044,7 @@ class OcctCRMap(MapBase):
                     ):
                         path_data[key].extend([v.tolist() for v in vertices[slice_range]])
                 raw_left_vertices = np.array(path_data["left_vertices"])
+                raw_right_vertices = np.array(path_data["right_vertices"])
                 # calculate correspond boundary pts
                 center_vertices = np.array(path_data["center_vertices"])
                 center_vertices = smooth_road_centerline(
@@ -1053,7 +1056,7 @@ class OcctCRMap(MapBase):
                 right_vertices = np.array(path_data["right_vertices"])
                 # revise road boundary for [127, 128, 131, 133, 136, 137, 142, 145, 147, 151, 106, 102]
                 if path_ids[0]==127 and extend_left_boundary:
-                    left_vertices = torch.tensor(self.path_library[0]["raw_left_vertices"]).to(right_vertices.device)
+                    left_vertices = torch.tensor(self.path_library[0]["raw_right_vertices"]).to(right_vertices.device)
                     left_vertices = torch.flip(left_vertices, dims=[0])
 
                     right_vertices, _ = self._resample_path(right_vertices, len(center_vertices))
@@ -1106,11 +1109,15 @@ class OcctCRMap(MapBase):
                 # TODO: how the define hinge reward and status
                 # we want to make hinge ready only pass the corner, but cant make sure all hinge has 0 status through the corner
                 # make hinge status consistent through the corner
+                corner_begin_s = center_cum_len[-1]
+                corner_end_s = center_cum_len[0]
                 for hinge_idx in range(hinge_status.shape[0]):
                     if (hinge_status[hinge_idx]==0).any():#exclude first and last hinge pts
                         begin_idx = torch.where(hinge_status[hinge_idx] == 0)[0][0]
                         pass_corner_idx = torch.where(hinge_status[hinge_idx] == 0)[0][-1]
                         hinge_status[hinge_idx, begin_idx:pass_corner_idx] = 0
+                        corner_begin_s = min(center_cum_len[begin_idx],corner_begin_s)
+                        corner_end_s = max(center_cum_len[pass_corner_idx],corner_end_s)
                 # pass_corner_idx = torch.where(hinge_status == 0)[0][-1]
                 # hinge_status[:pass_corner_idx] = 0
                 self.path_library.append({
@@ -1120,11 +1127,14 @@ class OcctCRMap(MapBase):
                     "left_vertices": left_vertices,
                     "raw_left_vertices": raw_left_vertices,
                     "right_vertices": right_vertices,
+                    "raw_right_vertices": raw_right_vertices,
                     "s": center_cum_len,
                     "ref_v": ref_v,
                     "lane_width": resampled_lane_width,
                     "hinge_status": hinge_status,
                     "hinge_trajs": hinge_trajs,
+                    "corner_begin_s": corner_begin_s,
+                    "corner_end_s": corner_end_s,
                 })
                 assert hinge_status.shape[0]==self.n_agents, "hinge个数必须与n_agents一致"
                 assert hinge_trajs.shape[0]==self.n_agents and hinge_trajs.shape[-1]==2, "hinge轨迹必须为2维"
@@ -1217,7 +1227,7 @@ class OcctCRMap(MapBase):
         self.batch_left_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
         self.batch_right_vertices = torch.empty(B, max_path_pts_num, 2, device=self.device).fill_(float('nan'))
         self.batch_ref_v = torch.empty(B, max_path_pts_num, 1, device=self.device).fill_(float('nan'))
-        self.batch_hinge_status = torch.ones(B, max_path_pts_num, self.n_agents, device=self.device)
+        #self.batch_hinge_status = torch.ones(B, max_path_pts_num, self.n_agents, device=self.device)
         self.batch_s_max = torch.empty(B, device=self.device).fill_(float('nan'))
         self.batch_map_name = [None]*B
         self.batch_corner_s = torch.zeros(B, device=self.device)
@@ -1239,7 +1249,7 @@ class OcctCRMap(MapBase):
             self.batch_right_vertices[batch_idx, :length] = path_data["right_vertices"]
             self.batch_s_max[batch_idx] = s_max
             self.batch_ref_v[batch_idx, :length, 0] = path_data["ref_v"]
-            self.batch_hinge_status[batch_idx, :length, :] = path_data["hinge_status"].transpose(0, 1) #[length, n_agents]
+            #self.batch_hinge_status[batch_idx, :length, :] = path_data["hinge_status"].transpose(0, 1) #[length, n_agents]
             self.batch_corner_s[batch_idx] = (path_data["corner_begin_s"] + path_data["corner_end_s"]) / 2
         # 对长度不足的道路样本进行延伸填充
         for batch_idx in range(B):
@@ -1268,8 +1278,8 @@ class OcctCRMap(MapBase):
         self.right_splines = NaturalCubicSpline(coeffs)
         coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_ref_v)
         self.ref_v_splines = NaturalCubicSpline(coeffs)
-        coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_hinge_status)
-        self.hinge_status_splines = NaturalCubicSpline(coeffs)
+        # coeffs = natural_cubic_spline_coeffs(longest_s, self.batch_hinge_status)
+        # self.hinge_status_splines = NaturalCubicSpline(coeffs)
         end_time=time.time()
         #print(f"结束reset_splines, cost time: {end_time-start_time}")
 
@@ -1409,17 +1419,17 @@ class OcctCRMap(MapBase):
             ref_v = ref_v[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
             return ref_v
         
-    def get_hinge_status(self, s: Tensor, env_j: int = None) -> Tensor:
-        hinge_status = self.hinge_status_splines.evaluate(s)
-        if s.dim()==0 or s.dim()==1:
-            if type(env_j) == int:
-                return hinge_status[env_j]
-            return hinge_status
-        if s.dim()==2:
-            # get pts for batch
-            assert self.batch_dim == s.shape[0], "s的批量维度必须与样条批量维度一致"
-            hinge_status = hinge_status[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
-            return hinge_status
+    # def get_hinge_status(self, s: Tensor, env_j: int = None) -> Tensor:
+    #     hinge_status = self.hinge_status_splines.evaluate(s)
+    #     if s.dim()==0 or s.dim()==1:
+    #         if type(env_j) == int:
+    #             return hinge_status[env_j]
+    #         return hinge_status
+    #     if s.dim()==2:
+    #         # get pts for batch
+    #         assert self.batch_dim == s.shape[0], "s的批量维度必须与样条批量维度一致"
+    #         hinge_status = hinge_status[torch.arange(s.shape[0]), torch.arange(s.shape[0])]
+    #         return hinge_status
     
     def get_tangent_vector(self, s: Tensor) -> Tensor:
         assert self.center_splines._a.shape[0] == s.shape[0], "s的批量维度必须与样条批量维度一致"
@@ -2398,6 +2408,21 @@ if __name__ == "__main__chapter23":
     
     road.plot_road_debug()
     road.plot_road_for_paper(vis_dir="vmas/scenarios_data/cr_maps/debug/vis_paper")
+if __name__ == "__main__chapter4_no_extra_hinge":
+    device = torch.device("cuda")
+    road = OcctCRMap(batch_dim=200, 
+                     cr_map_dir="vmas/scenarios_data/cr_maps/chapter4",
+                     max_ref_v=15/3.6 ,
+                     min_lane_width=2.4, 
+                     min_lane_len=80,
+                     device=device, 
+                     sample_gap=1, 
+                     is_constant_ref_v=False,
+                     rod_len=18.0,
+                     extend_len=None,#0.0,
+                     n_agents=4)
+    
+    road.plot_road_debug()
 if __name__ == "__main__":
     device = torch.device("cuda")
     road = OcctCRMap(batch_dim=200, 

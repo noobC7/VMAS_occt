@@ -109,7 +109,7 @@ class Scenario(BaseScenario):
         self.batch_dim = batch_dim
         self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
-        self.n_agents=kwargs.pop("n_agents", 4)
+        self.n_agents=kwargs.pop("n_agents", 5)
         self.obs_audit_agent_index = min(max(self.obs_audit_agent_index, 0), self.n_agents - 1)
         # platoon params
         self.is_loop=kwargs.pop("is_loop", False)
@@ -119,8 +119,8 @@ class Scenario(BaseScenario):
         self.mask_ref_v=kwargs.pop("mask_ref_v", False)
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", False)
         self.init_arc_pos = kwargs.pop("init_arc_pos", 0.0)
-        self.init_vel_mean = kwargs.pop("init_vel_mean", 1.0)
-        self.init_vel_std = kwargs.pop("init_vel_std", 0.0) 
+        # self.init_vel_mean = kwargs.pop("init_vel_mean", 0.1)
+        # self.init_vel_std = kwargs.pop("init_vel_std", 0.0) 
         self.still_space = kwargs.pop("still_space", 6.0)
         self.platoon_tau = kwargs.pop("platoon_tau", 0.0)
         self.platoon_vel_batch = torch.zeros((self.batch_dim), device=device)
@@ -180,6 +180,8 @@ class Scenario(BaseScenario):
         )
         # agent params
         self.max_speed = float(kwargs.get("max_speed", 5))
+        self.init_vel_min = kwargs.pop("init_vel_min", 0.1)
+        self.init_vel_max = kwargs.pop("init_vel_max", self.max_speed)
         self.max_steering_angle = kwargs.pop(
             "max_steering_angle",
             torch.deg2rad(torch.tensor(35, device=device, dtype=torch.float32)),
@@ -497,7 +499,7 @@ class Scenario(BaseScenario):
                         self.n_agents,
                         self.n_hinges,
                         self.n_points_short_term,
-                        2,
+                        5,
                     ),
                     device=device,
                     dtype=torch.float32,
@@ -1033,7 +1035,8 @@ class Scenario(BaseScenario):
         # ============== 阶段2：生成车队速度/间距 ==============
         stage2_start = time.time()
         # 提前获取platoon_vel_batch和platoon_space_batch
-        platoon_vel_batch = self.get_normal_tensor(self.init_vel_mean, self.init_vel_std)
+        #platoon_vel_batch = self.get_normal_tensor(self.init_vel_mean, self.init_vel_std)
+        platoon_vel_batch = self.init_vel_min+(self.init_vel_max-self.init_vel_min)*self.get_random_tensor()
         self.platoon_vel_batch[idx_mask] = torch.clamp(platoon_vel_batch, min=0.0)[idx_mask]
         #print(f"platoon_vel_batch: {self.platoon_vel_batch}")
         # 1. 随机最后一辆车所在的弧长和间距
@@ -1043,11 +1046,12 @@ class Scenario(BaseScenario):
         # ============== 阶段3：计算最后一辆车弧长 ==============
         stage3_start = time.time()
         s_start_buffer = 0.0
-        s_end_buffer = 0.0
+        s_end_buffer = 10.0
         if self.is_rand_arc_pos:
-            last_vehicle_s = self.get_random_tensor() * self.road.get_s_max() * 0.7 #260128
-            last_vehicle_s=torch.normal(mean=self.road.batch_corner_s, std=self.road.batch_corner_s/2) #260301
-            last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
+            #last_vehicle_s=torch.normal(mean=self.road.batch_corner_s, std=self.road.batch_corner_s/2) #260301
+            #last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
+            #last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
+            last_vehicle_s = self.get_random_tensor() * self.road.get_s_max() #260128
         else:
             last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos
         last_vehicle_s = torch.clamp(last_vehicle_s, s_start_buffer * torch.ones(B,device=device),
@@ -1364,7 +1368,7 @@ class Scenario(BaseScenario):
                 sample_interval=self.sample_interval,
                 n_points_shift=1,
             )
-            self.ref_paths_agent_related.short_term[env_j, i_agent, :, 2] = self.init_vel_mean
+            self.ref_paths_agent_related.short_term[env_j, i_agent, :, 2] = (self.init_vel_min+self.init_vel_max)/2
 
         #print(f"get_short_term time_cost: {time.time()-tmp_t:.6f}s")
         tmp_t = time.time()
@@ -1888,23 +1892,34 @@ class Scenario(BaseScenario):
         return target_idx
     def get_agent_hinge_short_term(
         self,
-        hinge_short_term: torch.Tensor,  # [B, n_hinges, n_points, 5]
-        target_hinge_idx: torch.Tensor   # [B, n_agents]
-        ) -> torch.Tensor:
+        relative_hinge_short_term: torch.Tensor,  # [B, n_agents, n_hinges, n_points, 5]
+        target_hinge_idx: torch.Tensor,  # [B, n_agents]
+    ) -> torch.Tensor:
         """
-        根据每个Agent匹配的Hinge索引，从共享的Hinge数据中提取对应路径。
+        根据每个Agent匹配的Hinge索引，从各Agent相对坐标系下的Hinge数据中提取对应路径。
+
         Args:
-            hinge_short_term: 共享的铰接点数据 [B, n_hinges, n_points, 5]
+            relative_hinge_short_term: 每个Agent相对于所有Hinge的短期数据
+                [B, n_agents, n_hinges, n_points, 5]
             target_hinge_idx: 每个Agent对应的Hinge索引 [B, n_agents]，-1为无效
+
         Returns:
             agent_hinge: 提取后属于每个Agent的数据 [B, n_agents, n_points, 5]
         """
-        B, n_hinges, n_points, _ = hinge_short_term.shape
-        _, n_agents = target_hinge_idx.shape
-        device = hinge_short_term.device
-        safe_idx = target_hinge_idx.clamp(min=0)
+        B, n_agents, n_hinges, n_points, _ = relative_hinge_short_term.shape
+        _, target_n_agents = target_hinge_idx.shape
+        if target_n_agents != n_agents:
+            raise ValueError(
+                f"target_hinge_idx n_agents={target_n_agents} does not match "
+                f"relative_hinge_short_term n_agents={n_agents}."
+            )
+
+        device = relative_hinge_short_term.device
+        safe_idx = target_hinge_idx.clamp(min=0, max=n_hinges - 1)
         batch_idx = torch.arange(B, device=device).view(B, 1).expand(B, n_agents)
-        agent_hinge = hinge_short_term[batch_idx, safe_idx]
+        agent_idx = torch.arange(n_agents, device=device).view(1, n_agents).expand(B, n_agents)
+        agent_hinge = relative_hinge_short_term[batch_idx, agent_idx, safe_idx]
+
         invalid_mask = (target_hinge_idx == -1).unsqueeze(-1).unsqueeze(-1)
         agent_hinge = agent_hinge.masked_fill(invalid_mask, -1.0)
         return agent_hinge
@@ -1948,8 +1963,9 @@ class Scenario(BaseScenario):
         # print(f"self.ref_paths_agent_related.agent_target_hinge_idx:{self.ref_paths_agent_related.agent_target_hinge_idx}")
         self.ref_paths_agent_related.agent_target_hinge_short_term = \
             self.get_agent_hinge_short_term(
-                self.ref_paths_agent_related.hinge_short_term,
-                self.ref_paths_agent_related.agent_target_hinge_idx
+                self.observations.past_short_term_hinge_points.get_latest(),
+                #self.ref_paths_agent_related.hinge_short_term,
+                self.ref_paths_agent_related.agent_target_hinge_idx,
             )# (B,n_agents,n_hinges,n_pts,5) 
     def get_scenario_info(self):
         """获取场景信息，用于调试和验证"""
@@ -2127,6 +2143,11 @@ class Scenario(BaseScenario):
                             pos_j=self.ref_paths_agent_related.hinge_short_term[:, a_j, :, 0:2],
                             rot_i=rot_i,
                         )
+                        hinge_i_others[
+                            :, a_i, a_j, :, 2:
+                        ] = self.ref_paths_agent_related.hinge_short_term[:, a_j, :, 2:]
+                        
+                        
 
                     ego_longitudinal_velocity = vel_i_others[:, a_i, a_i, 0]
                     if a_i > 0:
@@ -2153,7 +2174,11 @@ class Scenario(BaseScenario):
                 )
                 if self.task_class == TaskClass.OCCT_PLATOON:
                     self.observations.past_short_term_hinge_points.add(
-                        hinge_i_others / self.normalizers.pos
+                        hinge_i_others / torch.tensor([self.normalizers.pos[0], 
+                                                       self.normalizers.pos[1], 
+                                                       self.normalizers.v,
+                                                       self.normalizers.v,
+                                                       1],device=self.device,dtype=torch.float32)
                     )
                         
                 self.observations.past_left_boundary.add(
@@ -2209,6 +2234,12 @@ class Scenario(BaseScenario):
             (hinge_short_term_pts, hinge_short_term_vxy, hinge_short_term_status), 
             dim=-1
         )
+        if hinge_info.max() > self.obs_audit_large_threshold:
+            print(
+                f"[OBS_AUDIT_DEBUG] HINGE_INFO_ABNORMAL "
+                f"step={self.current_step} agent={agent_index} "
+                f"max_abs={hinge_info.max():.3e}"
+            )
         self_left_boundary_pts = self.observations.past_left_boundary.get_latest()[
                 indexing_tuple_3
             ]
@@ -2653,12 +2684,11 @@ class Scenario(BaseScenario):
                 previous_tensor = self.obs_audit_prev_groups.get(name)
                 stats = self._format_obs_audit_stats(tensor, previous_tensor)
                 print(
-                    f"  - {name:34s} dim={stats['dim']:4d} "
-                    f"mean={stats['mean']:+.3e} std={stats['std']:.3e} "
-                    f"|x|mean={stats['mean_abs']:.3e} |x|max={stats['max_abs']:.3e} "
-                    f"p01/p50/p99=({stats['p01']:+.3e}, {stats['p50']:+.3e}, {stats['p99']:+.3e}) "
-                    f"small={stats['small_frac']:.2%} large={stats['large_frac']:.2%} "
-                    f"delta_std={stats['delta_std']:.3e}"
+                    f"  - {name:30s} d={stats['dim']:3d} "
+                    f"mu={stats['mean']:+.2e} sd={stats['std']:.2e} "
+                    f"q=[{stats['p01']:+.2e}|{stats['p50']:+.2e}|{stats['p99']:+.2e}] "
+                    f"s={stats['small_frac']:.1%} l={stats['large_frac']:.1%} "
+                    f"ds={stats['delta_std']:.2e}"
                 )
             print("[OBS_AUDIT] end\n")
             self.obs_audit_last_logged_step = current_step
@@ -2831,11 +2861,6 @@ class Scenario(BaseScenario):
         reward_vel = v_proj / agent.max_speed * self.rewards.higth_v
         reward_details["reward_vel"][:,agent_index] = reward_vel
 
-        # [reward] reach goal
-        reward_goal = (
-            self.collisions.with_exit_segments[:, agent_index] * self.rewards.reach_goal
-        )
-        reward_details["reward_goal"][:,agent_index] = reward_goal
         # [reward] 横向跟踪
         ref_vector = torch.mean(ref_points_vecs,dim=1) # or ref_points_vecs[:,0,:]
         ref_vector_normalized = ref_vector / (torch.norm(ref_vector, dim=-1, keepdim=True) + 1e-8)
@@ -2851,69 +2876,64 @@ class Scenario(BaseScenario):
         #                                torch.sum(ref_vector_normalized * move_vector_normalized, dim=-1),-1.0,1.0
         #                                ))/max_delta_angle)
         reward_details["reward_track_ref_heading"][:,agent_index] =  reward_track_ref_heading
-        hinge_status = self.get_target_hinge_status(agent_index)# lookahead hinge
-        if self.task_class==TaskClass.SIMPLE_PLATOON or (self.task_class==TaskClass.OCCT_PLATOON):
-            # [reward] 编队跟踪
-            error_vel_sq = torch.mean(
-                self.observations.error_vel[:, agent_index] ** 2,
-                dim=-1,
-            )
-            if self.task_class==TaskClass.OCCT_PLATOON:
-                # way1
-                # ref_vel1 = torch.linalg.norm(self.world.agents[agent_index-1].state.vel, dim=-1)
-                # ref_vel2 = torch.linalg.norm(self.world.agents[agent_index+1].state.vel, dim=-1)
-                # dis_from_front = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 0]+self.platoon_space_batch-self.agent_length,min=0.01)
-                # dis_from_rear = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 1]+self.platoon_space_batch-self.agent_length,min=0.01)
-                # ref_vel = (ref_vel1+ref_vel2)/2
-                # ref_vel = (dis_from_rear*ref_vel1+dis_from_front*ref_vel2)/(dis_from_front+dis_from_rear)
-                # error_vel = agent_raw_vel - ref_vel
-                # way2
-                space_errors = torch.mean(torch.abs(self.observations.error_space.get_latest(n=1)[:, agent_index, :]),dim=-1) # consider front and rear space
-                # # way3
-                # error_vel = agent_raw_vel - agent_raw_vel
-            else:
-                hinge_status =  False
-                #ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
-                space_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0] # only consider front space
-            reward_track_ref_vel = torch.clamp(
-                - self.rewards.reward_track_ref_vel * error_vel_sq,
-                min=-1.0,
-            ) * torch.logical_not(hinge_status)
-            reward_details["reward_track_ref_vel"][:,agent_index] =  reward_track_ref_vel
-            reward_track_ref_space = torch.clamp(- self.rewards.reward_track_ref_space * space_errors**2, min=-1.0) * torch.logical_not(hinge_status)
-            reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
-            ratio=0.7
-            ratio_list = [0.7,0.3]
-            weighted_ref_dis = 0
-            for idx, ratio in enumerate(ratio_list):
-                weighted_ref_dis += self.distances.lookahead_pts[:, agent_index, idx]
-            #reward_track_ref_path = 1 - self.rewards.reward_track_ref_path * torch.clamp((weighted_ref_dis-0.05), min=0)
-            reward_track_ref_path = torch.clamp(- self.rewards.reward_track_ref_path * weighted_ref_dis**2, min=-1.0) * torch.logical_not(hinge_status)
-            reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
-            reward_details["reward_track_hinge"][:, agent_index] = 0
-            reward_details["reward_hinge"][:, agent_index] = 0
+        error_vel_sq = torch.max(self.observations.error_vel[:, agent_index] ** 2, dim = -1)[0]
+        if self.task_class==TaskClass.OCCT_PLATOON:
+            hinge_status = self.get_target_hinge_status(agent_index)# lookahead hinge
+            # way1
+            # ref_vel1 = torch.linalg.norm(self.world.agents[agent_index-1].state.vel, dim=-1)
+            # ref_vel2 = torch.linalg.norm(self.world.agents[agent_index+1].state.vel, dim=-1)
+            # dis_from_front = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 0]+self.platoon_space_batch-self.agent_length,min=0.01)
+            # dis_from_rear = torch.clamp(self.observations.error_space.get_latest(n=1)[:, agent_index, 1]+self.platoon_space_batch-self.agent_length,min=0.01)
+            # ref_vel = (ref_vel1+ref_vel2)/2
+            # ref_vel = (dis_from_rear*ref_vel1+dis_from_front*ref_vel2)/(dis_from_front+dis_from_rear)
+            # error_vel = agent_raw_vel - ref_vel
+            # way2
+            space_errors_sq = torch.max(self.observations.error_space.get_latest(n=1)[:, agent_index, :] ** 2, dim = -1)[0] # consider front and rear space
+            # # way3
+            # error_vel = agent_raw_vel - agent_raw_vel
         else:
-            # [reward] hinge tracking
-            ratio_list = [0.7,0.3] # 0.7 for 1st pts, 0.3 for 2nd
-            weight_distance = 0
-            for idx, ratio in enumerate(ratio_list):
-                agent_desire_pos = self.get_lookahead_agent_pos(agent_index, idx)  # [batch_dim, 2]
-                hinge_desire_pos = self.get_target_hinge_pos(agent_index, idx) # [batch_dim, 2]
-                desire_distance = torch.norm(
-                    hinge_desire_pos - agent_desire_pos, dim=-1
-                )  # shape: [batch_dim]
-                weight_distance += ratio*desire_distance
-            reward_track_hinge = torch.clamp(- self.rewards.reward_track_hinge * weight_distance**2, min=-1.0) * hinge_status
-            reward_details["reward_track_hinge"][:, agent_index] = reward_track_hinge
-            hinge_once = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index] and \
-                  (not self.ref_paths_agent_related.agent_hinge_status.get_latest(n=2)[:, agent_index])
-            reward_hinge = self.rewards.reward_hinge * hinge_once * hinge_status
-            reward_details["reward_hinge"][:, agent_index] = reward_hinge
-            reward_details["reward_track_ref_vel"][:,agent_index] =  0
-            reward_details["reward_track_ref_space"][:,agent_index] = 0
-            reward_details["reward_track_ref_path"][:,agent_index] = 0
+            #ref_vel = self.ref_paths_agent_related.short_term[:, agent_index, 0, 2]
+            hinge_status =  torch.zeros_like(error_vel_sq, dtype=torch.bool)
+            space_errors_sq = self.observations.error_space.get_latest(n=1)[:, agent_index, 0]**2 # only consider front space
+        reward_track_ref_vel = 1 - torch.clamp(self.rewards.reward_track_ref_vel * error_vel_sq, max=1.0) * torch.logical_not(hinge_status)
+        reward_details["reward_track_ref_vel"][:,agent_index] =  reward_track_ref_vel
+        reward_track_ref_space = 1 - torch.clamp(self.rewards.reward_track_ref_space * space_errors_sq, max=1.0) * torch.logical_not(hinge_status)
+        reward_details["reward_track_ref_space"][:,agent_index] = reward_track_ref_space
+        ratio=0.7
+        ratio_list = [0.7,0.3]
+        weighted_ref_dis = 0
+        for idx, ratio in enumerate(ratio_list):
+            weighted_ref_dis += self.distances.lookahead_pts[:, agent_index, idx]
+        #reward_track_ref_path = 1 - self.rewards.reward_track_ref_path * torch.clamp((weighted_ref_dis-0.05), min=0)
+        reward_track_ref_path = 1 - torch.clamp(self.rewards.reward_track_ref_path * weighted_ref_dis**2, max=1.0) * torch.logical_not(hinge_status)
+        reward_details["reward_track_ref_path"][:,agent_index] = reward_track_ref_path
+        # [reward] reach goal
+        reward_goal = self.collisions.with_exit_segments[:, agent_index] * self.rewards.reach_goal * torch.logical_not(hinge_status)
+        reward_details["reward_goal"][:,agent_index] = reward_goal
+
+        # [reward] hinge tracking
+        ratio_list = [0.7,0.3] # 0.7 for 1st pts, 0.3 for 2nd
+        weight_distance = 0
+        for idx, ratio in enumerate(ratio_list):
+            agent_desire_pos = self.get_lookahead_agent_pos(agent_index, idx)  # [batch_dim, 2]
+            hinge_desire_pos = self.get_target_hinge_pos(agent_index, idx) # [batch_dim, 2]
+            desire_distance = torch.norm(
+                hinge_desire_pos - agent_desire_pos, dim=-1
+            )  # shape: [batch_dim]
+            weight_distance += ratio*desire_distance
+        reward_track_hinge = 1 - torch.clamp(self.rewards.reward_track_hinge * weight_distance**2, max=1.0) * hinge_status
+        reward_details["reward_track_hinge"][:, agent_index] = reward_track_hinge
+        hinge_once = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index] & \
+                (~self.ref_paths_agent_related.agent_hinge_status.get_latest(n=2)[:, agent_index])
+        reward_hinge = self.rewards.reward_hinge * hinge_once * hinge_status
+        reward_details["reward_hinge"][:, agent_index] = reward_hinge
 
         
+        # [reward] reach goal
+        reward_goal = (
+            self.collisions.with_exit_segments[:, agent_index] * self.rewards.reach_goal
+        )
+        reward_details["reward_goal"][:,agent_index] = reward_goal
         t2=time.time()
         # hinge之后就屏蔽奖励
         # if self.task_class==TaskClass.OCCT_PLATOON:
