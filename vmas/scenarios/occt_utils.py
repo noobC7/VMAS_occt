@@ -74,6 +74,7 @@ class OcctRewards:
         reward_track_ref_heading=None,
         reward_track_ref_path=None,
         reward_track_hinge=None,  # 新增：铰接距离奖励权重
+        reward_track_hinge_vel=None,  # 新增：铰接速度跟踪奖励权重
         reward_hinge=None,  # 新增：铰接奖励权重
     ):
         self.progress = progress
@@ -86,6 +87,7 @@ class OcctRewards:
         self.reward_track_ref_heading = reward_track_ref_heading
         self.reward_track_ref_path = reward_track_ref_path
         self.reward_track_hinge = reward_track_hinge  # 铰接距离奖励权重
+        self.reward_track_hinge_vel = reward_track_hinge_vel  # 铰接速度跟踪奖励权重
         self.reward_hinge = reward_hinge  # 铰接奖励权重
 
 class OcctPenalties:
