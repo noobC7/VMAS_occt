@@ -2787,7 +2787,7 @@ class Scenario(BaseScenario):
             weight_distance += ratio * desire_distance
         reward_track_hinge = hinge_reward_gain * (
             1 - torch.clamp(
-                self.rewards.reward_track_hinge * weight_distance**2,
+                self.rewards.reward_track_hinge * weight_distance,
                 max=1.0,
             )
         ) * hinge_status
