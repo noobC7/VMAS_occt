@@ -194,8 +194,8 @@ class OcctObservations:
         past_vertices: CircularBuffer = None,
         past_vel: CircularBuffer = None,
         past_steering: CircularBuffer = None,
-        past_short_term_ref_points: CircularBuffer = None,
-        past_short_term_hinge_points: CircularBuffer = None,
+        past_relative_ref_info: CircularBuffer = None,
+        past_relative_hinge_info: CircularBuffer = None,
         past_action_acc: CircularBuffer = None,
         past_action_steering: CircularBuffer = None,
         past_distance_to_ref_path: CircularBuffer = None,
@@ -223,11 +223,11 @@ class OcctObservations:
         self.past_vel = past_vel  # Past velocites
         self.past_steering = past_steering  # Past steering actions
 
-        self.past_short_term_ref_points = (
-            past_short_term_ref_points  # Past short-term reference points
+        self.past_relative_ref_info = (
+            past_relative_ref_info  # Past short-term reference points
         )
-        self.past_short_term_hinge_points = (
-            past_short_term_hinge_points  # Past short-term hinge points
+        self.past_relative_hinge_info = (
+            past_relative_hinge_info  # Past short-term hinge points
         )
         self.past_left_boundary = past_left_boundary  # Past left lanelet boundary
         self.past_right_boundary = past_right_boundary  # Past right lanelet boundary
@@ -297,8 +297,6 @@ class OcctReferencePathsAgentRelated:
         hinge_short_term: Tensor = None,
         short_term_indices: Tensor = None,
         agent_hinge_status: CircularBuffer = None,
-        agent_target_hinge_idx: Tensor = None,
-        agent_target_hinge_short_term: Tensor = None,
         exit: Tensor = None,
     ):
         self.long_term = long_term  # Actual long-term reference paths of agents
@@ -310,8 +308,6 @@ class OcctReferencePathsAgentRelated:
         self.nearing_points_left_boundary = nearing_points_left_boundary  # Nearing left boundary
         self.nearing_points_right_boundary = nearing_points_right_boundary  # Nearing right boundary
         self.agent_hinge_status = agent_hinge_status  # Hinge status for each agent
-        self.agent_target_hinge_idx = agent_target_hinge_idx  # Index of the target hinge point for each agent
-        self.agent_target_hinge_short_term = agent_target_hinge_short_term  # Index of the target hinge point for each agent in the short-term reference path
         self.exit = exit  # Exit segment
         
 def check_validity(obj):

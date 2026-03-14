@@ -118,8 +118,8 @@ class Scenario(BaseScenario):
         self.use_boundary_frenet_ref=kwargs.pop("use_boundary_frenet_ref", True)
         self.mask_ref_v=kwargs.pop("mask_ref_v", False)
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", False)
-        self.init_arc_pos = kwargs.pop("init_arc_pos", 100.0)
-        self.init_vel_mean = kwargs.pop("init_vel_mean", 3)
+        self.init_arc_pos = kwargs.pop("init_arc_pos", 40.0)
+        self.init_vel_mean = kwargs.pop("init_vel_mean", 0.01)
         self.init_vel_std = kwargs.pop("init_vel_std", 0.0) 
         self.still_space = kwargs.pop("still_space", 6.0)
         self.platoon_tau = kwargs.pop("platoon_tau", 0.0)
@@ -754,6 +754,19 @@ class Scenario(BaseScenario):
         )
         reward_hinge = (
             kwargs.pop("reward_hinge", 100) / r_p_normalizer
+        )
+        self.reward_track_hinge_approach = torch.tensor(
+            kwargs.pop("reward_track_hinge_approach", 100) / r_p_normalizer,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.penalty_goal_incomplete_hinge = torch.tensor(
+            kwargs.pop("penalty_goal_incomplete_hinge", -100) / r_p_normalizer,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.goal_incomplete_hinge_penalty_mode = kwargs.pop(
+            "goal_incomplete_hinge_penalty_mode", "scaled"
         )
         self.rewards = OcctRewards(
             progress=torch.tensor(reward_progress, device=device, dtype=torch.float32),
@@ -2571,6 +2584,47 @@ class Scenario(BaseScenario):
         )
         target_agent_s = s_front.unsqueeze(-1) - desired_gap_s.unsqueeze(-1) * agent_indices
         return target_agent_s, desired_gap_s
+
+    def get_all_followers_hinged(self):
+        if self.task_class != TaskClass.OCCT_PLATOON or self.n_followers <= 0:
+            return torch.ones(self.batch_dim, device=self.device, dtype=torch.bool)
+        return self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[
+            :, self.FOLLOWER_SLICE
+        ].all(dim=-1)
+
+    def get_hinged_followers_ratio(self):
+        if self.task_class != TaskClass.OCCT_PLATOON or self.n_followers <= 0:
+            return torch.ones(self.batch_dim, device=self.device, dtype=torch.float32)
+        return self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[
+            :, self.FOLLOWER_SLICE
+        ].to(torch.float32).mean(dim=-1)
+
+    def get_hinge_approach_progress(self, agent_index):
+        if self.observations.past_relative_hinge_info.valid_size < 2:
+            return torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
+
+        hinge_status = self.get_target_hinge_status(agent_index)
+        if not hinge_status.any():
+            return torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
+
+        prev_relative_hinge = self.observations.past_relative_hinge_info.get_latest(n=2)[
+            :, agent_index, agent_index
+        ]
+        prev_hinge_distance = torch.linalg.norm(
+            prev_relative_hinge[:, 0, :2] * self.normalizers.pos,
+            dim=-1,
+        )
+        current_hinge_distance = torch.linalg.norm(
+            self.get_target_hinge_pos(agent_index, 0) - self.world.agents[agent_index].state.pos,
+            dim=-1,
+        )
+        hinge_approach_progress = prev_hinge_distance - current_hinge_distance
+        return torch.where(
+            hinge_status,
+            hinge_approach_progress,
+            torch.zeros_like(hinge_approach_progress),
+        )
+
     def get_local_relative_longitudinal_velocity_history(self, agent_index, indexing_tuple_1):
         n_observed_steps = int(self.observations.n_observed_steps.item())
         other_local_vel_history = torch.stack(
@@ -2599,11 +2653,25 @@ class Scenario(BaseScenario):
         track_ref_vel_space_mask,
         track_ref_path_mask=None,
         track_ref_heading_mask=None,
+        goal_mask=None,
+        goal_penalty=None,
     ):
         if track_ref_path_mask is None:
             track_ref_path_mask = track_ref_vel_space_mask
         if track_ref_heading_mask is None:
             track_ref_heading_mask = track_ref_vel_space_mask
+        if goal_mask is None:
+            goal_mask = torch.ones(
+                self.batch_dim, device=self.device, dtype=torch.float32
+            )
+        else:
+            goal_mask = goal_mask.to(torch.float32)
+        if goal_penalty is None:
+            goal_penalty = torch.zeros(
+                self.batch_dim, device=self.device, dtype=torch.float32
+            )
+        else:
+            goal_penalty = goal_penalty.to(torch.float32)
 
         ref_vector = torch.mean(ref_points_vecs, dim=1)
         ref_vector_normalized = ref_vector / (torch.norm(ref_vector, dim=-1, keepdim=True) + 1e-8)
@@ -2641,7 +2709,7 @@ class Scenario(BaseScenario):
         ) * track_ref_vel_space_mask
 
         weighted_ref_dis = 0.0
-        for idx, ratio in enumerate((0.5, 0.5)):
+        for idx, ratio in enumerate((0.2, 0.8)):
             weighted_ref_dis += ratio * self.distances.lookahead_pts[:, agent_index, idx]
         reward_track_ref_path = (
             1 - torch.clamp(
@@ -2654,7 +2722,10 @@ class Scenario(BaseScenario):
         reward_details["reward_track_ref_space"][:, agent_index] = reward_track_ref_space
         reward_details["reward_track_ref_path"][:, agent_index] = reward_track_ref_path
 
-        reward_goal = self.collisions.with_exit_segments[:, agent_index] * self.rewards.reach_goal
+        is_reach_goal = self.collisions.with_exit_segments.any(dim=-1).to(torch.float32)
+        reward_goal = is_reach_goal * (
+            goal_mask * self.rewards.reach_goal + (1 - goal_mask) * goal_penalty
+        )
         reward_details["reward_goal"][:, agent_index] = reward_goal
         return reward_details
 
@@ -2669,6 +2740,7 @@ class Scenario(BaseScenario):
             move_vec=move_vec,
             space_errors_sq=space_errors_sq,
             track_ref_vel_space_mask=track_ref_mask,
+            goal_mask=torch.ones(self.batch_dim, device=self.device, dtype=torch.float32),
         )
         reward_details["reward_track_hinge"][:, agent_index] = 0.0
         reward_details["reward_track_hinge_vel"][:, agent_index] = 0.0
@@ -2677,10 +2749,21 @@ class Scenario(BaseScenario):
 
     def reward_occt_platoon(self, reward_details, agent, agent_index, ref_points_vecs, move_vec):
         hinge_status = self.get_target_hinge_status(agent_index)
+        all_followers_hinged = self.get_all_followers_hinged()
+        hinged_followers_ratio = self.get_hinged_followers_ratio()
         target_agent_s, _ = self.get_dynamic_target_arc_positions()
         space_errors_sq = (
             self.observations.agent_s[:, agent_index] - target_agent_s[:, agent_index]
         ) ** 2
+        if self.goal_incomplete_hinge_penalty_mode == "constant":
+            goal_penalty = self.penalty_goal_incomplete_hinge.expand(self.batch_dim)
+        elif self.goal_incomplete_hinge_penalty_mode == "scaled":
+            goal_penalty = self.penalty_goal_incomplete_hinge * (1 - hinged_followers_ratio)
+        else:
+            raise ValueError(
+                f"Unsupported goal_incomplete_hinge_penalty_mode: "
+                f"{self.goal_incomplete_hinge_penalty_mode}"
+            )
 
         reward_details = self._apply_reference_tracking_rewards(
             reward_details=reward_details,
@@ -2691,6 +2774,8 @@ class Scenario(BaseScenario):
             track_ref_vel_space_mask=torch.ones_like(hinge_status, dtype=torch.float32),
             track_ref_path_mask=torch.logical_not(hinge_status),
             track_ref_heading_mask=torch.logical_not(hinge_status),
+            goal_mask=all_followers_hinged.to(torch.float32),
+            goal_penalty=goal_penalty,
         )
 
         hinge_reward_gain = 1.5
@@ -2705,6 +2790,12 @@ class Scenario(BaseScenario):
                 self.rewards.reward_track_hinge * weight_distance**2,
                 max=1.0,
             )
+        ) * hinge_status
+        hinge_approach_progress = self.get_hinge_approach_progress(agent_index)
+        reward_track_hinge = reward_track_hinge + torch.clamp(
+            self.reward_track_hinge_approach * hinge_approach_progress,
+            min=-0.5,
+            max=0.5,
         ) * hinge_status
         reward_details["reward_track_hinge"][:, agent_index] = reward_track_hinge
 
@@ -3195,8 +3286,13 @@ class Scenario(BaseScenario):
         )  # [batch_dim]
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
         is_collision_with_exit_segments = self.collisions.with_exit_segments.any(dim=-1)
-        is_agent_all_hinged = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1).all(dim=-1)
-        is_done = is_collision_with_agents | is_collision_with_exit_segments | is_collision_with_lanelets # | is_agent_all_hinged
+        is_agent_all_hinged = self.get_all_followers_hinged()
+        is_done = (
+            is_collision_with_agents
+            | is_collision_with_exit_segments
+            | is_collision_with_lanelets
+            | is_agent_all_hinged
+        )
         #is_done = is_collision_with_exit_segments
         # is_fail = is_collision_with_agents | is_collision_with_lanelets
         # is_success = is_collision_with_exit_segments
@@ -3300,9 +3396,18 @@ class Scenario(BaseScenario):
             hinge_pos = self.get_target_hinge_pos(agent_index)
             hinge_status = self.get_target_hinge_status(agent_index)
             hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)  # [batch_dim, n_points]
+            hinged_followers_ratio = self.get_hinged_followers_ratio()
+            if agent_index in self.TRACTOR_SLICE:
+                hinge_approach_progress = torch.zeros(
+                    self.batch_dim, device=self.device, dtype=torch.float32
+                )
+            else:
+                hinge_approach_progress = self.get_hinge_approach_progress(agent_index)
             hinge_dict = {
                 "hinge_status": hinge_status,
                 "hinge_dis": hinge_dis,
+                "hinged_followers_ratio": hinged_followers_ratio,
+                "hinge_approach_progress": hinge_approach_progress,
             }
         #print(f"agent_index: {agent_index}, hinge_status: {hinge_status}, hinge_dis: {hinge_dis}")
         info = {
