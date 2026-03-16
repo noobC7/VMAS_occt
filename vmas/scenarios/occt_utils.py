@@ -297,6 +297,7 @@ class OcctReferencePathsAgentRelated:
         hinge_short_term: Tensor = None,
         short_term_indices: Tensor = None,
         agent_hinge_status: CircularBuffer = None,
+        hinge_status: Tensor = None,
         exit: Tensor = None,
     ):
         self.long_term = long_term  # Actual long-term reference paths of agents
@@ -308,6 +309,7 @@ class OcctReferencePathsAgentRelated:
         self.nearing_points_left_boundary = nearing_points_left_boundary  # Nearing left boundary
         self.nearing_points_right_boundary = nearing_points_right_boundary  # Nearing right boundary
         self.agent_hinge_status = agent_hinge_status  # Hinge status for each agent
+        self.hinge_status = hinge_status  # Each Hinge status
         self.exit = exit  # Exit segment
         
 def check_validity(obj):
@@ -711,7 +713,7 @@ def get_short_term_hinge_path_by_s(
         K=hinge_edge_buffer,
     )
     
-    # 4. 【关键修复】判定是否已经过了拐角
+    # # 4. 【关键修复】判定是否已经过了拐角
     # 确保 is_after_corner 维度为 [B, 1, 1, 1] 然后广播到 [B, N_hinge, n_points_to_return, 1]
     is_after_corner = (torch.atleast_1d(first_agent_s) > corner_s).view(B, 1, 1, 1)
     is_after_corner = is_after_corner.expand(-1, hinge_pts_num, n_points_to_return, 1)
@@ -726,7 +728,10 @@ def get_short_term_hinge_path_by_s(
     # 6. 合并计算 Ready 位
     # 维度对齐：[B, 8, 4, 1] = [B, 8, 4, 1] & ([B, 8, 4, 1] | [B, 8, 4, 1])
     #hinge_short_term[..., 4:5] = (is_in_boundary & ((is_after_corner | is_in_straight | is_side_hinge))).to(dtype=hinge_short_term.dtype)
-    hinge_short_term[..., 4:5] = (is_in_boundary & ((is_after_corner | is_side_hinge))).to(dtype=hinge_short_term.dtype)
+    #hinge_short_term[..., 4:5] = (is_in_boundary & ((is_after_corner | is_side_hinge))).to(dtype=hinge_short_term.dtype)
+
+    # 260316 simplify
+    hinge_short_term[..., 4:5] = is_in_boundary & is_after_corner
     
     return hinge_short_term
 
