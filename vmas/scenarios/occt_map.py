@@ -376,7 +376,8 @@ class OcctCRMap(MapBase):
                  is_constant_ref_v: bool = False,
                  rod_len = None,
                  extend_len = None,
-                 n_agents: int = 4): # 采样间隔
+                 n_agents: int = 4,
+                 target_road_id=None,): # 采样间隔
         """
         初始化道路类，使用CommonRoad地图并基于torchcubicspline实现路径表示
         
@@ -421,7 +422,7 @@ class OcctCRMap(MapBase):
             raise ValueError("No paths found in the provided CommonRoad map directory")
         
         # 初始化路径样条
-        self.reset_splines()
+        self.reset_splines(target_road_id)
 
     def get_lane_width(self,type="mean") -> Tensor:
         """
@@ -807,28 +808,46 @@ class OcctCRMap(MapBase):
                 # if not ((path_ids[0]==177 and path_ids[-1]==129) or \
                 #    (path_ids[0]==153 and path_ids[-1]==175)):
                 #     continue
-                if (path_ids[0]==112 and path_ids[-1]==129):
+                # if (path_ids[0]==112 and path_ids[-1]==129):
+                #     continue
+                # if not (path_ids[0]==177 and path_ids[-1]==129):
+                #     continue
+                # if map_name == "USA_Roundabout_EP_repaired.xml":
+                #     if (path_ids[-1]==124) or \
+                #         (path_ids[0]==100 and path_ids[-1]==169) or \
+                #             (path_ids[0]==149 and path_ids[-1]==157) or \
+                #             (path_ids[0]==149 and path_ids[-1]==124) or \
+                #             (path_ids[0]==127 and path_ids[-1]==124) or \
+                #             (path_ids[0]==127 and path_ids[-1]==157) or \
+                #             (path_ids[0]==149 and path_ids[-1]==132):
+                #         continue
+                #chapter4 road list
+                path_list=({188,113},(102,119),(112,113),
+                           (172,164),(172,166),(153,175),
+                           (100,117),(100,129),(127,102),(177,129),(177,117),
+                           (124,146))
+                # 260316 12 path
+                if (path_ids[0],path_ids[-1]) not in path_list:
                     continue
-                if map_name == "USA_Roundabout_EP_repaired.xml":
-                    if (path_ids[-1]==124) or \
-                        (path_ids[0]==100 and path_ids[-1]==169) or \
-                            (path_ids[0]==149 and path_ids[-1]==157) or \
-                            (path_ids[0]==149 and path_ids[-1]==124) or \
-                            (path_ids[0]==127 and path_ids[-1]==124) or \
-                            (path_ids[0]==127 and path_ids[-1]==157) or \
-                            (path_ids[0]==149 and path_ids[-1]==132):
-                        continue
                 for i, lanelet_id in enumerate(path_ids):
                     lanelet = scenario.lanelet_network.find_lanelet_by_id(lanelet_id)
                     center_vertices = np.array(lanelet.center_vertices)
+                    left_vertices = np.array(lanelet.left_vertices)
+                    right_vertices = np.array(lanelet.right_vertices)
                     if i == 0 and len(center_vertices) > 2:
                         center_vertices[1] = (center_vertices[2] + center_vertices[0]) / 2
                     if i == len(path_ids)-1 and len(center_vertices) > 2:
                         center_vertices[-2] = (center_vertices[-1] + center_vertices[-3]) / 2
-
+                    if len(center_vertices) == 2 and len(left_vertices) == 2 and len(right_vertices) == 2:
+                        tmp_len = np.linalg.norm(center_vertices[1]-center_vertices[0])
+                        if tmp_len>10:
+                            straight_resample_num = round(tmp_len/5)
+                            center_vertices, _ = self._resample_path(center_vertices,straight_resample_num)
+                            left_vertices, _ = self._resample_path(left_vertices,straight_resample_num)
+                            right_vertices, _ = self._resample_path(right_vertices,straight_resample_num)
                     center_vertices, left_vertices, right_vertices = OcctCRMap.extend_road(center_vertices,
-                                                        lanelet.left_vertices,
-                                                        lanelet.right_vertices, 
+                                                        left_vertices,
+                                                        right_vertices, 
                                                         head_extend_len=self.extend_len if i==0 else 0, 
                                                         tail_extend_len=self.extend_len if i==len(path_ids)-1 else 0)
                     # center_vertices, _ = self._resample_path(center_vertices)
@@ -1206,7 +1225,7 @@ class OcctCRMap(MapBase):
         """
         map_name = self.batch_map_name[env_index]
         return self.scenario_library[map_name]
-    def reset_splines(self):
+    def reset_splines(self,target_road_id=None):
         """
         生成batch_dim长度的随机整型tensor，范围0到道路库数量-1
         使用torchcubicspline初始化路径样条
@@ -1216,6 +1235,8 @@ class OcctCRMap(MapBase):
         # 260128 revise
         for i in range(self.batch_dim):
             self.batch_id[i] = torch.tensor(i % len(self.path_library), dtype=torch.int64, device=self.device)
+        if target_road_id:
+            self.batch_id[0]=target_road_id
         #self.batch_id[0] = 3
         # 准备batch数据
         B = self.batch_dim
@@ -1250,7 +1271,8 @@ class OcctCRMap(MapBase):
             self.batch_s_max[batch_idx] = s_max
             self.batch_ref_v[batch_idx, :length, 0] = path_data["ref_v"]
             #self.batch_hinge_status[batch_idx, :length, :] = path_data["hinge_status"].transpose(0, 1) #[length, n_agents]
-            self.batch_corner_s[batch_idx] = (path_data["corner_begin_s"] + path_data["corner_end_s"]) / 2
+            #self.batch_corner_s[batch_idx] = (path_data["corner_begin_s"] + path_data["corner_end_s"]) / 2
+            self.batch_corner_s[batch_idx] = path_data["corner_begin_s"]
         # 对长度不足的道路样本进行延伸填充
         for batch_idx in range(B):
             current_length = torch.count_nonzero(~torch.isnan(self.batch_center_vertices[batch_idx, :, 0])).item()
@@ -2426,14 +2448,14 @@ if __name__ == "__main__chapter4_no_extra_hinge":
 if __name__ == "__main__":
     device = torch.device("cuda")
     road = OcctCRMap(batch_dim=200, 
-                     cr_map_dir="vmas/scenarios_data/cr_maps/chapter4",
+                     cr_map_dir="vmas/scenarios_data/cr_maps/chapter4_12_path/",
                      max_ref_v=15/3.6 ,
                      min_lane_width=2.4, 
                      min_lane_len=80,
                      device=device, 
                      sample_gap=1, 
                      is_constant_ref_v=False,
-                     rod_len=18.0,
+                     rod_len=6*4.0,
                      extend_len=None,#0.0,
                      n_agents=4)
     
