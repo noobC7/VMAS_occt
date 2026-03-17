@@ -826,6 +826,10 @@ class OcctCRMap(MapBase):
                            (172,164),(172,166),(153,175),
                            (100,117),(100,129),(127,102),(177,129),(177,117),
                            (124,146))
+                #chapter4 road list v2
+                path_list=({188,113},(112,113),(172,166),(153,175),(100,129),(177,117))
+                           
+                           
                 # 260316 12 path
                 if (path_ids[0],path_ids[-1]) not in path_list:
                     continue
@@ -2448,7 +2452,7 @@ if __name__ == "__main__chapter4_no_extra_hinge":
 if __name__ == "__main__":
     device = torch.device("cuda")
     road = OcctCRMap(batch_dim=200, 
-                     cr_map_dir="vmas/scenarios_data/cr_maps/chapter4_12_path/",
+                     cr_map_dir="vmas/scenarios_data/cr_maps/chapter4_6_path/",
                      max_ref_v=15/3.6 ,
                      min_lane_width=2.4, 
                      min_lane_len=80,

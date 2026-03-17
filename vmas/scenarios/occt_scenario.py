@@ -232,7 +232,7 @@ class Scenario(BaseScenario):
         self.road = OcctCRMap(
             batch_dim=B,
             device=device,
-            cr_map_dir="/home/yons/Graduation/VMAS_occt/vmas/scenarios_data/cr_maps/chapter4_12_path",
+            cr_map_dir="/home/yons/Graduation/VMAS_occt/vmas/scenarios_data/cr_maps/chapter4_6_path",
             max_ref_v=self.max_speed,
             is_constant_ref_v=True,
             rod_len=self.rod_len,
@@ -2093,7 +2093,7 @@ class Scenario(BaseScenario):
         self_short_term = self.observations.past_relative_ref_info.get_latest()[
                 indexing_tuple_3
             ]
-        hinge_mask = self.ref_paths_agent_related.hinge_status[:,agent_index]
+        hinge_mask = ~self.ref_paths_agent_related.hinge_status[:,agent_index]
         hinge_mask = hinge_mask[:, None, None]
         observed_hinge_short_term = self.observations.past_relative_hinge_info.get_latest()[:,agent_index,agent_index]
         #self_target_hinge_short_term = self.observations.past_relative_hinge_info.get_latest()[:,agent_index]
@@ -2108,9 +2108,10 @@ class Scenario(BaseScenario):
         if hinge_info.max() > self.obs_audit_large_threshold:
             print(
                 f"[OBS_AUDIT_DEBUG] HINGE_INFO_ABNORMAL "
-                f"step={self.current_step} agent={agent_index} "
+                f"step={self._get_obs_audit_step()} agent={agent_index} "
                 f"max_abs={hinge_info.max():.3e}"
             )
+            import pdb;pdb.set_trace()
         self_left_boundary_pts = self.observations.past_left_boundary.get_latest()[
                 indexing_tuple_3
             ]
