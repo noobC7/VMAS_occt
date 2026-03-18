@@ -2080,19 +2080,12 @@ class Scenario(BaseScenario):
 
     def observe_self(self, agent_index, return_groups: bool = False):
         """Observe the given agent itself."""
-        indexing_tuple_3 = (
-            (self.constants.env_idx_broadcasting,)
-            + (agent_index,)
-            + ((agent_index,))
-        )
         indexing_tuple_vel = (
             (self.constants.env_idx_broadcasting,)
             + (agent_index,)
             + ((agent_index, 0))
         )  # In local coordinate system, only the first component is interesting, as the second is always 0
-        self_short_term = self.observations.past_relative_ref_info.get_latest()[
-                indexing_tuple_3
-            ]
+        self_short_term = self.observations.past_relative_ref_info.get_latest()[:,agent_index,agent_index,:,:]
         effective_short_term = self_short_term
         if self.task_class == TaskClass.OCCT_PLATOON:
             hinge_mask = self.ref_paths_agent_related.hinge_status[:,agent_index][:, None, None]
@@ -2118,28 +2111,22 @@ class Scenario(BaseScenario):
             )
             import pdb;pdb.set_trace()
         self_left_boundary_pts = self.observations.past_left_boundary.get_latest()[
-                indexing_tuple_3
+                :,agent_index,agent_index,1:,:
             ]
         self_right_boundary_pts = self.observations.past_right_boundary.get_latest()[
-                indexing_tuple_3
+                :,agent_index,agent_index,1:,:
             ]
         self_left_dis = torch.linalg.norm(
-            self_left_boundary_pts[...,1:,:] - self_short_term[...,:2], dim=-1
+            self_left_boundary_pts - self_short_term[...,:2], dim=-1
         )
         self_right_dis = torch.linalg.norm(
-            self_right_boundary_pts[...,1:,:] - self_short_term[...,:2], dim=-1
+            self_right_boundary_pts - self_short_term[...,:2], dim=-1
         )
         vel = self.observations.past_vel.get_latest()[indexing_tuple_vel]
         vel_mag = torch.linalg.norm(vel, dim=-1)
         obs_self_groups = [
-            ("self_vel_local", vel.reshape(self.world.batch_dim, -1)),
+            ("self_vel", vel.reshape(self.world.batch_dim, -1)),
             ("self_speed", vel_mag.reshape(self.world.batch_dim, -1)),
-            (
-                "self_vel_longitudinal",
-                self.observations.past_vel.get_latest()[indexing_tuple_vel].reshape(
-                    self.world.batch_dim, -1
-                ),
-            ),
             (
                 "self_steering",
                 self.observations.past_steering.get_latest()[:,agent_index].reshape(
@@ -2167,12 +2154,12 @@ class Scenario(BaseScenario):
                 if self.task_class == TaskClass.OCCT_PLATOON
                 else None,
             ),
-            # (
-            #     "self_distance_to_ref",
-            #     self.observations.past_distance_to_ref_path.get_latest()[
-            #         :, agent_index
-            #     ].reshape(self.world.batch_dim, -1),
-            # ),
+            (
+                "self_distance_to_ref",
+                torch.linalg.norm(effective_short_term[
+                    :, 0, :2
+                ],dim=-1).reshape(self.world.batch_dim, -1),
+            ),
             (
                 "self_distance_to_left_boundary",
                 self.observations.past_distance_to_left_boundary.get_latest()[
@@ -2501,7 +2488,7 @@ class Scenario(BaseScenario):
                 agent_index,
                 obs_self_groups + obs_other_agent_groups + [("obs_total", obs)],
             )
-
+        assert obs.shape[1]==62, "obs shape bug"
         check_validity(self.observations)
         check_validity(self.ref_paths_agent_related)
         if self.is_add_noise:
@@ -2748,14 +2735,14 @@ class Scenario(BaseScenario):
             agent_desire_pos = self.get_lookahead_agent_pos(agent_index, idx)
             hinge_desire_pos = self.get_target_hinge_pos(agent_index, idx)
             weighted_hinge_ref_path_error += ratio * torch.norm(hinge_desire_pos - agent_desire_pos, dim=-1)
-        reward_platoon_ref = self.clamp_error_reward(self.rewards.reward_platoon_ref, weighted_hinge_ref_path_error) * ~hinge_status
-        reward_details["reward_platoon_ref"][:, agent_index] = reward_platoon_ref
+        reward_hinge_ref = self.clamp_error_reward(self.rewards.reward_hinge_ref, weighted_hinge_ref_path_error) * ~hinge_status
+        reward_details["reward_hinge_ref"][:, agent_index] = reward_hinge_ref
 
         weighted_platoon_ref_path_error = torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
         for idx, ratio in enumerate((0.2, 0.8)):
             weighted_platoon_ref_path_error += ratio * self.distances.lookahead_pts[:, agent_index, idx]
-        reward_hinge_ref = self.clamp_error_reward(self.rewards.reward_hinge_ref, weighted_platoon_ref_path_error) * hinge_status
-        reward_details["reward_hinge_ref"][:, agent_index] = reward_hinge_ref
+        reward_platoon_ref = self.clamp_error_reward(self.rewards.reward_platoon_ref, weighted_platoon_ref_path_error) * hinge_status
+        reward_details["reward_platoon_ref"][:, agent_index] = reward_platoon_ref
 
         reward_platoon_heading = self._reward_agent_heading(
                 ref_points_vecs=ref_points_vecs,
@@ -3322,10 +3309,13 @@ class Scenario(BaseScenario):
         """
         Get the current agent position of the agent.
         """
+        current_pos = self.world.agents[agent_index].state.pos
         if lookahead_idx is None:
-            return self.world.agents[agent_index].state.pos
+            return current_pos
         else:
-            return self.ref_paths_agent_related.short_term[:, agent_index, lookahead_idx, :2]
+            theta = self.world.agents[agent_index].state.rot
+            lookahead_pts = current_pos + (lookahead_idx)*self.sample_interval * torch.hstack([torch.cos(theta), torch.sin(theta)])
+            return lookahead_pts
     def get_target_hinge_pos(self, agent_index, lookahead_idx = None):
         """
         Get the current hinge position of the agent.
