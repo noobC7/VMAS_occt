@@ -61,62 +61,48 @@ class OcctNormalizers:
         self.distance_agent = distance_agent
         self.distance_ref = distance_ref
 class OcctRewards:
-    """Rewards for moving forward, moving with high speed, etc."""
+    """Reward weights used by the current OCCT platoon reward pipeline."""
     def __init__(
         self,
-        progress=None,
+        reward_progress=None,
         weighting_ref_directions=None,
-        higth_v=None,
-        reach_goal=None,
-        reach_intermediate_goal=None,
-        reward_track_ref_vel=None,
-        reward_track_ref_space=None,
-        reward_track_ref_heading=None,
-        reward_track_ref_path=None,
-        reward_track_hinge=None,  # 新增：铰接距离奖励权重
-        reward_track_hinge_vel=None,  # 新增：铰接速度跟踪奖励权重
-        reward_hinge=None,  # 新增：铰接奖励权重
+        reward_vel=None,
+        reward_goal=None,
+        reward_platoon_heading=None,
+        reward_platoon_space=None,
+        reward_hinge_space=None,
+        reward_platoon_vel=None,
+        reward_hinge_vel=None,
+        reward_platoon_ref=None,
+        reward_hinge_ref=None,
+        reward_hinge=None,
     ):
-        self.progress = progress
+        self.reward_progress = reward_progress
         self.weighting_ref_directions = weighting_ref_directions
-        self.higth_v = higth_v
-        self.reach_goal = reach_goal
-        self.reach_intermediate_goal = reach_intermediate_goal
-        self.reward_track_ref_vel = reward_track_ref_vel
-        self.reward_track_ref_space = reward_track_ref_space
-        self.reward_track_ref_heading = reward_track_ref_heading
-        self.reward_track_ref_path = reward_track_ref_path
-        self.reward_track_hinge = reward_track_hinge  # 铰接距离奖励权重
-        self.reward_track_hinge_vel = reward_track_hinge_vel  # 铰接速度跟踪奖励权重
-        self.reward_hinge = reward_hinge  # 铰接奖励权重
+        self.reward_vel = reward_vel
+        self.reward_goal = reward_goal
+        self.reward_platoon_heading = reward_platoon_heading
+        self.reward_platoon_space = reward_platoon_space
+        self.reward_hinge_space = reward_hinge_space
+        self.reward_platoon_vel = reward_platoon_vel
+        self.reward_hinge_vel = reward_hinge_vel
+        self.reward_platoon_ref = reward_platoon_ref
+        self.reward_hinge_ref = reward_hinge_ref
+        self.reward_hinge = reward_hinge
 
 class OcctPenalties:
     """Penalties for collisions, being too close to other agents or lane boundaries, etc."""
 
     def __init__(
         self,
-        deviate_from_ref_path=None,
-        deviate_from_goal=None,
-        weighting_deviate_from_ref_path=None,
         near_boundary=None,
         near_other_agents=None,
         collide_with_agents=None,
         collide_with_boundaries=None,
-        collide_with_obstacles=None,
         backward=None,
-        time=None,
         change_steering=None,
         change_acc=None,
-        ref_vel_error=None,
-        ref_space_error=None,
     ):
-        self.deviate_from_ref_path = (
-            deviate_from_ref_path  # Penalty for deviating from reference path
-        )
-        self.deviate_from_goal = (
-            deviate_from_goal  # Penalty for deviating from goal position
-        )
-        self.weighting_deviate_from_ref_path = weighting_deviate_from_ref_path
         self.near_boundary = (
             near_boundary  # Penalty for being too close to lanelet boundaries
         )
@@ -129,53 +115,35 @@ class OcctPenalties:
         self.collide_with_boundaries = (
             collide_with_boundaries  # Penalty for colliding with lanelet boundaries
         )
-        self.collide_with_obstacles = (
-            collide_with_obstacles  # Penalty for colliding with obstacles
-        )
         self.backward = backward  # Penalty for leaving the world
-        self.time = time  # Penalty for losing time
         self.change_steering = (
             change_steering  # Penalty for changing steering direction
         )
         self.change_acc = change_acc  # Penalty for changing acceleration direction
-        self.ref_vel_error = ref_vel_error  # Penalty for velocity error relative to reference velocity
-        self.ref_space_error = ref_space_error  # Penalty for gap error relative to reference gap (unnormalized)
+
 class OcctThresholds:
     """Different thresholds, such as starting from which distance agents are deemed being too close to other agents."""
 
     def __init__(
         self,
-        deviate_from_ref_path=None,
         near_boundary_low=None,
         near_boundary_high=None,
         near_other_agents_low=None,
         near_other_agents_high=None,
-        reach_goal=None,
-        reach_intermediate_goal=None,
         change_steering=None,
         change_acc=None,
-        no_reward_if_too_close_to_boundaries=None,
-        no_reward_if_too_close_to_other_agents=None,
         distance_mask_agents=None,
-        hinge_close=None,  # 新增：理想铰接距离
-        hinge_far=None,    # 新增：最大有效铰接距离
     ):
-        self.deviate_from_ref_path = deviate_from_ref_path
         self.near_boundary_low = near_boundary_low
         self.near_boundary_high = near_boundary_high
         self.near_other_agents_low = near_other_agents_low
         self.near_other_agents_high = near_other_agents_high
-        self.reach_goal = reach_goal  # Threshold less than which agents are considered at their goal positions
-        self.reach_intermediate_goal = reach_intermediate_goal  # Threshold less than which agents are considered at their intermediate goal positions
         self.change_steering = change_steering  # Threshold above which agents will be penalized for changing steering too quick [degree]
         self.change_acc = change_acc  # Threshold above which agents will be penalized for changing acceleration too quick [m/s^2]
-        self.no_reward_if_too_close_to_boundaries = no_reward_if_too_close_to_boundaries  # Agents get no reward if they are too close to lanelet boundaries
-        self.no_reward_if_too_close_to_other_agents = no_reward_if_too_close_to_other_agents  # Agents get no reward if they are too close to other agents
         self.distance_mask_agents = (
             distance_mask_agents  # Threshold above which nearing agents will be masked
         )
-        self.hinge_close = hinge_close  # 理想铰接距离（米），reward=1
-        self.hinge_far = hinge_far      # 最大有效铰接距离（米），reward=0
+
 class OcctObservations:
     def __init__(
         self,

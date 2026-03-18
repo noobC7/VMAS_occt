@@ -23,7 +23,7 @@ from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalize
     is_point_left_of_polyline,get_frenet_distances_between_agents
 from enum import IntEnum
 TRADITIONAL_CONTROL=False
-AGENT_INDEX_FOCUS=1
+AGENT_INDEX_FOCUS=2
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
     OCCT_PLATOON = 1 # with cargo
@@ -104,6 +104,7 @@ class Scenario(BaseScenario):
         )
         self.obs_audit_last_logged_step = -1
         self.obs_audit_prev_groups = {}
+        self._tracking_error_last_synced_step = -1
         # world params
         self.device = device
         self.batch_dim = batch_dim
@@ -595,19 +596,27 @@ class Scenario(BaseScenario):
             ),
         )
         n_agents=self.n_agents
+
         self.reward_details = {
             "reward_total": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "reward_progress": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "reward_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_platoon_heading": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+
             "reward_goal": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
-            "reward_track_ref_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
-            "reward_track_ref_space": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
-            "reward_track_hinge": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
-            "reward_approach_hinge": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
-            "reward_track_hinge_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "reward_hinge": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
-            "reward_track_ref_heading": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
-            "reward_track_ref_path": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+
+            "reward_platoon_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_hinge_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+
+            "reward_platoon_ref": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_hinge_ref": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+
+            "reward_platoon_space": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_hinge_space": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+
+            "reward_approach_hinge": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+
             "penalty_near_boundary": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "penalty_near_other_agents": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "penalty_change_steering": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
@@ -618,14 +627,6 @@ class Scenario(BaseScenario):
         }
 
         # Penalty
-        threshold_deviate_from_ref_path = kwargs.pop(
-            "threshold_deviate_from_ref_path", (self.lane_width - self.agent_width) / 2
-        )  # Use for penalizing of deviating from reference path
-
-        threshold_reach_goal = kwargs.pop(
-            "threshold_reach_goal", self.agent_width / 2
-        )  # Threshold less than which agents are considered at their goal positions
-
         threshold_change_steering = kwargs.pop(
             "threshold_change_steering", 10
         )  # Threshold above which agents will be penalized for changing steering too quick [degree]
@@ -651,20 +652,7 @@ class Scenario(BaseScenario):
         )  # Threshold above which agents will be penalized (for center-to-center distance,
         # If a c2c distance is less than the half of the agent width, they are colliding, which will be penalized by another penalty)
 
-        threshold_no_reward_if_too_close_to_boundaries = kwargs.pop(
-            "threshold_no_reward_if_too_close_to_boundaries", self.agent_width / 10
-        )
-        threshold_no_reward_if_too_close_to_other_agents = kwargs.pop(
-            "threshold_no_reward_if_too_close_to_other_agents", self.agent_width / 6
-        )
-
         self.thresholds = OcctThresholds(
-            reach_goal=torch.tensor(
-                threshold_reach_goal, device=device, dtype=torch.float32
-            ),
-            deviate_from_ref_path=torch.tensor(
-                threshold_deviate_from_ref_path, device=device, dtype=torch.float32
-            ),
             near_boundary_low=torch.tensor(
                 threshold_near_boundary_low, device=device, dtype=torch.float32
             ),
@@ -682,16 +670,6 @@ class Scenario(BaseScenario):
             ).deg2rad(),
             change_acc=torch.tensor(
                 threshold_change_acc, device=device, dtype=torch.float32
-            ),
-            no_reward_if_too_close_to_boundaries=torch.tensor(
-                threshold_no_reward_if_too_close_to_boundaries,
-                device=device,
-                dtype=torch.float32,
-            ),
-            no_reward_if_too_close_to_other_agents=torch.tensor(
-                threshold_no_reward_if_too_close_to_other_agents,
-                device=device,
-                dtype=torch.float32,
             ),
             distance_mask_agents=self.normalizers.pos[0],
         )
@@ -741,23 +719,26 @@ class Scenario(BaseScenario):
         reward_goal = (
             kwargs.pop("reward_goal", 10) / r_p_normalizer
         )  # Goal-reaching reward
-        reward_track_ref_vel = (
-            kwargs.pop("reward_track_ref_vel", 20) / r_p_normalizer
+        reward_platoon_space = (
+            kwargs.pop("reward_platoon_space", 20) / r_p_normalizer
         )
-        reward_track_ref_space = (
-            kwargs.pop("reward_track_ref_space", 20) / r_p_normalizer
+        reward_hinge_space = (
+            kwargs.pop("reward_hinge_space", 50) / r_p_normalizer
         )
-        reward_track_ref_heading = (
-            kwargs.pop("reward_track_ref_heading", 50) / r_p_normalizer
+        reward_platoon_vel = (
+            kwargs.pop("reward_platoon_vel", 20) / r_p_normalizer
         )
-        reward_track_ref_path = (
-            kwargs.pop("reward_track_ref_path", 50) / r_p_normalizer
+        reward_hinge_vel = (
+            kwargs.pop("reward_hinge_vel", 0) / r_p_normalizer
         )
-        reward_track_hinge = (
-            kwargs.pop("reward_track_hinge", 50) / r_p_normalizer
+        reward_platoon_ref = (
+            kwargs.pop("reward_platoon_ref", 50) / r_p_normalizer
         )
-        reward_track_hinge_vel = (
-            kwargs.pop("reward_track_hinge_vel", 30) / r_p_normalizer
+        reward_hinge_ref = (
+            kwargs.pop("reward_hinge_ref", 50) / r_p_normalizer
+        )
+        reward_platoon_heading = (
+            kwargs.pop("reward_platoon_heading", 50) / r_p_normalizer
         )
         reward_hinge = (
             kwargs.pop("reward_hinge", 100) / r_p_normalizer
@@ -776,17 +757,18 @@ class Scenario(BaseScenario):
             "goal_incomplete_hinge_penalty_mode", "scaled"
         )
         self.rewards = OcctRewards(
-            progress=torch.tensor(reward_progress, device=device, dtype=torch.float32),
+            reward_progress=torch.tensor(reward_progress, device=device, dtype=torch.float32),
             weighting_ref_directions=weighting_ref_directions,  # Progress in the weighted directions (directions indicating by
             # closer short-term reference points have higher weights)
-            higth_v=torch.tensor(reward_vel, device=device, dtype=torch.float32),
-            reach_goal=torch.tensor(reward_goal, device=device, dtype=torch.float32),
-            reward_track_ref_vel=torch.tensor(reward_track_ref_vel, device=device, dtype=torch.float32),
-            reward_track_ref_space=torch.tensor(reward_track_ref_space, device=device, dtype=torch.float32),
-            reward_track_ref_heading=torch.tensor(reward_track_ref_heading, device=device, dtype=torch.float32),
-            reward_track_ref_path=torch.tensor(reward_track_ref_path, device=device, dtype=torch.float32),
-            reward_track_hinge=torch.tensor(reward_track_hinge, device=device, dtype=torch.float32),
-            reward_track_hinge_vel=torch.tensor(reward_track_hinge_vel, device=device, dtype=torch.float32),
+            reward_vel=torch.tensor(reward_vel, device=device, dtype=torch.float32),
+            reward_goal=torch.tensor(reward_goal, device=device, dtype=torch.float32),
+            reward_platoon_heading=torch.tensor(reward_platoon_heading, device=device, dtype=torch.float32),
+            reward_platoon_space=torch.tensor(reward_platoon_space, device=device, dtype=torch.float32),
+            reward_hinge_space=torch.tensor(reward_hinge_space, device=device, dtype=torch.float32),
+            reward_platoon_vel=torch.tensor(reward_platoon_vel, device=device, dtype=torch.float32),
+            reward_hinge_vel=torch.tensor(reward_hinge_vel, device=device, dtype=torch.float32),
+            reward_platoon_ref=torch.tensor(reward_platoon_ref, device=device, dtype=torch.float32),
+            reward_hinge_ref=torch.tensor(reward_hinge_ref, device=device, dtype=torch.float32),
             reward_hinge=torch.tensor(reward_hinge, device=device, dtype=torch.float32),
         )
         self.rew = torch.zeros(batch_dim, device=device, dtype=torch.float32)
@@ -1044,13 +1026,19 @@ class Scenario(BaseScenario):
         stage3_start = time.time()
         s_start_buffer = 0.0
         s_end_buffer = 10.0
+        #last_vehicle_s_min = torch.clamp(0.7*self.road.batch_corner_s_begin - 30,min=0)
+        last_vehicle_s_min = torch.clamp(self.road.batch_corner_s_end-self.rod_len - s_start_buffer,min=0)
+        last_vehicle_s_max = torch.clamp(self.road.get_s_max() - s_end_buffer,min=0)
         if self.is_rand_arc_pos:
             #last_vehicle_s=torch.normal(mean=self.road.batch_corner_s, std=self.road.batch_corner_s/2) #260301
             #last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
             #last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
             last_vehicle_s = self.get_random_tensor() * self.road.get_s_max() #260128
+            last_vehicle_s = last_vehicle_s_min + self.get_random_tensor() * (last_vehicle_s_max - last_vehicle_s_min)   #260318 TODO: revise to origin, only for debug
         else:
             last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos
+            last_vehicle_s = 0.7*self.road.batch_corner_s_end  #260317 TODO: revise to origin, only for debug
+            last_vehicle_s = last_vehicle_s_min  #260318 TODO: revise to origin, only for debug
         last_vehicle_s = torch.clamp(last_vehicle_s, s_start_buffer * torch.ones(B,device=device),
                                     self.road.get_s_max() - (s_start_buffer + s_end_buffer) - (self.n_agents - 1) * torch.mean(spacing, dim=-1))
 
@@ -1251,7 +1239,7 @@ class Scenario(BaseScenario):
             sample_ds=self.sample_interval,
             env_j=env_j,
             hinge_edge_buffer=self.agent_width/2,
-            corner_s=self.road.batch_corner_s,
+            corner_s=self.road.batch_corner_s_begin,
             hinge_relative_pos=self.hinge_relative_pos,
         )[env_j]
         
@@ -1835,7 +1823,63 @@ class Scenario(BaseScenario):
             "dt": self.dt,
             "device": str(self.device),
         }
-    
+
+    def _compute_tracking_error_space(self):
+        error_space = torch.zeros(
+            (self.world.batch_dim, self.n_agents, 2),
+            device=self.world.device,
+            dtype=torch.float32,
+        )
+        if self.task_class == TaskClass.OCCT_PLATOON:
+            target_agent_s, _ = self.get_dynamic_target_arc_positions()
+            error_space[:, :, 0] = self.observations.agent_s - target_agent_s
+        else:
+            for agent_idx in range(self.n_agents):
+                if agent_idx > 0:
+                    actual_distance = self.distances.agents[:, agent_idx, agent_idx - 1]
+                    error_space[:, agent_idx, 0] = actual_distance - self.platoon_space_batch
+                if agent_idx < self.n_agents - 1:
+                    actual_distance = self.distances.agents[:, agent_idx, agent_idx + 1]
+                    error_space[:, agent_idx, 1] = actual_distance - self.platoon_space_batch
+        return error_space
+
+    def _compute_tracking_error_vel(self):
+        error_vel = torch.zeros(
+            (self.world.batch_dim, self.n_agents, 2),
+            device=self.world.device,
+            dtype=torch.float32,
+        )
+        agent_speed = torch.stack(
+            [torch.linalg.norm(agent.state.vel, dim=1) for agent in self.world.agents],
+            dim=1,
+        )
+        leader_speed = agent_speed[:, 0]
+        leader_ref_speed = self.ref_paths_agent_related.short_term[:, 0, 0, -1]
+        for agent_idx in range(self.n_agents):
+            ego_speed = agent_speed[:, agent_idx]
+            if self.task_class == TaskClass.OCCT_PLATOON:
+                if agent_idx in self.TRACTOR_SLICE:
+                    continue
+                hinge_status = self.ref_paths_agent_related.hinge_status[:, agent_idx]
+                non_hinge_status = ~hinge_status
+                target_hinge_speed = torch.linalg.norm(
+                    self.get_target_hinge_vel(agent_idx, 0),
+                    dim=-1,
+                )
+                error_vel[hinge_status, agent_idx, 0] = ego_speed[hinge_status] - target_hinge_speed[hinge_status]
+                error_vel[hinge_status, agent_idx, 1] = error_vel[hinge_status, agent_idx, 0]
+
+                front_vehicle_speed_error = agent_speed[:, agent_idx - 1] - ego_speed
+                error_vel[non_hinge_status, agent_idx, 0] = front_vehicle_speed_error[non_hinge_status]
+                rear_vehicle_speed_error = agent_speed[:, agent_idx + 1] - ego_speed
+                error_vel[non_hinge_status, agent_idx, 1] = rear_vehicle_speed_error[non_hinge_status]
+            else:
+                if agent_idx == 0:
+                    error_vel[:, agent_idx, 0] = ego_speed - leader_ref_speed
+                else:
+                    error_vel[:, agent_idx, 0] = ego_speed - leader_speed
+                error_vel[:, agent_idx, 1] = error_vel[:, agent_idx, 0]
+        return error_vel
     def update_observation_and_normalize(self, agent, agent_index):
         """Update observation and normalize them."""
         if agent_index == 0:  # Avoid repeated computations
@@ -1866,41 +1910,10 @@ class Scenario(BaseScenario):
                 self.distances.boundaries / self.normalizers.distance_lanelet
             )
 
-            # 初始化相对间距误差张量，形状为(batch_dim, self.n_agents, 2)
-            error_space = torch.zeros(
-                (self.world.batch_dim, self.n_agents, 2), 
-                device=self.world.device, 
-                dtype=torch.float32
-            )
-            error_vel = torch.zeros(
-                (self.world.batch_dim, self.n_agents, 2),
-                device=self.world.device,
-                dtype=torch.float32,
-            )
-            if self.task_class == TaskClass.OCCT_PLATOON:
-                _, desired_gap_s = self.get_dynamic_target_arc_positions()
-                for i in range(self.n_agents):
-                    if i > 0:
-                        actual_front_gap_s = (
-                            self.observations.agent_s[:, i - 1] - self.observations.agent_s[:, i]
-                        )
-                        error_space[:, i, 0] = actual_front_gap_s - desired_gap_s
-
-                    if i < self.n_agents - 1:
-                        actual_rear_gap_s = (
-                            self.observations.agent_s[:, i] - self.observations.agent_s[:, i + 1]
-                        )
-                        error_space[:, i, 1] = actual_rear_gap_s - desired_gap_s
-            else:
-                for i in range(self.n_agents):
-                    if i > 0:
-                        actual_distance = self.distances.agents[:, i, i-1]
-                        error_space[:, i, 0] = (actual_distance - self.platoon_space_batch)
-
-                    if i < self.n_agents - 1:
-                        actual_distance = self.distances.agents[:, i, i+1]
-                        error_space[:, i, 1] = (actual_distance - self.platoon_space_batch)
+            error_space = self._compute_tracking_error_space()
+            error_vel = self._compute_tracking_error_vel()
             self.observations.error_space.add(error_space)
+            self.observations.error_vel = error_vel
             if True:
                 pos_i_others = torch.zeros(
                     (self.world.batch_dim, self.n_agents, self.n_agents, 2),
@@ -2014,20 +2027,7 @@ class Scenario(BaseScenario):
                         hinge_i_others[
                             :, a_i, a_j, :, 2:
                         ] = self.ref_paths_agent_related.hinge_short_term[:, a_j, :, 2:]
-                        
-                        
-
-                    ego_longitudinal_velocity = vel_i_others[:, a_i, a_i, 0]
-                    if a_i > 0:
-                        error_vel[:, a_i, 0] = (
-                            vel_i_others[:, a_i, a_i - 1, 0] - ego_longitudinal_velocity
-                        )
-                    if a_i < self.n_agents - 1:
-                        error_vel[:, a_i, 1] = (
-                            vel_i_others[:, a_i, a_i + 1, 0] - ego_longitudinal_velocity
-                        )
-
-                self.observations.error_vel = error_vel
+                
                 assert not torch.isnan(self.observations.error_vel).any()
 
                 # Add new observations & normalize
@@ -2093,19 +2093,24 @@ class Scenario(BaseScenario):
         self_short_term = self.observations.past_relative_ref_info.get_latest()[
                 indexing_tuple_3
             ]
-        hinge_mask = ~self.ref_paths_agent_related.hinge_status[:,agent_index]
-        hinge_mask = hinge_mask[:, None, None]
-        observed_hinge_short_term = self.observations.past_relative_hinge_info.get_latest()[:,agent_index,agent_index]
-        #self_target_hinge_short_term = self.observations.past_relative_hinge_info.get_latest()[:,agent_index]
-        hinge_short_term_pts = observed_hinge_short_term[...,:2] / self.normalizers.pos
-        hinge_short_term_vxy = observed_hinge_short_term[...,2:4] / self.normalizers.v
-        hinge_short_term_status = observed_hinge_short_term[..., 4:5]
-        hinge_info = torch.cat(
-            (hinge_short_term_pts, hinge_short_term_vxy, hinge_short_term_status), 
-            dim=-1
-        )
-        hinge_info = hinge_info.masked_fill(hinge_mask, 0.0)
-        if hinge_info.max() > self.obs_audit_large_threshold:
+        effective_short_term = self_short_term
+        if self.task_class == TaskClass.OCCT_PLATOON:
+            hinge_mask = self.ref_paths_agent_related.hinge_status[:,agent_index][:, None, None]
+            observed_hinge_short_term = self.observations.past_relative_hinge_info.get_latest()[
+                :,agent_index,agent_index
+            ]
+            hinge_short_term_status = observed_hinge_short_term[..., 4:5]
+            hinge_short_term_speed = torch.linalg.norm(
+                observed_hinge_short_term[..., 2:4],
+                dim=-1,
+                keepdim=True,
+            )
+            hinge_info = torch.cat(
+                (observed_hinge_short_term[..., :2], hinge_short_term_speed),
+                dim=-1,
+            )
+            effective_short_term = torch.where(hinge_mask, hinge_info, self_short_term)
+        if hinge_info is not None and hinge_info.max() > self.obs_audit_large_threshold:
             print(
                 f"[OBS_AUDIT_DEBUG] HINGE_INFO_ABNORMAL "
                 f"step={self._get_obs_audit_step()} agent={agent_index} "
@@ -2143,11 +2148,11 @@ class Scenario(BaseScenario):
             ),
             (
                 "self_ref_velocity",
-                self_short_term[...,2].reshape(self.world.batch_dim, -1)
+                effective_short_term[...,2].reshape(self.world.batch_dim, -1)
                 if not self.mask_ref_v
                 else None,
             ),
-            ("self_ref_points", self_short_term[...,:2].reshape(self.world.batch_dim, -1)),
+            ("self_ref_points", effective_short_term[...,:2].reshape(self.world.batch_dim, -1)),
             ("self_left_boundary_distance", self_left_dis.reshape(self.world.batch_dim, -1)),
             ("self_right_boundary_distance", self_right_dis.reshape(self.world.batch_dim, -1)),
             (
@@ -2157,11 +2162,17 @@ class Scenario(BaseScenario):
                 else None,
             ),
             (
-                "self_distance_to_ref",
-                self.observations.past_distance_to_ref_path.get_latest()[
-                    :, agent_index
-                ].reshape(self.world.batch_dim, -1),
+                "self_hinge_status",
+                hinge_short_term_status.reshape(self.world.batch_dim, -1)
+                if self.task_class == TaskClass.OCCT_PLATOON
+                else None,
             ),
+            # (
+            #     "self_distance_to_ref",
+            #     self.observations.past_distance_to_ref_path.get_latest()[
+            #         :, agent_index
+            #     ].reshape(self.world.batch_dim, -1),
+            # ),
             (
                 "self_distance_to_left_boundary",
                 self.observations.past_distance_to_left_boundary.get_latest()[
@@ -2604,7 +2615,7 @@ class Scenario(BaseScenario):
             :, self.FOLLOWER_SLICE
         ].to(torch.float32).mean(dim=-1)
 
-    def get_hinge_approach_progress(self, agent_index):
+    def get_hinge_approach_progress(self, agent_index, is_simple=False):
         if self.observations.past_relative_hinge_info.valid_size < 2:
             return torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
 
@@ -2624,12 +2635,13 @@ class Scenario(BaseScenario):
             dim=-1,
         )
         hinge_approach_progress = prev_hinge_distance - current_hinge_distance
+        if is_simple:
+            return torch.sign(hinge_approach_progress)
         return torch.where(
             hinge_status,
             hinge_approach_progress,
             torch.zeros_like(hinge_approach_progress),
         )
-
     def get_local_relative_longitudinal_velocity_history(self, agent_index, indexing_tuple_1):
         n_observed_steps = int(self.observations.n_observed_steps.item())
         other_local_vel_history = torch.stack(
@@ -2647,37 +2659,38 @@ class Scenario(BaseScenario):
             dim=-1,
         ) * self.normalizers.v
         return other_local_vel_history[..., 0, :] - ego_local_vel_history[:, None, 0, :]
+    def clamp_error_reward(self,weight,error,offset:float=1.0,norm:int=2,max:float=1.0,min:float=None):
+        return (
+            offset - torch.clamp(
+                weight * error**norm,
+                max=max,
+                min=min,
+            )
+        )
+    def _reward_conditional_goal(self):
+        all_followers_hinged = self.get_all_followers_hinged()
+        hinged_followers_ratio = self.get_hinged_followers_ratio()
+        if self.goal_incomplete_hinge_penalty_mode == "constant":
+            goal_penalty = self.penalty_goal_incomplete_hinge.expand(self.batch_dim)
+        elif self.goal_incomplete_hinge_penalty_mode == "scaled":
+            goal_penalty = self.penalty_goal_incomplete_hinge * (1 - hinged_followers_ratio)
+        else:
+            raise ValueError(
+                f"Unsupported goal_incomplete_hinge_penalty_mode: "
+                f"{self.goal_incomplete_hinge_penalty_mode}"
+            )
+        goal_mask=all_followers_hinged.to(torch.float32)
+        is_reach_goal = self.collisions.with_exit_segments.any(dim=-1).to(torch.float32)
+        reward_goal = is_reach_goal * (
+            goal_mask * self.rewards.reward_goal + (1 - goal_mask) * goal_penalty
+        )
+        return reward_goal
 
-    def _apply_reference_tracking_rewards(
+    def _reward_agent_heading(
         self,
-        reward_details,
-        agent_index,
         ref_points_vecs,
         move_vec,
-        space_errors_sq,
-        track_ref_vel_space_mask,
-        track_ref_path_mask=None,
-        track_ref_heading_mask=None,
-        goal_mask=None,
-        goal_penalty=None,
     ):
-        if track_ref_path_mask is None:
-            track_ref_path_mask = track_ref_vel_space_mask
-        if track_ref_heading_mask is None:
-            track_ref_heading_mask = track_ref_vel_space_mask
-        if goal_mask is None:
-            goal_mask = torch.ones(
-                self.batch_dim, device=self.device, dtype=torch.float32
-            )
-        else:
-            goal_mask = goal_mask.to(torch.float32)
-        if goal_penalty is None:
-            goal_penalty = torch.zeros(
-                self.batch_dim, device=self.device, dtype=torch.float32
-            )
-        else:
-            goal_penalty = goal_penalty.to(torch.float32)
-
         ref_vector = torch.mean(ref_points_vecs, dim=1)
         ref_vector_normalized = ref_vector / (torch.norm(ref_vector, dim=-1, keepdim=True) + 1e-8)
         move_vector = move_vec[:, 0, :]
@@ -2691,132 +2704,82 @@ class Scenario(BaseScenario):
             min=0.0,
             max=1.0,
         )
-        reward_track_ref_heading = (
-            1 - torch.clamp(
-                self.rewards.reward_track_ref_heading * (1 - heading_alignment),
-                max=1.0,
-            ) * track_ref_heading_mask
-        ) 
-        reward_details["reward_track_ref_heading"][:, agent_index] = reward_track_ref_heading
-
-        error_vel_sq = torch.max(self.observations.error_vel[:, agent_index] ** 2, dim=-1)[0]
-        reward_track_ref_vel = (
-            1 - torch.clamp(
-                self.rewards.reward_track_ref_vel * error_vel_sq,
-                max=1.0,
-            ) * track_ref_vel_space_mask
+        reward_platoon_heading = self.clamp_error_reward(
+            self.rewards.reward_platoon_heading,
+            (1 - heading_alignment),
+            norm=1,
         )
-        reward_track_ref_space = (
-            1 - torch.clamp(
-                self.rewards.reward_track_ref_space * space_errors_sq,
-                max=1.0,
-            ) * track_ref_vel_space_mask
-        ) 
-
-        weighted_ref_dis = 0.0
-        for idx, ratio in enumerate((0.2, 0.8)):
-            weighted_ref_dis += ratio * self.distances.lookahead_pts[:, agent_index, idx]
-        reward_track_ref_path = (
-            1 - torch.clamp(
-                self.rewards.reward_track_ref_path * weighted_ref_dis**2,
-                max=1.0,
-            ) * track_ref_path_mask
-        )
-
-        reward_details["reward_track_ref_vel"][:, agent_index] = reward_track_ref_vel
-        reward_details["reward_track_ref_space"][:, agent_index] = reward_track_ref_space
-        reward_details["reward_track_ref_path"][:, agent_index] = reward_track_ref_path
-
-        is_reach_goal = self.collisions.with_exit_segments.any(dim=-1).to(torch.float32)
-        reward_goal = is_reach_goal * (
-            goal_mask * self.rewards.reach_goal + (1 - goal_mask) * goal_penalty
-        )
-        reward_details["reward_goal"][:, agent_index] = reward_goal
-        return reward_details
+        return reward_platoon_heading
 
     def reward_simple_platoon(self, reward_details, agent_index, ref_points_vecs, move_vec):
         space_errors_sq = self.observations.error_space.get_latest(n=1)[:, agent_index, 0] ** 2
         track_ref_mask = torch.ones(self.batch_dim, device=self.device, dtype=torch.bool)
 
-        reward_details = self._apply_reference_tracking_rewards(
-            reward_details=reward_details,
-            agent_index=agent_index,
-            ref_points_vecs=ref_points_vecs,
-            move_vec=move_vec,
-            space_errors_sq=space_errors_sq,
-            track_ref_vel_space_mask=track_ref_mask,
-            goal_mask=torch.ones(self.batch_dim, device=self.device, dtype=torch.float32),
-        )
-        reward_details["reward_track_hinge"][:, agent_index] = 0.0
-        reward_details["reward_track_hinge_vel"][:, agent_index] = 0.0
-        reward_details["reward_hinge"][:, agent_index] = 0.0
+        # reward_details = self._apply_reference_tracking_rewards(
+        #     reward_details=reward_details,
+        #     agent_index=agent_index,
+        #     ref_points_vecs=ref_points_vecs,
+        #     move_vec=move_vec,
+        #     goal_mask=torch.ones(self.batch_dim, device=self.device, dtype=torch.float32),
+        # )
         return reward_details
-
     def reward_occt_platoon(self, reward_details, agent, agent_index, ref_points_vecs, move_vec):
         hinge_status = self.ref_paths_agent_related.hinge_status[:,agent_index]
-        all_followers_hinged = self.get_all_followers_hinged()
-        hinged_followers_ratio = self.get_hinged_followers_ratio()
-        target_agent_s, _ = self.get_dynamic_target_arc_positions()
-        space_errors_sq = (
-            self.observations.agent_s[:, agent_index] - target_agent_s[:, agent_index]
-        ) ** 2
-        if self.goal_incomplete_hinge_penalty_mode == "constant":
-            goal_penalty = self.penalty_goal_incomplete_hinge.expand(self.batch_dim)
-        elif self.goal_incomplete_hinge_penalty_mode == "scaled":
-            goal_penalty = self.penalty_goal_incomplete_hinge * (1 - hinged_followers_ratio)
-        else:
-            raise ValueError(
-                f"Unsupported goal_incomplete_hinge_penalty_mode: "
-                f"{self.goal_incomplete_hinge_penalty_mode}"
-            )
+        platoon_s_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0]
+        reward_platoon_space = self.clamp_error_reward(self.rewards.reward_platoon_space, platoon_s_errors) * ~hinge_status
+        reward_details["reward_platoon_space"][:, agent_index] = reward_platoon_space
 
-        reward_details = self._apply_reference_tracking_rewards(
-            reward_details=reward_details,
-            agent_index=agent_index,
-            ref_points_vecs=ref_points_vecs,
-            move_vec=move_vec,
-            space_errors_sq=space_errors_sq,
-            track_ref_vel_space_mask=torch.logical_not(hinge_status),#torch.ones_like(hinge_status, dtype=torch.float32),
-            track_ref_path_mask=torch.logical_not(hinge_status),
-            track_ref_heading_mask=torch.logical_not(hinge_status),
-            goal_mask=all_followers_hinged.to(torch.float32),
-            goal_penalty=goal_penalty,
-        )
+        agent_desire_pos = self.get_lookahead_agent_pos(agent_index, 0)
+        hinge_desire_pos = self.get_target_hinge_pos(agent_index, 0)
+        hinge_pos_errors = torch.norm(hinge_desire_pos - agent_desire_pos, dim=-1)
+        reward_hinge_space = self.clamp_error_reward(self.rewards.reward_hinge_space, hinge_pos_errors) * hinge_status
+        reward_details["reward_hinge_space"][:, agent_index] = reward_hinge_space
+        
+        platoon_vel_error = torch.max(torch.abs(self.observations.error_vel[:, agent_index]), dim=-1)[0]
+        reward_platoon_vel = self.clamp_error_reward(self.rewards.reward_platoon_vel, platoon_vel_error) * ~hinge_status
+        reward_details["reward_platoon_vel"][:, agent_index] = reward_platoon_vel
 
-        weight_distance = 0.0
-        for idx, ratio in enumerate((0.3, 0.7)):
+        hinge_vel_error = torch.max(torch.abs(self.observations.error_vel[:, agent_index]), dim=-1)[0]
+        reward_hinge_vel = self.clamp_error_reward(self.rewards.reward_hinge_vel, hinge_vel_error) * hinge_status
+        reward_details["reward_hinge_vel"][:, agent_index] = reward_hinge_vel
+
+        weighted_hinge_ref_path_error = torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
+        for idx, ratio in enumerate((0.2, 0.8)):
             agent_desire_pos = self.get_lookahead_agent_pos(agent_index, idx)
             hinge_desire_pos = self.get_target_hinge_pos(agent_index, idx)
-            desire_distance = torch.norm(hinge_desire_pos - agent_desire_pos, dim=-1)
-            weight_distance += ratio * desire_distance
-        reward_track_hinge = 1 - torch.clamp(
-                self.rewards.reward_track_hinge * weight_distance,
-                max=1.0,
-            ) * hinge_status
-        reward_details["reward_track_hinge"][:, agent_index] = reward_track_hinge
+            weighted_hinge_ref_path_error += ratio * torch.norm(hinge_desire_pos - agent_desire_pos, dim=-1)
+        reward_platoon_ref = self.clamp_error_reward(self.rewards.reward_platoon_ref, weighted_hinge_ref_path_error) * ~hinge_status
+        reward_details["reward_platoon_ref"][:, agent_index] = reward_platoon_ref
 
-        hinge_approach_progress = self.get_hinge_approach_progress(agent_index)
+        weighted_platoon_ref_path_error = torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
+        for idx, ratio in enumerate((0.2, 0.8)):
+            weighted_platoon_ref_path_error += ratio * self.distances.lookahead_pts[:, agent_index, idx]
+        reward_hinge_ref = self.clamp_error_reward(self.rewards.reward_hinge_ref, weighted_platoon_ref_path_error) * hinge_status
+        reward_details["reward_hinge_ref"][:, agent_index] = reward_hinge_ref
+
+        reward_platoon_heading = self._reward_agent_heading(
+                ref_points_vecs=ref_points_vecs,
+                move_vec=move_vec,
+            ) * ~hinge_status
+        reward_details["reward_platoon_heading"][:, agent_index] = reward_platoon_heading
+
+        approach_mask = hinge_status & (hinge_pos_errors>0.5)
+        hinge_approach_progress = self.get_hinge_approach_progress(agent_index,is_simple=True)
         reward_approach_hinge = torch.clamp(
             self.reward_approach_hinge * hinge_approach_progress,
-            min=-0.5,
-            max=0.5,
-        ) * hinge_status
+            min=-1,
+            max=1,
+        ) * approach_mask
         reward_details["reward_approach_hinge"][:, agent_index] = reward_approach_hinge
-        target_hinge_vel = self.get_target_hinge_vel(agent_index, 0)
-        target_hinge_speed = torch.linalg.norm(target_hinge_vel, dim=-1)
-        agent_speed = torch.linalg.norm(agent.state.vel, dim=-1)
-        hinge_speed_error_sq = (agent_speed - target_hinge_speed) ** 2
-        reward_track_hinge_vel = 1 - torch.clamp(
-                self.rewards.reward_track_hinge_vel * hinge_speed_error_sq,
-                max=1.0,
-            ) * hinge_status
-        reward_details["reward_track_hinge_vel"][:, agent_index] = reward_track_hinge_vel
-
+        
         hinge_once = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index] & (
             ~self.ref_paths_agent_related.agent_hinge_status.get_latest(n=2)[:, agent_index]
         )
         reward_hinge = self.rewards.reward_hinge * (hinge_once & hinge_status)
         reward_details["reward_hinge"][:, agent_index] = reward_hinge
+
+        reward_goal = self._reward_conditional_goal()
+        reward_details["reward_goal"][:, agent_index] = reward_goal
         return reward_details
     
     def reward(self, agent: Agent):
@@ -2950,12 +2913,12 @@ class Scenario(BaseScenario):
         reward_progress = (
             move_projected_weighted
             / (agent.max_speed * self.world.dt)
-            * self.rewards.progress
+            * self.rewards.reward_progress
         )
         reward_details["reward_progress"][:,agent_index] = reward_progress
 
         # [reward] high velocity
-        reward_vel = v_proj / agent.max_speed * self.rewards.higth_v
+        reward_vel = v_proj / agent.max_speed * self.rewards.reward_vel
         reward_details["reward_vel"][:,agent_index] = reward_vel
 
         if self.task_class == TaskClass.SIMPLE_PLATOON:
@@ -3151,7 +3114,7 @@ class Scenario(BaseScenario):
                     sample_ds=self.sample_interval,
                     env_j=slice(None),
                     hinge_edge_buffer=self.agent_width/2,
-                    corner_s=self.road.batch_corner_s,
+                    corner_s=self.road.batch_corner_s_begin,
                     hinge_relative_pos=self.hinge_relative_pos,
                     )
                 for agent_i in range(self.n_agents):
@@ -3167,7 +3130,7 @@ class Scenario(BaseScenario):
                 agent_vel_mag = torch.linalg.norm(agent_vel, dim=-1, keepdim=True)
                 agent_tangent = agent_vel / agent_vel_mag
                 hinge_tangent = hinge_vel / hinge_vel_mag
-                agent_pos_legal = torch.linalg.norm(hinge_pos - agent_pos, dim=-1) < 0.1
+                agent_pos_legal = torch.linalg.norm(hinge_pos - agent_pos, dim=-1) < 0.15
                 agent_heading_legal = (hinge_tangent*agent_tangent).sum(dim=-1) > torch.cos(torch.tensor(10/180*torch.pi, device=self.world.device))
                 agent_vel_legal = (torch.abs(agent_vel_mag-hinge_vel_mag) < 0.2).squeeze(-1)
                 #  | self.ref_paths_agent_related.agent_hinge_status.get_latest() since save historical agent hinge status to prevent disconnect
@@ -3296,7 +3259,7 @@ class Scenario(BaseScenario):
             is_collision_with_agents
             | is_collision_with_exit_segments
             | is_collision_with_lanelets
-            #| is_agent_all_hinged
+            | is_agent_all_hinged
         )
         #is_done = is_collision_with_exit_segments
         # is_fail = is_collision_with_agents | is_collision_with_lanelets
@@ -3401,20 +3364,13 @@ class Scenario(BaseScenario):
             hinge_pos = self.get_target_hinge_pos(agent_index)
             hinge_status = self.ref_paths_agent_related.hinge_status[:,agent_index]
             agent_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest()[:,agent_index] # [B, n_agents]
-            hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)  # [batch_dim, n_points]
-            hinged_followers_ratio = self.get_hinged_followers_ratio()
-            if agent_index in self.TRACTOR_SLICE:
-                hinge_approach_progress = torch.zeros(
-                    self.batch_dim, device=self.device, dtype=torch.float32
-                )
-            else:
-                hinge_approach_progress = self.get_hinge_approach_progress(agent_index)
+            hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)*hinge_status  # [batch_dim, n_points]
+            hinged_followers_ratio = self.get_hinged_followers_ratio()*hinge_status
             hinge_dict = {
                 "hinge_status": hinge_status,
                 "agent_hinge_status": agent_hinge_status,
                 "hinge_dis": hinge_dis,
                 "hinged_followers_ratio": hinged_followers_ratio,
-                "hinge_approach_progress": hinge_approach_progress,
             }
         #print(f"agent_index: {agent_index}, hinge_status: {hinge_status}, hinge_dis: {hinge_dis}")
         info = {
@@ -3519,13 +3475,30 @@ class Scenario(BaseScenario):
             #acc,steering = action[0],action[1]
             # text info render
             # [x,y,v,a]
-            space_errors = torch.mean(torch.abs(self.observations.error_space.get_latest(n=1)[env_index, agent_i, :]),dim=-1).detach().cpu()
+            agent_desire_pos = self.get_lookahead_agent_pos(agent_i, 0)
+            hinge_desire_pos = self.get_target_hinge_pos(agent_i, 0)
+            desire_distance = torch.norm(hinge_desire_pos - agent_desire_pos, dim=-1)
+            desire_distance = desire_distance.detach().cpu().tolist()[0]
+            space_errors = torch.abs(self.observations.error_space.get_latest(n=1)[env_index, agent_i, :]).detach().cpu()
+            front_space_errors = space_errors[0]
+            rear_space_errors = space_errors[1]
             geom = rendering.TextLine(
                 #text=f"a{agent_i}->h{target_hinge_idx}:[{pos[0]:.1f},{pos[1]:.1f},{v:.1f},{acc:.1f},{space_errors:.1f}]",
-                text=f"a{agent_i}->h{target_hinge_idx}:[v:{v:.1f},a:{acc:.1f},se:{space_errors:.1f}]",
+                text=f"a{agent_i}->h{target_hinge_idx}:[v:{v:.1f},a:{acc:.1f}]",
                 #text=f"a{agent_i} to h{target_hinge_idx}",
-                x=2.5*(pos[0] - pos_origin[0]) * self.resolution_factor + self.viewer_size[0]/2,
-                y=2.5*(pos[1] - pos_origin[1]) * self.resolution_factor + self.viewer_size[1]/2,
+                x=4*(pos[0] - pos_origin[0]) * self.resolution_factor + self.viewer_size[0]/2,
+                y=4*(pos[1] - pos_origin[1]) * self.resolution_factor + self.viewer_size[1]/2+2.2*5.2*self.resolution_factor,
+                font_size=int(2*self.resolution_factor),
+            )
+            xform = rendering.Transform()
+            geom.add_attr(xform)
+            geoms.append(geom)
+            geom = rendering.TextLine(
+                #text=f"a{agent_i}->h{target_hinge_idx}:[{pos[0]:.1f},{pos[1]:.1f},{v:.1f},{acc:.1f},{space_errors:.1f}]",
+                text=f"[se:({front_space_errors:.1f},{rear_space_errors:.1f}),he:{desire_distance:.2f}]",
+                #text=f"a{agent_i} to h{target_hinge_idx}",
+                x=4*(pos[0] - pos_origin[0]) * self.resolution_factor + self.viewer_size[0]/2,
+                y=4*(pos[1] - pos_origin[1]) * self.resolution_factor + self.viewer_size[1]/2+2.2*4*self.resolution_factor,
                 font_size=int(2*self.resolution_factor),
             )
             xform = rendering.Transform()
@@ -3617,8 +3590,8 @@ class Scenario(BaseScenario):
                 geom = rendering.TextLine(
                     #text=f"h{hinge_i}_✔" if hinge_status else f"h{hinge_i}_✘",
                     text=f"h{hinge_i}-V" if hinge_status else f"h{hinge_i}-X",
-                    x=2.5*(pos[0] - pos_origin[0]) * self.resolution_factor + self.viewer_size[0]/2,
-                    y=2.5*(pos[1] - pos_origin[1]) * self.resolution_factor + self.viewer_size[1]/2-2.2*self.resolution_factor,
+                    x=4*(pos[0] - pos_origin[0]) * self.resolution_factor + self.viewer_size[0]/2,
+                    y=4*(pos[1] - pos_origin[1]) * self.resolution_factor + self.viewer_size[1]/2-2.2*self.resolution_factor,
                     font_size=int(2*self.resolution_factor),
                 )
                 xform = rendering.Transform()
