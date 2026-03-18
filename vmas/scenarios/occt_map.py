@@ -1255,7 +1255,9 @@ class OcctCRMap(MapBase):
         #self.batch_hinge_status = torch.ones(B, max_path_pts_num, self.n_agents, device=self.device)
         self.batch_s_max = torch.empty(B, device=self.device).fill_(float('nan'))
         self.batch_map_name = [None]*B
-        self.batch_corner_s = torch.zeros(B, device=self.device)
+        #self.batch_corner_s = torch.zeros(B, device=self.device)
+        self.batch_corner_s_begin = torch.zeros(B, device=self.device)
+        self.batch_corner_s_end = torch.zeros(B, device=self.device)
         max_s_len=0
         max_s_len_id=0
         for batch_idx, path_id in enumerate(self.batch_id):
@@ -1276,7 +1278,9 @@ class OcctCRMap(MapBase):
             self.batch_ref_v[batch_idx, :length, 0] = path_data["ref_v"]
             #self.batch_hinge_status[batch_idx, :length, :] = path_data["hinge_status"].transpose(0, 1) #[length, n_agents]
             #self.batch_corner_s[batch_idx] = (path_data["corner_begin_s"] + path_data["corner_end_s"]) / 2
-            self.batch_corner_s[batch_idx] = path_data["corner_begin_s"]
+            #self.batch_corner_s[batch_idx] = path_data["corner_begin_s"]
+            self.batch_corner_s_begin[batch_idx] = path_data["corner_begin_s"]
+            self.batch_corner_s_end[batch_idx] = path_data["corner_end_s"]
         # 对长度不足的道路样本进行延伸填充
         for batch_idx in range(B):
             current_length = torch.count_nonzero(~torch.isnan(self.batch_center_vertices[batch_idx, :, 0])).item()
