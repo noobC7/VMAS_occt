@@ -90,6 +90,8 @@ class Scenario(BaseScenario):
         # episode step 追踪（向量化，每个并行环境独立计数）
         self.env_current_step = torch.zeros(batch_dim, device=device, dtype=torch.long)
         self.env_total_step = torch.zeros(batch_dim, device=device, dtype=torch.long)
+        self.success_count = torch.zeros(batch_dim, device=device, dtype=torch.float32)
+        self.failure_count = torch.zeros(batch_dim, device=device, dtype=torch.float32)
         self.agent_index_focus = kwargs.pop("agent_index_focus", AGENT_INDEX_FOCUS)
         self.enable_obs_audit = kwargs.pop("enable_obs_audit", True)
         self.obs_audit_interval = int(kwargs.pop("obs_audit_interval", 100))
@@ -111,6 +113,9 @@ class Scenario(BaseScenario):
         self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
         self.n_agents=kwargs.pop("n_agents", 5)
+        self.hinge_active_steps = torch.zeros(
+            (batch_dim, self.n_agents), device=device, dtype=torch.long
+        )
         self.obs_audit_agent_index = min(max(self.obs_audit_agent_index, 0), self.n_agents - 1)
         # platoon params
         self.is_loop=kwargs.pop("is_loop", False)
@@ -161,7 +166,7 @@ class Scenario(BaseScenario):
         
         # Visualization
         self.visualize_semidims=True
-        self.viewer_zoom = float(kwargs.get("viewer_zoom", 20)) #7
+        self.viewer_zoom = float(kwargs.pop("viewer_zoom", 20)) #7
         self.world_x_dim = kwargs.pop(
             "world_x_dim", 200
         )  # The x-dimension of the world in [m]
@@ -180,7 +185,7 @@ class Scenario(BaseScenario):
             ),
         )
         # agent params
-        self.max_speed = float(kwargs.get("max_speed", 5))
+        self.max_speed = float(kwargs.pop("max_speed", 5))
         self.max_steering_angle = kwargs.pop(
             "max_steering_angle",
             torch.deg2rad(torch.tensor(35, device=device, dtype=torch.float32)),
@@ -221,7 +226,7 @@ class Scenario(BaseScenario):
                 device=device,
                 dtype=torch.float32
             )
-            self.cargo_half_width = float(kwargs.get("cargo_half_width", 2))
+            self.cargo_half_width = float(kwargs.pop("cargo_half_width", 2))
             self.n_hinges = self.hinge_relative_pos.size(0)
             self.dock_agent_when_hinged = kwargs.pop("dock_agent_when_hinged", True)
         # self.road = OcctMap(
@@ -375,6 +380,9 @@ class Scenario(BaseScenario):
             ),
             distance_agent=torch.tensor(
                 self.agent_length * 10, device=device, dtype=torch.float32
+            ),
+            hinge_step=torch.tensor(
+                200, device=device, dtype=torch.float32
             ),
         )
         self.obs_relative_velocity_scale = torch.tensor(
@@ -616,6 +624,7 @@ class Scenario(BaseScenario):
             "reward_hinge_space": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
 
             "reward_approach_hinge": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "penalty_hinge_time_cost": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
 
             "penalty_near_boundary": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "penalty_near_other_agents": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
@@ -756,6 +765,11 @@ class Scenario(BaseScenario):
         self.goal_incomplete_hinge_penalty_mode = kwargs.pop(
             "goal_incomplete_hinge_penalty_mode", "scaled"
         )
+        # +reward_hinge at the first hinge step, linearly decreasing to
+        # -reward_hinge after `hinge_reward_zero_time` seconds in the hinge zone.
+        self.hinge_reward_zero_time = float(
+            kwargs.pop("hinge_reward_zero_time", 2.0)
+        )
         self.rewards = OcctRewards(
             reward_progress=torch.tensor(reward_progress, device=device, dtype=torch.float32),
             weighting_ref_directions=weighting_ref_directions,  # Progress in the weighted directions (directions indicating by
@@ -794,6 +808,9 @@ class Scenario(BaseScenario):
         penalty_backward = (
             kwargs.pop("penalty_backward", -100) / r_p_normalizer
         ) 
+        penalty_hinge_time_cost = (
+            kwargs.pop("penalty_hinge_time_cost", -5) / r_p_normalizer
+        ) 
 
         self.penalties = OcctPenalties(
             near_boundary=torch.tensor(penalty_near_boundary, device=device, dtype=torch.float32),
@@ -809,6 +826,7 @@ class Scenario(BaseScenario):
             change_steering=torch.tensor(penalty_change_steering, device=device, dtype=torch.float32),
             change_acc=torch.tensor(penalty_change_acc, device=device, dtype=torch.float32),
             backward=torch.tensor(penalty_backward, device=device, dtype=torch.float32),
+            hinge_time_cost=torch.tensor(penalty_hinge_time_cost, device=device, dtype=torch.float32),
         )
 
         ScenarioUtils.check_kwargs_consumed(kwargs)
@@ -1010,6 +1028,7 @@ class Scenario(BaseScenario):
         else:
             idx_mask = torch.zeros(B, dtype=torch.bool, device=device)
             idx_mask[env_index] = True
+        self.hinge_active_steps[idx_mask] = 0
 
         # ============== 阶段2：生成车队速度/间距 ==============
         stage2_start = time.time()
@@ -1034,11 +1053,13 @@ class Scenario(BaseScenario):
             #last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
             #last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
             last_vehicle_s = self.get_random_tensor() * self.road.get_s_max() #260128
-            last_vehicle_s = last_vehicle_s_min + self.get_random_tensor() * (last_vehicle_s_max - last_vehicle_s_min)   #260318 TODO: revise to origin, only for debug
+            last_vehicle_s = last_vehicle_s_min + self.get_random_tensor() * (last_vehicle_s_max - last_vehicle_s_min)   #260318 TODO: revise to origin, only for debug hinge stage
+            last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos + self.get_random_tensor() * (last_vehicle_s_min - self.init_arc_pos) #260320 two stage
         else:
             last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos
             last_vehicle_s = 0.7*self.road.batch_corner_s_end  #260317 TODO: revise to origin, only for debug
-            last_vehicle_s = last_vehicle_s_min  #260318 TODO: revise to origin, only for debug
+            last_vehicle_s = last_vehicle_s_min  #260318 TODO: revise to origin, only for debug hinge stage
+            last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos #260320 two stage
         last_vehicle_s = torch.clamp(last_vehicle_s, s_start_buffer * torch.ones(B,device=device),
                                     self.road.get_s_max() - (s_start_buffer + s_end_buffer) - (self.n_agents - 1) * torch.mean(spacing, dim=-1))
 
@@ -1842,12 +1863,12 @@ class Scenario(BaseScenario):
         agent_vel_mag = torch.linalg.norm(agent_vel, dim=-1, keepdim=True)
         agent_tangent = agent_vel / torch.clamp(agent_vel_mag, min=1e-6)
         hinge_tangent = hinge_vel / torch.clamp(hinge_vel_mag, min=1e-6)
-        agent_pos_legal = torch.linalg.norm(hinge_pos - agent_pos, dim=-1) < 0.1
+        agent_pos_legal = torch.linalg.norm(hinge_pos - agent_pos, dim=-1) < 0.15
         agent_heading_legal = (hinge_tangent * agent_tangent).sum(dim=-1) > torch.cos(
             torch.tensor(5 / 180 * torch.pi, device=self.world.device)
         )
         agent_vel_legal = (
-            torch.abs(agent_vel_mag - hinge_vel_mag) < 0.5
+            torch.abs(agent_vel_mag - hinge_vel_mag) < 0.75
         ).squeeze(-1)
         prev_agent_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest()
         agent_legal_to_hinge = (
@@ -2207,6 +2228,8 @@ class Scenario(BaseScenario):
         )
         vel = self.observations.past_vel.get_latest()[indexing_tuple_vel]
         vel_mag = torch.linalg.norm(vel, dim=-1)
+        hinge_steps = self.hinge_active_steps[:, agent_index]
+        hinge_time_cost = -torch.clamp(hinge_steps/self.normalizers.hinge_step,max=1)
         obs_self_groups = [
             ("self_vel", vel.reshape(self.world.batch_dim, -1)),
             ("self_speed", vel_mag.reshape(self.world.batch_dim, -1)),
@@ -2237,6 +2260,12 @@ class Scenario(BaseScenario):
                 if self.task_class == TaskClass.OCCT_PLATOON
                 else None,
             ),
+            # (
+            #     "hinge_time_cost",
+            #     hinge_time_cost.reshape(self.world.batch_dim, -1)
+            #     if self.task_class == TaskClass.OCCT_PLATOON
+            #     else None,
+            # ),
             (
                 "self_distance_to_ref",
                 torch.linalg.norm(effective_short_term[
@@ -2792,8 +2821,13 @@ class Scenario(BaseScenario):
         #     goal_mask=torch.ones(self.batch_dim, device=self.device, dtype=torch.float32),
         # )
         return reward_details
-    def reward_occt_platoon(self, reward_details, agent, agent_index, ref_points_vecs, move_vec):
+    def reward_occt_platoon(self, reward_details, agent_index, ref_points_vecs, move_vec):
         hinge_status = self.ref_paths_agent_related.hinge_status[:,agent_index]
+        self.hinge_active_steps[:, agent_index] = torch.where(
+            hinge_status,
+            self.hinge_active_steps[:, agent_index] + 1,
+            torch.zeros_like(self.hinge_active_steps[:, agent_index]),
+        )
         platoon_s_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0]
         reward_platoon_space = self.clamp_error_reward(self.rewards.reward_platoon_space, platoon_s_errors) * ~hinge_status
         reward_details["reward_platoon_space"][:, agent_index] = reward_platoon_space
@@ -2817,13 +2851,13 @@ class Scenario(BaseScenario):
             agent_desire_pos = self.get_lookahead_agent_pos(agent_index, idx)
             hinge_desire_pos = self.get_target_hinge_pos(agent_index, idx)
             weighted_hinge_ref_path_error += ratio * torch.norm(hinge_desire_pos - agent_desire_pos, dim=-1)
-        reward_hinge_ref = self.clamp_error_reward(self.rewards.reward_hinge_ref, weighted_hinge_ref_path_error) * ~hinge_status
+        reward_hinge_ref = self.clamp_error_reward(self.rewards.reward_hinge_ref, weighted_hinge_ref_path_error) * hinge_status
         reward_details["reward_hinge_ref"][:, agent_index] = reward_hinge_ref
 
         weighted_platoon_ref_path_error = torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
         for idx, ratio in enumerate((0.2, 0.8)):
             weighted_platoon_ref_path_error += ratio * self.distances.lookahead_pts[:, agent_index, idx]
-        reward_platoon_ref = self.clamp_error_reward(self.rewards.reward_platoon_ref, weighted_platoon_ref_path_error) * hinge_status
+        reward_platoon_ref = self.clamp_error_reward(self.rewards.reward_platoon_ref, weighted_platoon_ref_path_error)# * ~hinge_status
         reward_details["reward_platoon_ref"][:, agent_index] = reward_platoon_ref
 
         reward_platoon_heading = self._reward_agent_heading(
@@ -2832,7 +2866,7 @@ class Scenario(BaseScenario):
             ) * ~hinge_status
         reward_details["reward_platoon_heading"][:, agent_index] = reward_platoon_heading
 
-        approach_mask = hinge_status & (hinge_pos_errors>0.5)
+        approach_mask = hinge_status # & (hinge_pos_errors>0.5)
         hinge_approach_progress = self.get_hinge_approach_progress(agent_index,is_simple=True)
         reward_approach_hinge = torch.clamp(
             self.reward_approach_hinge * hinge_approach_progress,
@@ -2841,14 +2875,19 @@ class Scenario(BaseScenario):
         ) * approach_mask
         reward_details["reward_approach_hinge"][:, agent_index] = reward_approach_hinge
         
-        hinge_once = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index] & (
-            ~self.ref_paths_agent_related.agent_hinge_status.get_latest(n=2)[:, agent_index]
-        )
-        reward_hinge = self.rewards.reward_hinge * (hinge_once & hinge_status)
+        current_agent_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index]
+        last_agent_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=2)[:, agent_index]
+        hinge_once = current_agent_hinge_status & ~last_agent_hinge_status
+        
+        reward_hinge = self.rewards.reward_hinge * (hinge_once & hinge_status).to(torch.float32)
+            
         reward_details["reward_hinge"][:, agent_index] = reward_hinge
-
-        reward_goal = self._reward_conditional_goal()
-        reward_details["reward_goal"][:, agent_index] = reward_goal
+        hinge_steps = self.hinge_active_steps[:, agent_index]
+        #print(f"hinge_steps-[{hinge_steps.min().cpu(),hinge_steps.mean().cpu(),hinge_steps.max().cpu()}]")
+        #hinge_time_cost = -torch.clamp(hinge_steps/self.normalizers.hinge_step,max=2)
+        reward_details["penalty_hinge_time_cost"][:, agent_index] = self.penalties.hinge_time_cost*((hinge_status & ~current_agent_hinge_status).to(torch.float32))
+        #reward_goal = self._reward_conditional_goal()
+        reward_details["reward_goal"][:, agent_index] = 0
         return reward_details
     
     def reward(self, agent: Agent):
@@ -3000,7 +3039,6 @@ class Scenario(BaseScenario):
         elif self.task_class == TaskClass.OCCT_PLATOON:
             reward_details = self.reward_occt_platoon(
                 reward_details=reward_details,
-                agent=agent,
                 agent_index=agent_index,
                 ref_points_vecs=ref_points_vecs,
                 move_vec=move_vec,
@@ -3275,24 +3313,44 @@ class Scenario(BaseScenario):
                 dim=-1,
             )
             self.state_buffer.add(state_add)
-    def done(self):
-        """
-        This function computes the done flag for each env in a vectorized way.
-        """
-        is_collision_with_agents = self.collisions.with_agents.view(
+    def _get_done_status(self) -> Dict[str, Tensor]:
+        """Compute environment-level done reasons and success/failure labels."""
+        is_collision_with_agents_env = self.collisions.with_agents.view(
             self.world.batch_dim, -1
-        ).any(
-            dim=-1
-        )  # [batch_dim]
+        ).any(dim=-1)
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
         is_collision_with_exit_segments = self.collisions.with_exit_segments.any(dim=-1)
         is_agent_all_hinged = self.get_all_followers_hinged()
         is_done = (
-            is_collision_with_agents
+            is_collision_with_agents_env
             | is_collision_with_exit_segments
             | is_collision_with_lanelets
             | is_agent_all_hinged
         )
+        # Success is defined strictly as "done only because all followers hinged".
+        is_success = is_agent_all_hinged & ~(
+            is_collision_with_agents_env
+            | is_collision_with_exit_segments
+            | is_collision_with_lanelets
+        )
+        is_failure = is_done & ~is_success
+        return {
+            "is_done": is_done,
+            "is_success": is_success,
+            "is_failure": is_failure,
+            "is_collision_with_agents_env": is_collision_with_agents_env,
+            "is_collision_with_lanelets": is_collision_with_lanelets,
+            "is_collision_with_exit_segments": is_collision_with_exit_segments,
+            "is_agent_all_hinged": is_agent_all_hinged,
+        }
+    def done(self):
+        """
+        This function computes the done flag for each env in a vectorized way.
+        """
+        done_status = self._get_done_status()
+        is_done = done_status["is_done"]
+        self.success_count += done_status["is_success"].float()
+        self.failure_count += done_status["is_failure"].float()
         #is_done = is_collision_with_exit_segments
         # is_fail = is_collision_with_agents | is_collision_with_lanelets
         # is_success = is_collision_with_exit_segments
@@ -3376,6 +3434,9 @@ class Scenario(BaseScenario):
         agent_index = self.world.agents.index(agent)  # Index of the current agent
 
         is_action_empty = agent.action.u is None
+        done_status = self._get_done_status()
+        total_finished = self.success_count + self.failure_count
+        running_success_rate = self.success_count / total_finished.clamp_min(1.0)
 
         is_collision_with_agents = self.collisions.with_agents[:, agent_index].any(
             dim=-1
@@ -3394,11 +3455,13 @@ class Scenario(BaseScenario):
             agent_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest()[:,agent_index] # [B, n_agents]
             hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)*hinge_status  # [batch_dim, n_points]
             hinged_followers_ratio = self.get_hinged_followers_ratio()*hinge_status
+            hinge_steps = self.hinge_active_steps[:, agent_index]
             hinge_dict = {
                 "hinge_status": hinge_status,
                 "agent_hinge_status": agent_hinge_status,
                 "hinge_dis": hinge_dis,
                 "hinged_followers_ratio": hinged_followers_ratio,
+                "hinge_steps": hinge_steps,
             }
         #print(f"agent_index: {agent_index}, hinge_status: {hinge_status}, hinge_dis: {hinge_dis}")
         info = {
@@ -3423,6 +3486,16 @@ class Scenario(BaseScenario):
             "error_space": agent_error_space,
             "error_vel": self.observations.error_vel[:, agent_index],
             "ref_vel": self.ref_paths_agent_related.short_term[:, agent_index, 0, 2],
+            "episode_done": done_status["is_done"].float(),
+            "episode_success": done_status["is_success"].float(),
+            "episode_failure": done_status["is_failure"].float(),
+            "done_all_hinged": done_status["is_agent_all_hinged"].float(),
+            "done_collision_with_agents": done_status["is_collision_with_agents_env"].float(),
+            "done_collision_with_lanelets": done_status["is_collision_with_lanelets"].float(),
+            "done_collision_with_exit_segments": done_status["is_collision_with_exit_segments"].float(),
+            "scenario_success_count": self.success_count,
+            "scenario_failure_count": self.failure_count,
+            "running_scenario_success_rate": running_success_rate,
             # episode 步数信息
             "episode_step": self.env_current_step,
             "env_total_step": self.env_total_step,  # 全局最大步数

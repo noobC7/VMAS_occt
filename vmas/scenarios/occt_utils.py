@@ -46,6 +46,7 @@ class OcctNormalizers:
         distance_lanelet=None,
         distance_agent=None,
         distance_ref=None,
+        hinge_step=None,
     ):
         self.pos = pos
         self.error_pos = error_pos
@@ -60,6 +61,7 @@ class OcctNormalizers:
         self.distance_lanelet = distance_lanelet
         self.distance_agent = distance_agent
         self.distance_ref = distance_ref
+        self.hinge_step = hinge_step
 class OcctRewards:
     """Reward weights used by the current OCCT platoon reward pipeline."""
     def __init__(
@@ -102,6 +104,7 @@ class OcctPenalties:
         backward=None,
         change_steering=None,
         change_acc=None,
+        hinge_time_cost=None,
     ):
         self.near_boundary = (
             near_boundary  # Penalty for being too close to lanelet boundaries
@@ -120,6 +123,7 @@ class OcctPenalties:
             change_steering  # Penalty for changing steering direction
         )
         self.change_acc = change_acc  # Penalty for changing acceleration direction
+        self.hinge_time_cost = hinge_time_cost
 
 class OcctThresholds:
     """Different thresholds, such as starting from which distance agents are deemed being too close to other agents."""

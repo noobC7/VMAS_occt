@@ -434,7 +434,9 @@ class OcctCRMap(MapBase):
         Returns:
             mean_lane_width: [B] 平均车道宽度
         """
-        lane_widths = torch.hstack([torch.tensor(path["lane_width"],device=self.device) for path in self.path_library])
+        lane_widths = torch.hstack(
+            [torch.as_tensor(path["lane_width"], device=self.device) for path in self.path_library]
+        )
         if type == "mean":
             return lane_widths.mean(dim=-1).item()
         elif type == "min":
