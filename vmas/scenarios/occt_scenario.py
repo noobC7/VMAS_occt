@@ -22,7 +22,11 @@ from vmas.scenarios.occt_utils import OcctObservations,OcctRewards,OcctNormalize
     get_short_term_reference_path_simple,get_short_term_reference_path_by_s,check_boolean_block,calibrate_agent_s_by_road_pts,\
     is_point_left_of_polyline,get_frenet_distances_between_agents
 from enum import IntEnum
-TRADITIONAL_CONTROL=False
+class MethodClass(IntEnum):
+    MARL = 0
+    PID = 1
+    MPPI = 2
+TRADITIONAL_CONTROL=MethodClass.PID
 AGENT_INDEX_FOCUS=2
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
@@ -124,8 +128,8 @@ class Scenario(BaseScenario):
         self.use_boundary_frenet_ref=kwargs.pop("use_boundary_frenet_ref", True)
         self.mask_ref_v=kwargs.pop("mask_ref_v", False)
         self.is_rand_arc_pos=kwargs.pop("is_rand_arc_pos", False)
-        self.init_arc_pos = kwargs.pop("init_arc_pos", 40.0)
-        self.init_vel_mean = kwargs.pop("init_vel_mean", 0.01)
+        self.init_arc_pos = kwargs.pop("init_arc_pos", 0.0)
+        self.init_vel_mean = kwargs.pop("init_vel_mean", 3)
         self.init_vel_std = kwargs.pop("init_vel_std", 0.0) 
         self.still_space = kwargs.pop("still_space", 6.0)
         self.platoon_tau = kwargs.pop("platoon_tau", 0.0)
@@ -912,8 +916,8 @@ class Scenario(BaseScenario):
                     drag = 0.0,
                     linear_friction = 0.0,
                     angular_friction = 0.0,
-                    movable=False if TRADITIONAL_CONTROL else True,
-                    rotatable=False if TRADITIONAL_CONTROL else True,
+                    movable=False if TRADITIONAL_CONTROL!=MethodClass.MARL else True,
+                    rotatable=False if TRADITIONAL_CONTROL!=MethodClass.MARL else True,
                     dynamics=KinematicBicycle(
                         world,
                         width=self.agent_width,
@@ -1560,8 +1564,6 @@ class Scenario(BaseScenario):
         self._set_pose(self.tractor_front, p_front, front_theta, v_front, idx_mask)
         self._set_pose(self.tractor_rear, p_rear, rear_theta, v_rear, idx_mask)
 
-        if TRADITIONAL_CONTROL:
-            self._pure_pursuit_control()
     def pre_step(self):
         if self.task_class == TaskClass.SIMPLE_PLATOON:
             return
@@ -1644,9 +1646,191 @@ class Scenario(BaseScenario):
             v_r_new,       # 动力学平滑后的速度
             idx_mask
         )
-    def _pure_pursuit_control(self):
+
+        if TRADITIONAL_CONTROL!=MethodClass.MARL:
+            if self.task_class==TaskClass.SIMPLE_PLATOON:
+                self._pure_pursuit_control_platoon()
+            else:
+                if TRADITIONAL_CONTROL==MethodClass.PID:
+                    self._pure_pursuit_control_occt()
+                elif TRADITIONAL_CONTROL==MethodClass.MPPI:
+                    self._mppi_control_occt()
+                elif TRADITIONAL_CONTROL==MethodClass.MARL:
+                    pass
+                else:
+                    raise TypeError
+    def _mppi_control_occt(self):
         """
-        纯跟踪控制器 - 用于batch_size=1时的手动控制
+        纯跟踪编队及自主铰接控制器 
+        - 用于batch_size=1时的手动控制，
+        在对应的hinge不可用时保持横向路径跟踪以及纵向编队速度控制，
+        在hinge可用时跟踪hinge进行自主铰接
+
+        对每个agent：
+        1. 使用纯跟踪算法计算前轮转角
+        2. 使用MPPI控制器前向采样轨迹（要求采样n*sample_interval长度的轨迹，n可以设置为2）
+        3. 计算每一个轨迹的reward（在编队阶段是与ref_path对应n线段的差距，在铰接阶段是与hinge_short_term对应n线段的差距）
+        4. 使用MPPI的更新轨迹权重获得最优控制序列，取第一个控制量作为输出
+        5. 调用_set_pose直接设置状态（绕过VMAS的dynamics）
+        """
+        raise NotImplementedError
+
+    def _pure_pursuit_control_occt(self):
+        """
+        纯跟踪编队及自主铰接控制器 
+        - 用于batch_size=1时的手动控制，
+        在对应的hinge不可用时保持横向路径跟踪以及纵向编队速度控制，
+        在hinge可用时跟踪hinge进行自主铰接
+
+        对每个agent：
+        1. 使用纯跟踪算法计算前轮转角
+        2. 使用PD控制器计算加速度
+        3. 手动积分计算下一个状态
+        4. 调用_set_pose直接设置状态（绕过VMAS的dynamics）
+        """
+        LOOKAHEAD_DIST = 5.0
+        WHEELBASE = self.l_f + self.l_r
+
+        KP_VEL = 1.0
+        KD_VEL = 0.0
+        KP_HINGE_DIST = 8
+
+        if not hasattr(self, "_last_vel_errors"):
+            self._last_vel_errors = {}
+
+        for agent_idx, agent in enumerate(self.world.agents):
+            if agent_idx in self.TRACTOR_SLICE:
+                continue
+
+            current_pos = agent.state.pos[0]
+            current_theta = agent.state.rot[0, 0]
+            current_vel = agent.state.vel[0]
+
+            v_current = torch.linalg.norm(current_vel)
+            vel_dir = current_vel / (v_current + 1e-8)
+            heading_vec = torch.stack(
+                [torch.cos(current_theta), torch.sin(current_theta)]
+            )
+            direction_sign = torch.sign(torch.sum(vel_dir * heading_vec))
+            v_signed = v_current * direction_sign
+
+            hinge_status = self.ref_paths_agent_related.hinge_status[:, agent_idx]
+            hinge_ready = bool(hinge_status[0].item())
+
+            # 未进入可铰接区时跟踪编队短期参考路径；进入后切到 hinge 参考轨迹。
+            if hinge_ready:
+                ref_path = self.ref_paths_agent_related.hinge_short_term[0, agent_idx]
+                ref_points = ref_path[:, :2]
+            else:
+                ref_path = self.ref_paths_agent_related.short_term[0, agent_idx]
+                ref_points = ref_path[:, :2]
+
+            dists = torch.linalg.norm(ref_points - current_pos, dim=-1)
+            target_idx = torch.argmin(torch.abs(dists - LOOKAHEAD_DIST))
+            target_point = ref_points[target_idx]
+
+            dx = target_point[0] - current_pos[0]
+            dy = target_point[1] - current_pos[1]
+
+            cos_theta = torch.cos(current_theta)
+            sin_theta = torch.sin(current_theta)
+
+            target_x_vehicle = dx * cos_theta + dy * sin_theta
+            target_y_vehicle = -dx * sin_theta + dy * cos_theta
+
+            ld = torch.sqrt(target_x_vehicle**2 + target_y_vehicle**2)
+            ly = target_y_vehicle
+            ld = torch.clamp(ld, min=0.1)
+
+            curvature = 2.0 * ly / (ld**2)
+            steering_angle = torch.atan(curvature * WHEELBASE)
+            steering_angle = torch.clamp(
+                steering_angle,
+                min=-self.max_steering_angle,
+                max=self.max_steering_angle,
+            )
+
+            front_tractor_speed = torch.linalg.norm(
+                self.world.agents[self.HINGE_FIRST_INDEX].state.vel[0]
+            )
+            rear_tractor_speed = torch.linalg.norm(
+                self.world.agents[self.HINGE_LAST_INDEX].state.vel[0]
+            )
+
+            if hinge_ready:
+                hinge_pos = self.get_target_hinge_pos(agent_idx)[0]
+                hinge_vel = self.get_target_hinge_vel(agent_idx)[0]
+                hinge_speed = torch.linalg.norm(hinge_vel)
+                if hinge_speed > 1e-6:
+                    hinge_tangent = hinge_vel / hinge_speed
+                else:
+                    hinge_tangent = torch.stack(
+                        [torch.cos(current_theta), torch.sin(current_theta)]
+                    )
+
+                hinge_distance_vec = hinge_pos - current_pos
+                hinge_distance_error = torch.dot(hinge_distance_vec, hinge_tangent)
+                v_ref = torch.clamp(
+                    hinge_speed + KP_HINGE_DIST * hinge_distance_error,
+                    min=0.0,
+                    max=self.max_speed,
+                )
+            else:
+                # neighbor_speeds = [
+                #     torch.linalg.norm(self.world.agents[agent_idx - 1].state.vel[0]),
+                #     torch.linalg.norm(self.world.agents[agent_idx + 1].state.vel[0]),
+                # ]
+                # v_ref = torch.stack(neighbor_speeds).mean()
+                # v_ref = 0.5 * (front_tractor_speed + rear_tractor_speed)
+                v_ref = front_tractor_speed
+
+            vel_error = v_ref - v_signed
+            last_vel_error = self._last_vel_errors.get(
+                agent_idx, torch.tensor(0.0, device=self.device)
+            )
+            derivative = (vel_error - last_vel_error) / self.dt
+            acceleration = KP_VEL * vel_error + KD_VEL * derivative
+            acceleration = torch.clamp(
+                acceleration,
+                min=-self.max_acceleration,
+                max=self.max_acceleration,
+            )
+            self._last_vel_errors[agent_idx] = vel_error.detach().clone()
+
+            beta = torch.atan2(
+                torch.tan(steering_angle) * self.l_r / (self.l_f + self.l_r),
+                torch.tensor(1.0, device=self.device),
+            )
+
+            dx = v_signed * torch.cos(current_theta + beta)
+            dy = v_signed * torch.sin(current_theta + beta)
+            dtheta = (
+                (v_signed / (self.l_f + self.l_r))
+                * torch.cos(beta)
+                * torch.tan(steering_angle)
+            )
+            dv = acceleration
+
+            next_pos = current_pos + torch.stack([dx, dy]) * self.dt
+            next_theta = current_theta + dtheta * self.dt
+            next_v = torch.clamp(v_signed + dv * self.dt, min=0.0)
+
+            idx_mask = torch.ones(
+                self.batch_dim, dtype=torch.bool, device=self.device
+            )
+            self._set_pose(
+                agent,
+                next_pos.unsqueeze(0),
+                next_theta.unsqueeze(0).unsqueeze(0),
+                next_v.unsqueeze(0),
+                idx_mask,
+            )
+
+    def _pure_pursuit_control_platoon(self):
+        """
+        纯跟踪编队控制器 
+        - 用于batch_size=1时的手动控制，
+        保持横向路径跟踪以及纵向编队速度控制
 
         对每个agent：
         1. 使用纯跟踪算法计算前轮转角
@@ -2682,7 +2866,10 @@ class Scenario(BaseScenario):
         hinge_ready = hinge_short_term[:, :ready_n, -1] > 0.5    # [batch_dim, n_points]
         is_block, block_order = check_boolean_block(hinge_ready)
         # 0=先0后1(过完弯），2=纯1(直道) is_block(不是反复可铰接)
-        ready_to_hinge = (((block_order==0) | (block_order==2)) & is_block)
+        if TRADITIONAL_CONTROL!=MethodClass.MARL:
+            ready_to_hinge = (((block_order==2)) & is_block)
+        else:
+            ready_to_hinge = (((block_order==0) | (block_order==2)) & is_block)
         return ready_to_hinge
 
     def get_dynamic_target_arc_positions(self):
