@@ -703,6 +703,9 @@ def get_short_term_hinge_path_by_s(
     #hinge_short_term[..., 4:5] = (is_in_boundary & ((is_after_corner | is_side_hinge))).to(dtype=hinge_short_term.dtype)
 
     # 260316 simplify
+    # 260323 correction
+    is_after_corner = (agent_s > corner_s[:,None].expand(-1,hinge_pts_num)).view(B, hinge_pts_num, 1, 1)
+    is_after_corner = is_after_corner.expand(-1, -1, n_points_to_return, 1)
     hinge_short_term[..., 4:5] = is_in_boundary & is_after_corner
     
     return hinge_short_term
