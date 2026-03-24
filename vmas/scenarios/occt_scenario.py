@@ -1088,12 +1088,14 @@ class Scenario(BaseScenario):
 
         # ============== 阶段2：生成车队速度/间距 ==============
         stage2_start = time.time()
-        # 提前获取platoon_vel_batch和platoon_space_batch
-        platoon_vel_batch = self.get_normal_tensor(self.init_vel_mean, self.init_vel_std)
-        #platoon_vel_batch = self.init_vel_min+(self.init_vel_max-self.init_vel_min)*self.get_random_tensor()
-        self.platoon_vel_batch[idx_mask] = torch.clamp(platoon_vel_batch, min=0.0)[idx_mask]
-        #print(f"platoon_vel_batch: {self.platoon_vel_batch}")
-        # 1. 随机最后一辆车所在的弧长和间距
+        if self.task_class == TaskClass.OCCT_PLATOON:
+            # init vel is normal distribution depend on road ref velocity, self.platoon_vel_batch is useless
+            # and platoon_space_batch equals to self.still_space
+            self.platoon_vel_batch =torch.zeros(B, dtype=torch.float32, device=device)
+        else:
+            platoon_vel_batch = self.get_normal_tensor(self.init_vel_mean, self.init_vel_std)
+            #platoon_vel_batch = self.init_vel_min+(self.init_vel_max-self.init_vel_min)*self.get_random_tensor()
+            self.platoon_vel_batch[idx_mask] = torch.clamp(platoon_vel_batch, min=0.0)[idx_mask]
         self.platoon_space_batch = self.get_platoon_space(self.platoon_vel_batch)
         spacing = self.platoon_space_batch
 
@@ -1101,24 +1103,14 @@ class Scenario(BaseScenario):
         stage3_start = time.time()
         s_start_buffer = 0.0
         s_end_buffer = 10.0
-        #last_vehicle_s_min = torch.clamp(0.7*self.road.batch_corner_s_begin - 30,min=0)
-        last_vehicle_s_min = torch.clamp(self.road.batch_corner_s_end-self.rod_len - s_start_buffer,min=0)
-        last_vehicle_s_max = torch.clamp(self.road.get_s_max() - s_end_buffer,min=0)
+        last_vehicle_s_max = torch.clamp(self.road.batch_corner_s_end-self.rod_len,min=0)
         if self.is_rand_arc_pos:
-            #last_vehicle_s=torch.normal(mean=self.road.batch_corner_s, std=self.road.batch_corner_s/2) #260301
-            #last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
-            #last_vehicle_s = self.get_random_tensor() * self.road.batch_corner_s * 0.8 #260303
-            last_vehicle_s = self.get_random_tensor() * self.road.get_s_max() #260128
-            last_vehicle_s = last_vehicle_s_min + self.get_random_tensor() * (last_vehicle_s_max - last_vehicle_s_min)   #260318 TODO: revise to origin, only for debug hinge stage
-            last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos + self.get_random_tensor() * (last_vehicle_s_min - self.init_arc_pos) #260320 two stage
+            last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos + self.get_random_tensor() * (last_vehicle_s_max - self.init_arc_pos) #260320 two stage
         else:
-            last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos
-            last_vehicle_s = 0.7*self.road.batch_corner_s_end  #260317 TODO: revise to origin, only for debug
-            last_vehicle_s = last_vehicle_s_min  #260318 TODO: revise to origin, only for debug hinge stage
             last_vehicle_s = torch.ones(B,device=device) * self.init_arc_pos #260320 two stage
         last_vehicle_s = torch.clamp(last_vehicle_s, s_start_buffer * torch.ones(B,device=device),
                                     self.road.get_s_max() - (s_start_buffer + s_end_buffer) - (self.n_agents - 1) * torch.mean(spacing, dim=-1))
-
+        init_vel_noise = self.get_normal_tensor(0,self.init_vel_std)
         # ============== 阶段4：OCCT_PLATOON核心逻辑 ==============
         stage4_start = time.time()
         if self.task_class == TaskClass.OCCT_PLATOON:
@@ -1141,9 +1133,12 @@ class Scenario(BaseScenario):
             front_theta = front_rear_theta[:,0]
             rear_theta = front_rear_theta[:,1]
             
-            # 设置牵引车初始位姿 - 修改：传递完整张量，不再提前过滤
-            self._set_pose(self.tractor_front, p_front, front_theta, self.platoon_vel_batch, idx_mask)
-            self._set_pose(self.tractor_rear, p_rear, rear_theta, self.platoon_vel_batch, idx_mask)
+            front_ref_v = self.road.get_ref_v(s_front_new[:,None])[:,0,0]+init_vel_noise # [B]
+            front_ref_v = torch.clamp(front_ref_v,min=0,max=self.max_speed)
+            rear_ref_v = self.road.get_ref_v(last_vehicle_s[:,None])[:,0,0]+init_vel_noise # [B]
+            rear_ref_v = torch.clamp(rear_ref_v,min=0,max=self.max_speed)
+            self._set_pose(self.tractor_front, p_front, front_theta, front_ref_v, idx_mask)
+            self._set_pose(self.tractor_rear, p_rear, rear_theta, rear_ref_v, idx_mask)
 
         else:
             s_front_new = (self.n_followers-1)* self.still_space + last_vehicle_s
@@ -1208,7 +1203,12 @@ class Scenario(BaseScenario):
         stage9_start = time.time()
         # 设置车辆状态
         for i, ag in enumerate(self.followers):
-            self._set_pose(ag, vehicle_pos[:,i,:], vehicle_theta[:,i], self.platoon_vel_batch, idx_mask)
+            agent_s = self.observations.agent_s[...,self.FOLLOWER_SLICE][:,i]
+            ref_v = self.road.get_ref_v(agent_s[:,None])[:,0,0]+init_vel_noise # [B]
+            ref_v = (rear_ref_v + front_ref_v)/2
+            init_vel_noise = self.get_normal_tensor(0,self.init_vel_std)
+            ref_v = torch.clamp(ref_v + init_vel_noise,min=0,max=self.max_speed)
+            self._set_pose(ag, vehicle_pos[:,i,:], vehicle_theta[:,i], ref_v, idx_mask)
 
         # ============== 阶段10：重置智能体循环（距离/碰撞） ==============
         stage10_start = time.time()
@@ -2542,7 +2542,6 @@ class Scenario(BaseScenario):
         vel = self.observations.past_vel.get_latest()[indexing_tuple_vel]
         vel_mag = torch.linalg.norm(vel, dim=-1)
         hinge_steps = self.hinge_active_steps[:, agent_index]
-        hinge_time_cost = -torch.clamp(hinge_steps/self.normalizers.hinge_step,max=1)
         obs_self_groups = [
             ("self_vel", vel.reshape(self.world.batch_dim, -1)),
             ("self_speed", vel_mag.reshape(self.world.batch_dim, -1)),
@@ -2562,23 +2561,11 @@ class Scenario(BaseScenario):
             ("self_left_boundary_distance", self_left_dis.reshape(self.world.batch_dim, -1)),
             ("self_right_boundary_distance", self_right_dis.reshape(self.world.batch_dim, -1)),
             (
-                "self_hinge_info",
-                hinge_info.reshape(self.world.batch_dim, -1)
-                if self.task_class == TaskClass.OCCT_PLATOON
-                else None,
-            ),
-            (
                 "self_hinge_status",
                 hinge_short_term_status.reshape(self.world.batch_dim, -1)
                 if self.task_class == TaskClass.OCCT_PLATOON
                 else None,
             ),
-            # (
-            #     "hinge_time_cost",
-            #     hinge_time_cost.reshape(self.world.batch_dim, -1)
-            #     if self.task_class == TaskClass.OCCT_PLATOON
-            #     else None,
-            # ),
             (
                 "self_distance_to_ref",
                 torch.linalg.norm(effective_short_term[
@@ -3713,12 +3700,15 @@ class Scenario(BaseScenario):
         hinge_dict = {}
         if self.task_class == TaskClass.OCCT_PLATOON:
             hinge_pos = self.get_target_hinge_pos(agent_index)
+            hinge_vel = self.ref_paths_agent_related.hinge_short_term[:,agent_index,0,2:4]
             hinge_status = self.ref_paths_agent_related.hinge_status[:,agent_index]
             agent_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest()[:,agent_index] # [B, n_agents]
             hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)*hinge_status  # [batch_dim, n_points]
             hinged_followers_ratio = self.get_hinged_followers_ratio()*hinge_status
             hinge_steps = self.hinge_active_steps[:, agent_index]
             hinge_dict = {
+                "hinge_pos": hinge_pos,
+                "hinge_vel": hinge_vel,
                 "hinge_status": hinge_status,
                 "agent_hinge_status": agent_hinge_status,
                 "hinge_dis": hinge_dis,
