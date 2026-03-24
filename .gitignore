@@ -253,3 +253,5 @@ cython_debug/
 !/.idea/multiagentparticlesimulator.iml
 
 vmas/scenarios_data/cr_maps
+
+*.pt
