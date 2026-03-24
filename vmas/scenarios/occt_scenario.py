@@ -27,11 +27,33 @@ class MethodClass(IntEnum):
     MARL = 0
     PID = 1
     MPPI = 2
-TRADITIONAL_CONTROL=MethodClass.MARL
+DEFAULT_TRADITIONAL_CONTROL = MethodClass.MARL
 AGENT_INDEX_FOCUS=2
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
     OCCT_PLATOON = 1 # with cargo
+
+
+def parse_traditional_control(value) -> MethodClass:
+    if isinstance(value, MethodClass):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().upper()
+        try:
+            return MethodClass[normalized]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported traditional control '{value}'. Expected one of: "
+                f"{', '.join(method.name for method in MethodClass)}."
+            ) from exc
+    try:
+        return MethodClass(int(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Unsupported traditional control '{value}'. Expected MethodClass, int, or str."
+        ) from exc
+
+
 class Scenario(BaseScenario):
     def make_world(self, batch_dim: int, device: torch.device, **kwargs) -> World:
         self.device = device
@@ -115,6 +137,11 @@ class Scenario(BaseScenario):
         # world params
         self.device = device
         self.batch_dim = batch_dim
+        self.traditional_control = parse_traditional_control(
+            kwargs.pop("traditional_control", DEFAULT_TRADITIONAL_CONTROL)
+        )
+        target_road_id = kwargs.pop("target_road_id", 0)
+        self.target_road_id = None if target_road_id is None else int(target_road_id)
         self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
         self.n_agents=kwargs.pop("n_agents", 5)
@@ -234,7 +261,7 @@ class Scenario(BaseScenario):
             dtype=torch.float32,
         )
         self.simple_mppi = None
-        if TRADITIONAL_CONTROL == MethodClass.MPPI:
+        if self.traditional_control == MethodClass.MPPI:
             self.simple_mppi = SimpleMPPIController(
                 num_agents=self.n_agents,
                 device=device,
@@ -297,7 +324,7 @@ class Scenario(BaseScenario):
             is_constant_ref_v=True,
             rod_len=self.rod_len,
             n_agents=self.n_agents,
-            target_road_id=None,
+            target_road_id=self.target_road_id,
         )
         self.road_total_step = torch.zeros_like(self.road.batch_id.unique())
         self.lane_width = self.road.get_lane_width("mean")
@@ -328,6 +355,16 @@ class Scenario(BaseScenario):
                 device=device,
                 dtype=torch.bool,
             ), # each hinge is ready to hinge or not
+            hinge_heading_vel_angle_diff_deg=torch.zeros(
+                (batch_dim, self.n_agents),
+                device=device,
+                dtype=torch.float32,
+            ),
+            agent_heading_hinge_heading_angle_diff_deg=torch.zeros(
+                (batch_dim, self.n_agents),
+                device=device,
+                dtype=torch.float32,
+            ),
             agent_hinge_status=CircularBuffer(
                 torch.zeros(
                     (
@@ -966,8 +1003,8 @@ class Scenario(BaseScenario):
                     drag = 0.0,
                     linear_friction = 0.0,
                     angular_friction = 0.0,
-                    movable=False if TRADITIONAL_CONTROL!=MethodClass.MARL else True,
-                    rotatable=False if TRADITIONAL_CONTROL!=MethodClass.MARL else True,
+                    movable=False if self.traditional_control!=MethodClass.MARL else True,
+                    rotatable=False if self.traditional_control!=MethodClass.MARL else True,
                     dynamics=KinematicBicycle(
                         world,
                         width=self.agent_width,
@@ -1085,6 +1122,10 @@ class Scenario(BaseScenario):
         self.hinge_active_steps[idx_mask] = 0
         if self.simple_mppi is not None:
             self.simple_mppi.reset()
+        if hasattr(self, "_last_vel_errors"):
+            self._last_vel_errors.clear()
+        if hasattr(self, "_last_pid_steering"):
+            self._last_pid_steering.clear()
 
         # ============== 阶段2：生成车队速度/间距 ==============
         stage2_start = time.time()
@@ -1204,10 +1245,8 @@ class Scenario(BaseScenario):
         # 设置车辆状态
         for i, ag in enumerate(self.followers):
             agent_s = self.observations.agent_s[...,self.FOLLOWER_SLICE][:,i]
-            ref_v = self.road.get_ref_v(agent_s[:,None])[:,0,0]+init_vel_noise # [B]
-            ref_v = (rear_ref_v + front_ref_v)/2
-            init_vel_noise = self.get_normal_tensor(0,self.init_vel_std)
-            ref_v = torch.clamp(ref_v + init_vel_noise,min=0,max=self.max_speed)
+            #ref_v = self.road.get_ref_v(agent_s[:,None])[:,0,0]+init_vel_noise # [B]
+            ref_v = torch.clamp((rear_ref_v + front_ref_v)/2 ,min=0,max=self.max_speed)
             self._set_pose(ag, vehicle_pos[:,i,:], vehicle_theta[:,i], ref_v, idx_mask)
 
         # ============== 阶段10：重置智能体循环（距离/碰撞） ==============
@@ -1642,15 +1681,15 @@ class Scenario(BaseScenario):
             idx_mask
         )
 
-        if TRADITIONAL_CONTROL!=MethodClass.MARL:
+        if self.traditional_control!=MethodClass.MARL:
             if self.task_class==TaskClass.SIMPLE_PLATOON:
                 self._pure_pursuit_control_platoon()
             else:
-                if TRADITIONAL_CONTROL==MethodClass.PID:
+                if self.traditional_control==MethodClass.PID:
                     self._pure_pursuit_control_occt()
-                elif TRADITIONAL_CONTROL==MethodClass.MPPI:
+                elif self.traditional_control==MethodClass.MPPI:
                     self._mppi_control_occt()
-                elif TRADITIONAL_CONTROL==MethodClass.MARL:
+                elif self.traditional_control==MethodClass.MARL:
                     pass
                 else:
                     raise TypeError
@@ -1823,9 +1862,21 @@ class Scenario(BaseScenario):
         KP_VEL = 1.0
         KD_VEL = 0.0
         KP_HINGE_DIST = 8
+        KP_GAP = 0.8
+        pure_pursuit_ref_point_count = max(
+            self.n_points_short_term,
+            int(
+                (LOOKAHEAD_DIST + max(self.still_space, float(self.sample_interval)))
+                / max(float(self.sample_interval), 1e-3)
+            )
+            + 2,
+        )
 
         if not hasattr(self, "_last_vel_errors"):
             self._last_vel_errors = {}
+        if not hasattr(self, "_last_pid_steering"):
+            self._last_pid_steering = {}
+        target_agent_s, _ = self.get_dynamic_target_arc_positions()
 
         for agent_idx, agent in enumerate(self.world.agents):
             if agent_idx in self.TRACTOR_SLICE:
@@ -1834,14 +1885,14 @@ class Scenario(BaseScenario):
             current_pos = agent.state.pos[0]
             current_theta = agent.state.rot[0, 0]
             current_vel = agent.state.vel[0]
-
-            v_current = torch.linalg.norm(current_vel)
-            vel_dir = current_vel / (v_current + 1e-8)
             heading_vec = torch.stack(
                 [torch.cos(current_theta), torch.sin(current_theta)]
             )
-            direction_sign = torch.sign(torch.sum(vel_dir * heading_vec))
-            v_signed = v_current * direction_sign
+            v_forward = torch.clamp(
+                torch.dot(current_vel, heading_vec),
+                min=0.0,
+                max=self.max_speed,
+            )
 
             hinge_status = self.ref_paths_agent_related.hinge_status[:, agent_idx]
             hinge_ready = bool(hinge_status[0].item())
@@ -1851,23 +1902,37 @@ class Scenario(BaseScenario):
                 ref_path = self.ref_paths_agent_related.hinge_short_term[0, agent_idx]
                 ref_points = ref_path[:, :2]
             else:
-                ref_path = self.ref_paths_agent_related.short_term[0, agent_idx]
+                ref_path = get_short_term_reference_path_by_s(
+                    self.road,
+                    target_agent_s[:, agent_idx],
+                    n_points_to_return=pure_pursuit_ref_point_count,
+                    device=self.world.device,
+                    sample_interval=self.sample_interval,
+                    return_ref_v=False,
+                    env_j=None,
+                )[0]
                 ref_points = ref_path[:, :2]
-
-            dists = torch.linalg.norm(ref_points - current_pos, dim=-1)
-            target_idx = torch.argmin(torch.abs(dists - LOOKAHEAD_DIST))
-            target_point = ref_points[target_idx]
-
-            dx = target_point[0] - current_pos[0]
-            dy = target_point[1] - current_pos[1]
 
             cos_theta = torch.cos(current_theta)
             sin_theta = torch.sin(current_theta)
+            rel_points = ref_points - current_pos.unsqueeze(0)
+            target_x_vehicle_all = rel_points[:, 0] * cos_theta + rel_points[:, 1] * sin_theta
+            target_y_vehicle_all = -rel_points[:, 0] * sin_theta + rel_points[:, 1] * cos_theta
+            dists = torch.sqrt(target_x_vehicle_all**2 + target_y_vehicle_all**2)
+            forward_mask = target_x_vehicle_all > 0.0
+            if forward_mask.any():
+                lookahead_cost = torch.where(
+                    forward_mask,
+                    torch.abs(dists - LOOKAHEAD_DIST),
+                    torch.full_like(dists, float("inf")),
+                )
+                target_idx = torch.argmin(lookahead_cost)
+            else:
+                target_idx = torch.argmax(target_x_vehicle_all)
+            target_x_vehicle = target_x_vehicle_all[target_idx]
+            target_y_vehicle = target_y_vehicle_all[target_idx]
 
-            target_x_vehicle = dx * cos_theta + dy * sin_theta
-            target_y_vehicle = -dx * sin_theta + dy * cos_theta
-
-            ld = torch.sqrt(target_x_vehicle**2 + target_y_vehicle**2)
+            ld = dists[target_idx]
             ly = target_y_vehicle
             ld = torch.clamp(ld, min=0.1)
 
@@ -1878,12 +1943,19 @@ class Scenario(BaseScenario):
                 min=-self.max_steering_angle,
                 max=self.max_steering_angle,
             )
-
-            front_tractor_speed = torch.linalg.norm(
-                self.world.agents[self.HINGE_FIRST_INDEX].state.vel[0]
+            last_steering = self._last_pid_steering.get(
+                agent_idx, steering_angle.detach().clone()
             )
-            rear_tractor_speed = torch.linalg.norm(
-                self.world.agents[self.HINGE_LAST_INDEX].state.vel[0]
+            max_steering_delta = self.max_steering_rate * self.dt
+            steering_angle = torch.clamp(
+                steering_angle,
+                min=last_steering - max_steering_delta,
+                max=last_steering + max_steering_delta,
+            )
+            self._last_pid_steering[agent_idx] = steering_angle.detach().clone()
+
+            front_neighbor_speed = torch.linalg.norm(
+                self.world.agents[agent_idx - 1].state.vel[0]
             )
 
             if hinge_ready:
@@ -1905,15 +1977,20 @@ class Scenario(BaseScenario):
                     max=self.max_speed,
                 )
             else:
-                # neighbor_speeds = [
-                #     torch.linalg.norm(self.world.agents[agent_idx - 1].state.vel[0]),
-                #     torch.linalg.norm(self.world.agents[agent_idx + 1].state.vel[0]),
-                # ]
-                # v_ref = torch.stack(neighbor_speeds).mean()
-                # v_ref = 0.5 * (front_tractor_speed + rear_tractor_speed)
-                v_ref = front_tractor_speed
+                actual_gap_s = torch.clamp(
+                    self.observations.agent_s[0, agent_idx - 1]
+                    - self.observations.agent_s[0, agent_idx],
+                    min=0.0,
+                )
+                desired_gap_s = self.platoon_space_batch[0]
+                gap_error = actual_gap_s - desired_gap_s
+                v_ref = torch.clamp(
+                    front_neighbor_speed + KP_GAP * gap_error,
+                    min=0.0,
+                    max=self.max_speed,
+                )
 
-            vel_error = v_ref - v_signed
+            vel_error = v_ref - v_forward
             last_vel_error = self._last_vel_errors.get(
                 agent_idx, torch.tensor(0.0, device=self.device)
             )
@@ -1931,10 +2008,10 @@ class Scenario(BaseScenario):
                 torch.tensor(1.0, device=self.device),
             )
 
-            dx = v_signed * torch.cos(current_theta + beta)
-            dy = v_signed * torch.sin(current_theta + beta)
+            dx = v_forward * torch.cos(current_theta + beta)
+            dy = v_forward * torch.sin(current_theta + beta)
             dtheta = (
-                (v_signed / (self.l_f + self.l_r))
+                (v_forward / (self.l_f + self.l_r))
                 * torch.cos(beta)
                 * torch.tan(steering_angle)
             )
@@ -1942,7 +2019,7 @@ class Scenario(BaseScenario):
 
             next_pos = current_pos + torch.stack([dx, dy]) * self.dt
             next_theta = current_theta + dtheta * self.dt
-            next_v = torch.clamp(v_signed + dv * self.dt, min=0.0)
+            next_v = torch.clamp(v_forward + dv * self.dt, min=0.0, max=self.max_speed)
 
             idx_mask = torch.ones(
                 self.batch_dim, dtype=torch.bool, device=self.device
@@ -2163,6 +2240,26 @@ class Scenario(BaseScenario):
                 ] = self.get_target_hinge_status(agent_i)
 
         hinge_info = self.ref_paths_agent_related.hinge_short_term
+        # Dock uses the geometric secant between the first two hinge preview points.
+        # Track its mismatch with the instantaneous hinge velocity direction for debugging.
+        hinge_heading = hinge_info[..., 1, :2] - hinge_info[..., 0, :2]
+        hinge_heading_mag = torch.linalg.norm(hinge_heading, dim=-1, keepdim=True)
+        hinge_heading_tangent = hinge_heading / torch.clamp(hinge_heading_mag, min=1e-6)
+        hinge_vel_tangent = hinge_info[..., 0, 2:4] / torch.clamp(
+            torch.linalg.norm(hinge_info[..., 0, 2:4], dim=-1, keepdim=True),
+            min=1e-6,
+        )
+        hinge_heading_vel_cross = (
+            hinge_heading_tangent[..., 0] * hinge_vel_tangent[..., 1]
+            - hinge_heading_tangent[..., 1] * hinge_vel_tangent[..., 0]
+        )
+        hinge_heading_vel_dot = (hinge_heading_tangent * hinge_vel_tangent).sum(
+            dim=-1
+        ).clamp(-1.0, 1.0)
+        self.ref_paths_agent_related.hinge_heading_vel_angle_diff_deg = (
+            torch.atan2(torch.abs(hinge_heading_vel_cross), hinge_heading_vel_dot)
+            * (180.0 / torch.pi)
+        )
         hinge_pos = hinge_info[..., 0, :2]
         hinge_vel = hinge_info[..., 0, 2:4]
         hinge_vel_mag = torch.linalg.norm(hinge_vel, dim=-1, keepdim=True)
@@ -2170,14 +2267,33 @@ class Scenario(BaseScenario):
         agent_pos = torch.stack(
             [self.world.agents[i].state.pos for i in range(self.n_agents)], dim=1
         )
+        agent_theta = torch.stack(
+            [self.world.agents[i].state.rot.squeeze(-1) for i in range(self.n_agents)],
+            dim=1,
+        )
+        agent_heading_tangent = torch.stack(
+            [torch.cos(agent_theta), torch.sin(agent_theta)], dim=-1
+        )
+        agent_heading_hinge_heading_cross = (
+            hinge_heading_tangent[..., 0] * agent_heading_tangent[..., 1]
+            - hinge_heading_tangent[..., 1] * agent_heading_tangent[..., 0]
+        )
+        agent_heading_hinge_heading_dot = (
+            hinge_heading_tangent * agent_heading_tangent
+        ).sum(dim=-1).clamp(-1.0, 1.0)
+        self.ref_paths_agent_related.agent_heading_hinge_heading_angle_diff_deg = (
+            torch.atan2(
+                torch.abs(agent_heading_hinge_heading_cross),
+                agent_heading_hinge_heading_dot,
+            )
+            * (180.0 / torch.pi)
+        )
         agent_vel = torch.stack(
             [self.world.agents[i].state.vel for i in range(self.n_agents)], dim=1
         )
         agent_vel_mag = torch.linalg.norm(agent_vel, dim=-1, keepdim=True)
-        agent_tangent = agent_vel / torch.clamp(agent_vel_mag, min=1e-6)
-        hinge_tangent = hinge_vel / torch.clamp(hinge_vel_mag, min=1e-6)
         agent_pos_legal = torch.linalg.norm(hinge_pos - agent_pos, dim=-1) < 0.15
-        agent_heading_legal = (hinge_tangent * agent_tangent).sum(dim=-1) > torch.cos(
+        agent_heading_legal = agent_heading_hinge_heading_dot > torch.cos(
             torch.tensor(2 / 180 * torch.pi, device=self.world.device)
         )
         agent_vel_legal = (
@@ -2982,7 +3098,7 @@ class Scenario(BaseScenario):
         hinge_ready = hinge_short_term[:, :ready_n, -1] > 0.5    # [batch_dim, n_points]
         is_block, block_order = check_boolean_block(hinge_ready)
         # 0=先0后1(过完弯），2=纯1(直道) is_block(不是反复可铰接)
-        if TRADITIONAL_CONTROL==MethodClass.MARL:
+        if self.traditional_control==MethodClass.MARL:
             ready_to_hinge = (((block_order==0) | (block_order==2)) & is_block)
         else:
             ready_to_hinge = (((block_order==2)) & is_block)
@@ -3703,6 +3819,16 @@ class Scenario(BaseScenario):
             hinge_vel = self.ref_paths_agent_related.hinge_short_term[:,agent_index,0,2:4]
             hinge_status = self.ref_paths_agent_related.hinge_status[:,agent_index]
             agent_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest()[:,agent_index] # [B, n_agents]
+            hinge_heading_vel_angle_diff_deg = (
+                self.ref_paths_agent_related.hinge_heading_vel_angle_diff_deg[
+                    :, agent_index
+                ]
+            )
+            hinge_gate_angle_diff_deg = (
+                self.ref_paths_agent_related.agent_heading_hinge_heading_angle_diff_deg[
+                    :, agent_index
+                ]
+            )
             hinge_dis = torch.norm(hinge_pos - agent.state.pos, dim=-1)*hinge_status  # [batch_dim, n_points]
             hinged_followers_ratio = self.get_hinged_followers_ratio()*hinge_status
             hinge_steps = self.hinge_active_steps[:, agent_index]
@@ -3711,6 +3837,8 @@ class Scenario(BaseScenario):
                 "hinge_vel": hinge_vel,
                 "hinge_status": hinge_status,
                 "agent_hinge_status": agent_hinge_status,
+                "hinge_heading_vel_angle_diff_deg": hinge_heading_vel_angle_diff_deg,
+                "hinge_gate_angle_diff_deg": hinge_gate_angle_diff_deg,
                 "hinge_dis": hinge_dis,
                 "hinged_followers_ratio": hinged_followers_ratio,
                 "hinge_steps": hinge_steps,
@@ -3885,7 +4013,7 @@ class Scenario(BaseScenario):
                         circle.set_color(*self.world.agents[agent_i].color)
                         geoms.append(circle)
             if (
-                TRADITIONAL_CONTROL == MethodClass.MPPI
+                self.traditional_control == MethodClass.MPPI
                 and self.enable_mppi_debug_render
                 and self.simple_mppi is not None
                 and agent_i == self.agent_index_focus
