@@ -1241,7 +1241,7 @@ class OcctCRMap(MapBase):
         # 260128 revise
         for i in range(self.batch_dim):
             self.batch_id[i] = torch.tensor(i % len(self.path_library), dtype=torch.int64, device=self.device)
-        if target_road_id:
+        if target_road_id is not None:
             self.batch_id[0]=target_road_id
         #self.batch_id[0] = 3
         # 准备batch数据

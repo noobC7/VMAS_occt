@@ -270,6 +270,8 @@ class OcctReferencePathsAgentRelated:
         short_term_indices: Tensor = None,
         agent_hinge_status: CircularBuffer = None,
         hinge_status: Tensor = None,
+        hinge_heading_vel_angle_diff_deg: Tensor = None,
+        agent_heading_hinge_heading_angle_diff_deg: Tensor = None,
         exit: Tensor = None,
     ):
         self.long_term = long_term  # Actual long-term reference paths of agents
@@ -282,6 +284,10 @@ class OcctReferencePathsAgentRelated:
         self.nearing_points_right_boundary = nearing_points_right_boundary  # Nearing right boundary
         self.agent_hinge_status = agent_hinge_status  # Hinge status for each agent
         self.hinge_status = hinge_status  # Each Hinge status
+        self.hinge_heading_vel_angle_diff_deg = hinge_heading_vel_angle_diff_deg
+        self.agent_heading_hinge_heading_angle_diff_deg = (
+            agent_heading_hinge_heading_angle_diff_deg
+        )
         self.exit = exit  # Exit segment
         
 def check_validity(obj):
