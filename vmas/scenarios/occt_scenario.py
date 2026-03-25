@@ -294,6 +294,13 @@ class Scenario(BaseScenario):
         n_observed_steps = kwargs.pop(
             "n_observed_steps", 5
         )  # The number of steps to observe (include the current step). At least one, and at most `n_stored_steps`
+        use_history_observation = bool(kwargs.pop("use_history_observation", False))
+        history_obs_len = int(kwargs.pop("history_obs_len", n_observed_steps))
+        history_obs_dim = kwargs.pop("history_obs_dim", None)
+        if history_obs_dim is not None:
+            history_obs_dim = int(history_obs_dim)
+            if history_obs_dim <= 0:
+                raise ValueError("history_obs_dim must be a positive integer or None.")
         
         # map params
         B = batch_dim
@@ -490,6 +497,10 @@ class Scenario(BaseScenario):
             device=device,
             dtype=torch.float32,
         )
+        self.use_history_observation = use_history_observation
+        self.history_obs_len = max(1, min(history_obs_len, n_observed_steps))
+        self.history_obs_dim = history_obs_dim
+        self.history_obs_raw_dim = None
         self.observations = OcctObservations(
             is_partial=torch.tensor(
                 is_partial_observation, device=device, dtype=torch.bool
@@ -2745,6 +2756,210 @@ class Scenario(BaseScenario):
         if return_groups:
             return obs_self, obs_self_groups
         return obs_self
+
+    def _get_history_step_indices(self) -> List[int]:
+        obs_len = min(self.history_obs_len, int(self.observations.n_observed_steps.item()))
+        return list(range(1, obs_len + 1))
+
+    def _adjust_history_obs_dim(self, obs_history: Tensor) -> Tensor:
+        raw_dim = obs_history.shape[-1]
+        self.history_obs_raw_dim = raw_dim
+        if self.history_obs_dim is None or self.history_obs_dim == raw_dim:
+            return obs_history
+        if raw_dim > self.history_obs_dim:
+            return obs_history[..., : self.history_obs_dim]
+        pad = obs_history.new_zeros(
+            *obs_history.shape[:-1], self.history_obs_dim - raw_dim
+        )
+        return torch.cat((obs_history, pad), dim=-1)
+
+    def observe_self_history(
+        self, agent_index: int, return_groups: bool = False
+    ) -> Tensor | Tuple[Tensor, List[Tuple[str, Tensor]]]:
+        batch_size = self.world.batch_dim
+        step_indices = self._get_history_step_indices()
+        obs_self_history = []
+        for step in step_indices:
+            self_short_term = self.observations.past_relative_ref_info.get_latest(step)[
+                :, agent_index, agent_index
+            ]
+            if self.mask_ref_v:
+                self_ref_features = self_short_term[..., :2].reshape(batch_size, -1)
+            else:
+                self_ref_features = self_short_term.reshape(batch_size, -1)
+
+            if self.task_class == TaskClass.OCCT_PLATOON:
+                observed_hinge_short_term = self.observations.past_relative_hinge_info.get_latest(
+                    step
+                )[:, agent_index, agent_index]
+                hinge_short_term_status = observed_hinge_short_term[..., 4:5]
+                hinge_short_term_speed = torch.linalg.norm(
+                    observed_hinge_short_term[..., 2:4],
+                    dim=-1,
+                    keepdim=True,
+                )
+                hinge_info = torch.cat(
+                    (
+                        observed_hinge_short_term[..., :2],
+                        hinge_short_term_speed,
+                        hinge_short_term_status,
+                    ),
+                    dim=-1,
+                )
+                hinge_distance = torch.linalg.norm(
+                    observed_hinge_short_term[:, 0, :2], dim=-1, keepdim=True
+                )
+            else:
+                hinge_info = self_short_term.new_zeros(
+                    *self_short_term.shape[:-1], 4
+                )
+                hinge_distance = self_short_term.new_zeros(batch_size, 1)
+
+            vel = self.observations.past_vel.get_latest(step)[
+                :, agent_index, agent_index
+            ].reshape(batch_size, -1)
+            speed = torch.linalg.norm(vel, dim=-1, keepdim=True)
+            steering = self.observations.past_steering.get_latest(step)[
+                :, agent_index
+            ].reshape(batch_size, 1)
+            action_acc = self.observations.past_action_acc.get_latest(step)[
+                :, agent_index
+            ].reshape(batch_size, 1)
+            action_steering = self.observations.past_action_steering.get_latest(step)[
+                :, agent_index
+            ].reshape(batch_size, 1)
+            distance_to_ref = self.observations.past_distance_to_ref_path.get_latest(step)[
+                :, agent_index
+            ].reshape(batch_size, 1)
+            distance_to_left_boundary = self.observations.past_distance_to_left_boundary.get_latest(
+                step
+            )[:, agent_index].reshape(batch_size, 1)
+            distance_to_right_boundary = self.observations.past_distance_to_right_boundary.get_latest(
+                step
+            )[:, agent_index].reshape(batch_size, 1)
+            error_space = (
+                self.observations.error_space.get_latest(step)[:, agent_index, :]
+                / self.normalizers.error_pos
+            ).reshape(batch_size, -1)
+            ref_distance = torch.linalg.norm(
+                self_short_term[:, 0, :2], dim=-1, keepdim=True
+            )
+
+            step_features = torch.cat(
+                (
+                    vel,
+                    speed,
+                    steering,
+                    action_acc,
+                    action_steering,
+                    self_ref_features,
+                    hinge_info.reshape(batch_size, -1),
+                    distance_to_ref,
+                    ref_distance,
+                    hinge_distance,
+                    distance_to_left_boundary,
+                    distance_to_right_boundary,
+                    error_space,
+                ),
+                dim=-1,
+            )
+            obs_self_history.append(step_features)
+
+        obs_self_history = torch.stack(obs_self_history, dim=1)
+        obs_self_groups = [("self_history", obs_self_history)]
+        if return_groups:
+            return obs_self_history, obs_self_groups
+        return obs_self_history
+
+    def observe_other_agents_history(
+        self, agent_index: int, return_groups: bool = False
+    ) -> Tensor | Tuple[Tensor, List[Tuple[str, Tensor]]]:
+        batch_size = self.world.batch_dim
+        step_indices = self._get_history_step_indices()
+
+        nearing_agents_distances, nearing_agents_indices = torch.topk(
+            self.distances.agents[:, agent_index],
+            k=self.observations.n_nearing_agents,
+            largest=False,
+        )
+        nearing_agents_indices, sorted_pos = torch.sort(nearing_agents_indices, dim=1)
+        nearing_agents_distances = torch.gather(
+            nearing_agents_distances, dim=1, index=sorted_pos
+        )
+        indexing_tuple_1 = (
+            (self.constants.env_idx_broadcasting,)
+            + ((agent_index,))
+            + (nearing_agents_indices,)
+        )
+
+        other_local_vel_history = torch.stack(
+            [
+                self.observations.past_vel.get_latest(step)[indexing_tuple_1]
+                for step in step_indices
+            ],
+            dim=1,
+        ) * self.normalizers.v
+        ego_local_vel_history = torch.stack(
+            [
+                self.observations.past_vel.get_latest(step)[:, agent_index, agent_index]
+                for step in step_indices
+            ],
+            dim=1,
+        ) * self.normalizers.v
+        relative_longitudinal_velocity_history = (
+            other_local_vel_history[..., 0]
+            - ego_local_vel_history[..., 0].unsqueeze(-1)
+        )
+        relative_acceleration_history = torch.zeros_like(
+            relative_longitudinal_velocity_history
+        )
+        if len(step_indices) > 1:
+            relative_acceleration_history[:, :-1] = (
+                relative_longitudinal_velocity_history[:, :-1]
+                - relative_longitudinal_velocity_history[:, 1:]
+            ) / self.dt
+
+        obs_other_history = []
+        for time_index, step in enumerate(step_indices):
+            obs_pos_other_agents = self.observations.past_pos.get_latest(step)[
+                indexing_tuple_1
+            ]
+            obs_rot_other_agents = self.observations.past_rot.get_latest(step)[
+                indexing_tuple_1
+            ].unsqueeze(-1)
+            obs_distance_other_agents = self.observations.past_distance_to_agents.get_latest(
+                step
+            )[
+                self.constants.env_idx_broadcasting,
+                agent_index,
+                nearing_agents_indices,
+            ].unsqueeze(-1)
+            obs_relative_longitudinal_velocity = (
+                relative_longitudinal_velocity_history[:, time_index].unsqueeze(-1)
+                / self.obs_relative_velocity_scale
+            )
+            obs_relative_acceleration = (
+                relative_acceleration_history[:, time_index].unsqueeze(-1)
+                / self.obs_relative_acceleration_scale
+            )
+
+            single_agent_feat = torch.cat(
+                [
+                    obs_pos_other_agents,
+                    obs_rot_other_agents,
+                    obs_relative_longitudinal_velocity,
+                    obs_relative_acceleration,
+                    obs_distance_other_agents,
+                ],
+                dim=-1,
+            )
+            obs_other_history.append(single_agent_feat.reshape(batch_size, -1))
+
+        obs_other_history = torch.stack(obs_other_history, dim=1)
+        obs_other_groups = [("others_history", obs_other_history)]
+        if return_groups:
+            return obs_other_history, obs_other_groups
+        return obs_other_history
     
     def observe_other_agents(self, agent_index):
         """Observe surrounding agents."""
@@ -3022,6 +3237,29 @@ class Scenario(BaseScenario):
         agent_index = self.world.agents.index(agent)
 
         self.update_observation_and_normalize(agent, agent_index)
+
+        if self.use_history_observation:
+            obs_self_history, obs_self_groups = self.observe_self_history(
+                agent_index, return_groups=True
+            )
+            obs_other_history, obs_other_groups = self.observe_other_agents_history(
+                agent_index, return_groups=True
+            )
+            obs = torch.cat((obs_self_history, obs_other_history), dim=-1)
+            obs = self._adjust_history_obs_dim(obs)
+            if self.enable_obs_audit:
+                self._maybe_print_obs_audit(
+                    agent_index,
+                    obs_self_groups + obs_other_groups + [("obs_total", obs)],
+                )
+            check_validity(self.observations)
+            check_validity(self.ref_paths_agent_related)
+            if self.is_add_noise:
+                return obs + (
+                    self.observations.noise_level
+                    * torch.rand_like(obs, device=self.world.device, dtype=torch.float32)
+                )
+            return obs
 
         # Observation of other agents
         #obs_other_agents = self.observe_other_agents(agent_index)
