@@ -145,6 +145,10 @@ class Scenario(BaseScenario):
         self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
         self.n_agents=kwargs.pop("n_agents", 5)
+        self.logged_control_acc = torch.zeros(
+            (batch_dim, self.n_agents), device=device, dtype=torch.float32
+        )
+        self.logged_control_steer = torch.zeros_like(self.logged_control_acc)
         self.hinge_active_steps = torch.zeros(
             (batch_dim, self.n_agents), device=device, dtype=torch.long
         )
@@ -1599,6 +1603,8 @@ class Scenario(BaseScenario):
         return v_front, v_rear
     
     def pre_step(self):
+        self.logged_control_acc.zero_()
+        self.logged_control_steer.zero_()
         if self.task_class == TaskClass.SIMPLE_PLATOON:
             return
         self.M_total = 5000.0  # 总质量 (2辆小车 + 扇叶)
@@ -1811,6 +1817,8 @@ class Scenario(BaseScenario):
                 min=-self.max_acceleration,
                 max=self.max_acceleration,
             )
+            self.logged_control_steer[0, agent_idx] = steering_angle.detach()
+            self.logged_control_acc[0, agent_idx] = acceleration.detach()
 
             beta = torch.atan2(
                 torch.tan(steering_angle) * self.l_r / (self.l_f + self.l_r),
@@ -2001,6 +2009,8 @@ class Scenario(BaseScenario):
                 min=-self.max_acceleration,
                 max=self.max_acceleration,
             )
+            self.logged_control_steer[0, agent_idx] = steering_angle.detach()
+            self.logged_control_acc[0, agent_idx] = acceleration.detach()
             self._last_vel_errors[agent_idx] = vel_error.detach().clone()
 
             beta = torch.atan2(
@@ -2147,6 +2157,8 @@ class Scenario(BaseScenario):
                 min=-self.max_acceleration,
                 max=self.max_acceleration
             )
+            self.logged_control_steer[0, agent_idx] = steering_angle.detach().clone()
+            self.logged_control_acc[0, agent_idx] = acceleration.detach().clone()
 
             # 保存当前速度误差供下次使用
             self._last_vel_errors[agent_idx] = vel_error.detach().clone()
@@ -2669,11 +2681,18 @@ class Scenario(BaseScenario):
             ),
             (
                 "self_ref_velocity",
-                effective_short_term[...,2].reshape(self.world.batch_dim, -1)
+                self_short_term[...,2].reshape(self.world.batch_dim, -1)
                 if not self.mask_ref_v
                 else None,
             ),
-            ("self_ref_points", effective_short_term[...,:2].reshape(self.world.batch_dim, -1)),
+            ("self_ref_points", self_short_term[...,:2].reshape(self.world.batch_dim, -1)),
+            (
+                "self_hinge_velocity",
+                hinge_info[...,2].reshape(self.world.batch_dim, -1)
+                if not self.mask_ref_v
+                else None,
+            ),
+            ("self_hinge_points", hinge_info[...,:2].reshape(self.world.batch_dim, -1)),
             ("self_left_boundary_distance", self_left_dis.reshape(self.world.batch_dim, -1)),
             ("self_right_boundary_distance", self_right_dis.reshape(self.world.batch_dim, -1)),
             (
@@ -2684,7 +2703,13 @@ class Scenario(BaseScenario):
             ),
             (
                 "self_distance_to_ref",
-                torch.linalg.norm(effective_short_term[
+                torch.linalg.norm(self_short_term[
+                    :, 0, :2
+                ],dim=-1).reshape(self.world.batch_dim, -1),
+            ),
+            (
+                "self_distance_to_hinge",
+                torch.linalg.norm(hinge_info[
                     :, 0, :2
                 ],dim=-1).reshape(self.world.batch_dim, -1),
             ),
@@ -3850,8 +3875,16 @@ class Scenario(BaseScenario):
             "rot": angle_eliminate_two_pi(agent.state.rot),
             "vel": agent.state.vel,
             "vel_norm": torch.norm(agent.state.vel, dim=-1),
-            "act_acc": (agent.action.u[:, 0]) if not is_action_empty else self.constants.empty_action_acc[:, agent_index],
-            "act_steer": (agent.action.u[:, 1]) if not is_action_empty else self.constants.empty_action_steering[:, agent_index],
+            "act_acc": (
+                (agent.action.u[:, 0])
+                if (self.traditional_control == MethodClass.MARL and not is_action_empty)
+                else self.logged_control_acc[:, agent_index]
+            ),
+            "act_steer": (
+                (agent.action.u[:, 1])
+                if (self.traditional_control == MethodClass.MARL and not is_action_empty)
+                else self.logged_control_steer[:, agent_index]
+            ),
             "distance_ref": self.distances.ref_paths[:, agent_index],
             "distance_lookahead_pts": torch.mean(self.distances.lookahead_pts[:, agent_index], dim=-1),
             "distance_left_b": self.distances.left_boundaries[:, agent_index].min(
