@@ -2700,6 +2700,13 @@ class Scenario(BaseScenario):
                     self.world.batch_dim, -1
                 ),
             ),
+            # 260326 居然没加历史加速度
+            (
+                "self_acc",
+                self.observations.past_action_acc.get_latest()[:,agent_index].reshape(
+                    self.world.batch_dim, -1
+                ),
+            ),
             (
                 "self_ref_velocity",
                 self_short_term[...,2].reshape(self.world.batch_dim, -1)
