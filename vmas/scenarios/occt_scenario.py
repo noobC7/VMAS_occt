@@ -307,6 +307,9 @@ class Scenario(BaseScenario):
         self.lane_width = 6  # 道路宽度
         if self.task_class == TaskClass.OCCT_PLATOON:
             self.hinge_edge_buffer=kwargs.pop("hinge_edge_buffer", self.agent_width/2*1.2) # hinge判断可用的最小边缘距离
+            self.hinge_short_term_status_mode = kwargs.pop(
+                "hinge_short_term_status_mode", "boundary_margin"
+            )
             self.rod_len = (self.n_followers+1) * self.still_space   # 货物长度 L
             self.hinge_side_width = float(kwargs.get("hinge_side_width", 5))
             self.corner_prepare_len = float(kwargs.get("corner_prepare_len", 40))
@@ -355,7 +358,7 @@ class Scenario(BaseScenario):
                 (batch_dim, self.n_hinges, self.n_points_short_term, 5),
                 device=device,
                 dtype=torch.float32,
-            ),  # [x, y, vx, vy, hinge_status]
+            ),  # [x, y, vx, vy, hinge_signal]
             short_term_indices=torch.zeros(
                 (batch_dim, self.n_agents, self.n_points_short_term),
                 device=device,
@@ -1372,6 +1375,7 @@ class Scenario(BaseScenario):
             hinge_edge_buffer=self.hinge_edge_buffer,
             corner_s=self.road.batch_corner_s_begin,
             hinge_relative_pos=self.hinge_relative_pos,
+            status_mode=self.hinge_short_term_status_mode,
         )[env_j]
         self.ref_paths_agent_related.hinge_status[env_j, :] = False
         for agent_i in range(self.n_agents):
@@ -1776,6 +1780,7 @@ class Scenario(BaseScenario):
                     hinge_edge_buffer=self.hinge_edge_buffer,
                     corner_s=self.road.batch_corner_s_begin,
                     hinge_relative_pos=self.hinge_relative_pos,
+                    status_mode=self.hinge_short_term_status_mode,
                 )[0, agent_idx]
                 ref_points = ref_path[:, :2]
                 ref_speeds = torch.linalg.norm(ref_path[:, 2:4], dim=-1)
@@ -2253,6 +2258,7 @@ class Scenario(BaseScenario):
             hinge_edge_buffer=self.hinge_edge_buffer,
             corner_s=self.road.batch_corner_s_begin,
             hinge_relative_pos=self.hinge_relative_pos,
+            status_mode=self.hinge_short_term_status_mode,
         )
 
         self.ref_paths_agent_related.hinge_status.zero_()
@@ -2648,7 +2654,11 @@ class Scenario(BaseScenario):
             observed_hinge_short_term = self.observations.past_relative_hinge_info.get_latest()[
                 :,agent_index,agent_index
             ]
-            hinge_short_term_status = observed_hinge_short_term[..., 4:5]
+            if self.hinge_short_term_status_mode=="binary":
+                hinge_short_term_status = observed_hinge_short_term[..., 4:5]
+            else:
+                hinge_short_term_status = torch.clamp(observed_hinge_short_term[..., 4:5]/(self.lane_width/2),
+                                                      min=0,max=1)
             hinge_short_term_speed = torch.linalg.norm(
                 observed_hinge_short_term[..., 2:4],
                 dim=-1,
@@ -2792,7 +2802,11 @@ class Scenario(BaseScenario):
                 observed_hinge_short_term = self.observations.past_relative_hinge_info.get_latest(
                     step
                 )[:, agent_index, agent_index]
-                hinge_short_term_status = observed_hinge_short_term[..., 4:5]
+                if self.hinge_short_term_status_mode=="binary":
+                    hinge_short_term_status = observed_hinge_short_term[..., 4:5]
+                else:
+                    hinge_short_term_status = torch.clamp(observed_hinge_short_term[..., 4:5]/(self.lane_width/2),
+                                                      min=0,max=1)
                 hinge_short_term_speed = torch.linalg.norm(
                     observed_hinge_short_term[..., 2:4],
                     dim=-1,
@@ -3358,7 +3372,11 @@ class Scenario(BaseScenario):
     def get_target_hinge_status(self, agent_index, ready_n=None):
         hinge_short_term = self.ref_paths_agent_related.hinge_short_term[:, agent_index] # [B, n_points, 5]
         ready_n = hinge_short_term.shape[-2] if ready_n is None else ready_n
-        hinge_ready = hinge_short_term[:, :ready_n, -1] > 0.5    # [batch_dim, n_points]
+        hinge_signal = hinge_short_term[:, :ready_n, -1]
+        if self.hinge_short_term_status_mode == "boundary_margin":
+            hinge_ready = hinge_signal > 0.0
+        else:
+            hinge_ready = hinge_signal > 0.5    # [batch_dim, n_points]
         is_block, block_order = check_boolean_block(hinge_ready)
         # 0=先0后1(过完弯），2=纯1(直道) is_block(不是反复可铰接)
         if self.traditional_control==MethodClass.MARL:
@@ -4058,6 +4076,38 @@ class Scenario(BaseScenario):
         Get the current hinge velocity of the agent.
         """
         return self.ref_paths_agent_related.hinge_short_term[:, agent_index, lookahead_idx, 2:4]
+
+    def _compute_agent_command_acceleration(self, agent_index: int) -> Tensor:
+        if self.observations.past_action_acc.valid_size == 0:
+            return torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
+        return (
+            self.observations.past_action_acc.get_latest(n=1)[:, agent_index]
+            * self.normalizers.action_acc
+        ).to(torch.float32)
+
+    def _compute_agent_command_jerk(self, agent_index: int) -> Tensor:
+        if self.observations.past_action_acc.valid_size < 2:
+            return torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
+        acc_current = self.observations.past_action_acc.get_latest(n=1)[:, agent_index]
+        acc_previous = self.observations.past_action_acc.get_latest(n=2)[:, agent_index]
+        return (
+            (acc_current - acc_previous) * self.normalizers.action_acc / self.dt
+        ).to(torch.float32)
+
+    def _compute_agent_steering_rate_deg(self, agent_index: int) -> Tensor:
+        if self.observations.past_action_steering.valid_size < 2:
+            return torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
+        steering_current = (
+            self.observations.past_action_steering.get_latest(n=1)[:, agent_index]
+            * self.normalizers.action_steering
+        )
+        steering_previous = (
+            self.observations.past_action_steering.get_latest(n=2)[:, agent_index]
+            * self.normalizers.action_steering
+        )
+        delta = steering_current - steering_previous
+        return (delta * (180.0 / torch.pi) / self.dt).to(torch.float32)
+
     def info(self, agent: Agent) -> Dict[str, Tensor]:
         agent_index = self.world.agents.index(agent)  # Index of the current agent
 
@@ -4071,6 +4121,9 @@ class Scenario(BaseScenario):
         )  # [batch_dim]
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
         agent_error_space=self.observations.error_space.get_latest()[:, agent_index,:]
+        command_acceleration = self._compute_agent_command_acceleration(agent_index)
+        command_jerk = self._compute_agent_command_jerk(agent_index)
+        steering_rate_deg = self._compute_agent_steering_rate_deg(agent_index)
         agent_reward_details = {}
         for reward_name, reward_tensor in self.reward_details.items():
             # reward_tensor 维度：(batch_dim, n_agents) → 提取当前智能体的列
@@ -4123,6 +4176,12 @@ class Scenario(BaseScenario):
                 if (self.traditional_control == MethodClass.MARL and not is_action_empty)
                 else self.logged_control_steer[:, agent_index]
             ),
+            "command_acceleration": command_acceleration,
+            "command_acceleration_abs": command_acceleration.abs(),
+            "command_jerk": command_jerk,
+            "command_jerk_abs": command_jerk.abs(),
+            "steering_rate_deg": steering_rate_deg,
+            "steering_rate_abs_deg": steering_rate_deg.abs(),
             "distance_ref": self.distances.ref_paths[:, agent_index],
             "distance_lookahead_pts": torch.mean(self.distances.lookahead_pts[:, agent_index], dim=-1),
             "distance_left_b": self.distances.left_boundaries[:, agent_index].min(
@@ -4427,7 +4486,7 @@ class Scenario(BaseScenario):
                     p = hinge_status[:2]
                     status = hinge_status[-1]
                     diamond_poly = [(0, 0.2), (0.2, 0), (0, -0.2), (-0.2, 0)]
-                    if status > 0.5:
+                    if status > 0.0:
                         circle = rendering.make_polygon(diamond_poly, filled=True)
                     else:
                         circle = rendering.make_polygon(diamond_poly, filled=False)
