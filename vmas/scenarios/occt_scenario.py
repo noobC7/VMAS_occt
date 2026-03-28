@@ -13,7 +13,7 @@ from vmas.simulator import rendering
 from vmas.simulator.utils import Color, ScenarioUtils
 
 from vmas.scenarios.road_traffic import get_perpendicular_distances,get_distances_between_agents,get_rectangle_vertices,\
-    transform_from_global_to_local_coordinate,interX,exponential_decreasing_fcn,\
+    transform_from_global_to_local_coordinate,interX,exponential_decreasing_fcn,angle_eliminate_two_pi,\
     Collisions,CircularBuffer,Timer,StateBuffer
 # 添加Road类导入
 from vmas.scenarios.occt_map import OcctMap,OcctCRMap
@@ -2558,7 +2558,9 @@ class Scenario(BaseScenario):
                         rot_i=rot_i,
                     )
                     # Store new observation - rotation
-                    rot_i_others[:, a_i] = rotations_global - rot_i
+                    rot_i_others[:, a_i] = angle_eliminate_two_pi(
+                        rotations_global - rot_i
+                    )
 
                     for a_j in range(self.n_agents):
                         # Store new observation - velocities
