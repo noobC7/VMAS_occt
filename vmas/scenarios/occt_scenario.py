@@ -13,7 +13,7 @@ from vmas.simulator import rendering
 from vmas.simulator.utils import Color, ScenarioUtils
 
 from vmas.scenarios.road_traffic import get_perpendicular_distances,get_distances_between_agents,get_rectangle_vertices,\
-    transform_from_global_to_local_coordinate,interX,exponential_decreasing_fcn,angle_eliminate_two_pi,\
+    transform_from_global_to_local_coordinate,interX,exponential_decreasing_fcn,\
     Collisions,CircularBuffer,Timer,StateBuffer
 # 添加Road类导入
 from vmas.scenarios.occt_map import OcctMap,OcctCRMap
@@ -152,6 +152,18 @@ class Scenario(BaseScenario):
         self.hinge_active_steps = torch.zeros(
             (batch_dim, self.n_agents), device=device, dtype=torch.long
         )
+        self.reward_phase_weights = torch.zeros(
+            (batch_dim, self.n_agents), device=device, dtype=torch.float32
+        )
+        self.reward_phase_transition_start = torch.zeros(
+            (batch_dim, self.n_agents), device=device, dtype=torch.float32
+        )
+        self.reward_phase_transition_target = torch.zeros(
+            (batch_dim, self.n_agents), device=device, dtype=torch.float32
+        )
+        self.reward_phase_transition_progress = torch.ones(
+            (batch_dim, self.n_agents), device=device, dtype=torch.float32
+        )
         self.obs_audit_agent_index = min(max(self.obs_audit_agent_index, 0), self.n_agents - 1)
         # platoon params
         self.is_loop=kwargs.pop("is_loop", False)
@@ -197,7 +209,7 @@ class Scenario(BaseScenario):
         self.sample_interval=kwargs.pop("sample_interval", 2)
         self.boundary_offset=kwargs.pop("boundary_offset", -self.sample_interval)
         self.n_points_nearing_boundary=kwargs.pop("n_points_nearing_boundary", self.n_points_short_term+1)
-        self.is_apply_mask=kwargs.pop("is_apply_mask", True)
+        self.is_apply_mask=kwargs.pop("is_apply_mask", False)
         self.is_observe_vertices=kwargs.pop("is_observe_vertices", False)
         self.is_observe_distance_to_agents=kwargs.pop(
             "is_observe_distance_to_agents", True
@@ -310,6 +322,25 @@ class Scenario(BaseScenario):
             self.hinge_short_term_status_mode = kwargs.pop(
                 "hinge_short_term_status_mode", "boundary_margin"
             )
+            self.reward_transition_blend_enabled = bool(
+                kwargs.pop("reward_transition_blend_enabled", False)
+            )
+            self.reward_transition_blend_mode = str(
+                kwargs.pop("reward_transition_blend_mode", "ramp")
+            ).lower()
+            self.reward_transition_duration_sec = float(
+                kwargs.pop("reward_transition_duration_sec", 0.2)
+            )
+            if self.reward_transition_duration_sec <= 0.0:
+                self.reward_transition_step_delta = 1.0
+            else:
+                self.reward_transition_step_delta = min(
+                    1.0, self.dt / self.reward_transition_duration_sec
+                )
+            if self.reward_transition_blend_mode not in {"ramp", "first_order", "s_curve"}:
+                raise ValueError(
+                    "reward_transition_blend_mode must be one of {'ramp', 'first_order', 's_curve'}."
+                )
             self.rod_len = (self.n_followers+1) * self.still_space   # 货物长度 L
             self.hinge_side_width = float(kwargs.get("hinge_side_width", 5))
             self.corner_prepare_len = float(kwargs.get("corner_prepare_len", 40))
@@ -1138,6 +1169,10 @@ class Scenario(BaseScenario):
             idx_mask = torch.zeros(B, dtype=torch.bool, device=device)
             idx_mask[env_index] = True
         self.hinge_active_steps[idx_mask] = 0
+        self.reward_phase_weights[idx_mask] = 0.0
+        self.reward_phase_transition_start[idx_mask] = 0.0
+        self.reward_phase_transition_target[idx_mask] = 0.0
+        self.reward_phase_transition_progress[idx_mask] = 1.0
         if self.simple_mppi is not None:
             self.simple_mppi.reset()
         if hasattr(self, "_last_vel_errors"):
@@ -3528,29 +3563,103 @@ class Scenario(BaseScenario):
         #     goal_mask=torch.ones(self.batch_dim, device=self.device, dtype=torch.float32),
         # )
         return reward_details
+
+    def _update_reward_phase_weight(
+        self, agent_index: int, hinge_status: Tensor
+    ) -> Tensor:
+        target_weight = hinge_status.to(torch.float32)
+        if not self.reward_transition_blend_enabled:
+            self.reward_phase_weights[:, agent_index] = target_weight
+            self.reward_phase_transition_start[:, agent_index] = target_weight
+            self.reward_phase_transition_target[:, agent_index] = target_weight
+            self.reward_phase_transition_progress[:, agent_index] = 1.0
+            return target_weight
+
+        previous_weight = self.reward_phase_weights[:, agent_index]
+        previous_target = self.reward_phase_transition_target[:, agent_index]
+        target_changed = (target_weight - previous_target).abs() > 1e-6
+        if target_changed.any():
+            self.reward_phase_transition_start[:, agent_index] = torch.where(
+                target_changed,
+                previous_weight,
+                self.reward_phase_transition_start[:, agent_index],
+            )
+            self.reward_phase_transition_target[:, agent_index] = torch.where(
+                target_changed,
+                target_weight,
+                previous_target,
+            )
+            self.reward_phase_transition_progress[:, agent_index] = torch.where(
+                target_changed,
+                torch.zeros_like(target_weight),
+                self.reward_phase_transition_progress[:, agent_index],
+            )
+
+        if self.reward_transition_blend_mode == "ramp":
+            delta = torch.clamp(
+                target_weight - previous_weight,
+                min=-self.reward_transition_step_delta,
+                max=self.reward_transition_step_delta,
+            )
+            updated_weight = previous_weight + delta
+        elif self.reward_transition_blend_mode in {"s_curve", "sigmoid"}:
+            progress = (
+                self.reward_phase_transition_progress[:, agent_index]
+                + self.reward_transition_step_delta
+            ).clamp(0.0, 1.0)
+            self.reward_phase_transition_progress[:, agent_index] = progress
+            smooth_progress = progress * progress * (3.0 - 2.0 * progress)
+            transition_start = self.reward_phase_transition_start[:, agent_index]
+            transition_target = self.reward_phase_transition_target[:, agent_index]
+            updated_weight = transition_start + (
+                transition_target - transition_start
+            ) * smooth_progress
+        else:
+            # First-order smoothing: update magnitude scales with the current gap.
+            updated_weight = previous_weight + self.reward_transition_step_delta * (
+                target_weight - previous_weight
+            )
+        updated_weight = updated_weight.clamp(0.0, 1.0)
+        self.reward_phase_weights[:, agent_index] = updated_weight
+        return updated_weight
+
     def reward_occt_platoon(self, reward_details, agent_index, ref_points_vecs, move_vec):
         hinge_status = self.ref_paths_agent_related.hinge_status[:,agent_index]
+        hinge_weight = self._update_reward_phase_weight(agent_index, hinge_status)
+        platoon_weight = 1.0 - hinge_weight
         self.hinge_active_steps[:, agent_index] = torch.where(
             hinge_status,
             self.hinge_active_steps[:, agent_index] + 1,
             torch.zeros_like(self.hinge_active_steps[:, agent_index]),
         )
         platoon_s_errors = self.observations.error_space.get_latest(n=1)[:, agent_index, 0]
-        reward_platoon_space = self.clamp_error_reward(self.rewards.reward_platoon_space, platoon_s_errors) * ~hinge_status
+        reward_platoon_space = (
+            self.clamp_error_reward(self.rewards.reward_platoon_space, platoon_s_errors)
+            * platoon_weight
+        )
         reward_details["reward_platoon_space"][:, agent_index] = reward_platoon_space
 
         agent_desire_pos = self.get_lookahead_agent_pos(agent_index)
         hinge_desire_pos = self.get_target_hinge_pos(agent_index)
         hinge_pos_errors = torch.norm(hinge_desire_pos - agent_desire_pos, dim=-1)
-        reward_hinge_space = self.clamp_error_reward(self.rewards.reward_hinge_space, hinge_pos_errors) * hinge_status
+        reward_hinge_space = (
+            self.clamp_error_reward(self.rewards.reward_hinge_space, hinge_pos_errors)
+            * hinge_weight
+        )
         reward_details["reward_hinge_space"][:, agent_index] = reward_hinge_space
         
         platoon_vel_error = torch.max(torch.abs(self.observations.error_vel[:, agent_index]), dim=-1)[0]
-        reward_platoon_vel = self.clamp_error_reward(self.rewards.reward_platoon_vel, platoon_vel_error) * ~hinge_status
+        reward_platoon_vel = (
+            self.clamp_error_reward(self.rewards.reward_platoon_vel, platoon_vel_error)
+            * platoon_weight
+        )
         reward_details["reward_platoon_vel"][:, agent_index] = reward_platoon_vel
 
         hinge_vel_error = torch.max(torch.abs(self.observations.error_vel[:, agent_index]), dim=-1)[0]
-        reward_hinge_vel = self.clamp_error_reward(self.rewards.reward_hinge_vel, hinge_vel_error) * hinge_status
+        reward_hinge_vel = (
+            self.clamp_error_reward(self.rewards.reward_hinge_vel, hinge_vel_error)
+            * hinge_weight
+        )
         reward_details["reward_hinge_vel"][:, agent_index] = reward_hinge_vel
 
         weighted_hinge_ref_path_error = torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
@@ -3558,22 +3667,32 @@ class Scenario(BaseScenario):
             agent_desire_pos = self.get_lookahead_agent_pos(agent_index, idx)
             hinge_desire_pos = self.get_target_hinge_pos(agent_index, idx)
             weighted_hinge_ref_path_error += ratio * torch.norm(hinge_desire_pos - agent_desire_pos, dim=-1)
-        reward_hinge_ref = self.clamp_error_reward(self.rewards.reward_hinge_ref, weighted_hinge_ref_path_error) * hinge_status
+        reward_hinge_ref = (
+            self.clamp_error_reward(
+                self.rewards.reward_hinge_ref, weighted_hinge_ref_path_error
+            )
+            * hinge_weight
+        )
         reward_details["reward_hinge_ref"][:, agent_index] = reward_hinge_ref
 
         weighted_platoon_ref_path_error = torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
         for idx, ratio in enumerate((0.2, 0.8)):
             weighted_platoon_ref_path_error += ratio * self.distances.lookahead_pts[:, agent_index, idx]
-        reward_platoon_ref = self.clamp_error_reward(self.rewards.reward_platoon_ref, weighted_platoon_ref_path_error)# * ~hinge_status
+        reward_platoon_ref = (
+            self.clamp_error_reward(
+                self.rewards.reward_platoon_ref, weighted_platoon_ref_path_error
+            )
+            * platoon_weight
+        )
         reward_details["reward_platoon_ref"][:, agent_index] = reward_platoon_ref
 
         reward_platoon_heading = self._reward_agent_heading(
                 ref_points_vecs=ref_points_vecs,
                 move_vec=move_vec,
-            ) * ~hinge_status
+            ) * platoon_weight
         reward_details["reward_platoon_heading"][:, agent_index] = reward_platoon_heading
 
-        approach_mask = hinge_status # & (hinge_pos_errors>0.5)
+        approach_mask = hinge_weight # & (hinge_pos_errors>0.5)
         hinge_approach_progress = self.get_hinge_approach_progress(agent_index,is_simple=True)
         reward_approach_hinge = torch.clamp(
             self.reward_approach_hinge * hinge_approach_progress,
@@ -3592,7 +3711,11 @@ class Scenario(BaseScenario):
         hinge_steps = self.hinge_active_steps[:, agent_index]
         #print(f"hinge_steps-[{hinge_steps.min().cpu(),hinge_steps.mean().cpu(),hinge_steps.max().cpu()}]")
         #hinge_time_cost = -torch.clamp(hinge_steps/self.normalizers.hinge_step,max=2)
-        reward_details["penalty_hinge_time_cost"][:, agent_index] = self.penalties.hinge_time_cost*((hinge_status & ~current_agent_hinge_status).to(torch.float32))
+        reward_details["penalty_hinge_time_cost"][:, agent_index] = (
+            self.penalties.hinge_time_cost
+            * ((hinge_status & ~current_agent_hinge_status).to(torch.float32))
+            * hinge_weight
+        )
         #reward_goal = self._reward_conditional_goal()
         reward_details["reward_goal"][:, agent_index] = 0
         return reward_details
@@ -4131,6 +4254,7 @@ class Scenario(BaseScenario):
         command_acceleration = self._compute_agent_command_acceleration(agent_index)
         command_jerk = self._compute_agent_command_jerk(agent_index)
         steering_rate_deg = self._compute_agent_steering_rate_deg(agent_index)
+        reward_phase_weight = self.reward_phase_weights[:, agent_index]
         agent_reward_details = {}
         for reward_name, reward_tensor in self.reward_details.items():
             # reward_tensor 维度：(batch_dim, n_agents) → 提取当前智能体的列
@@ -4189,6 +4313,8 @@ class Scenario(BaseScenario):
             "command_jerk_abs": command_jerk.abs(),
             "steering_rate_deg": steering_rate_deg,
             "steering_rate_abs_deg": steering_rate_deg.abs(),
+            "reward_phase_weight": reward_phase_weight,
+            "reward_phase_platoon_weight": 1.0 - reward_phase_weight,
             "distance_ref": self.distances.ref_paths[:, agent_index],
             "distance_lookahead_pts": torch.mean(self.distances.lookahead_pts[:, agent_index], dim=-1),
             "distance_left_b": self.distances.left_boundaries[:, agent_index].min(
