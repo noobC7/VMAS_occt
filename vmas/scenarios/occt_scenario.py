@@ -3264,18 +3264,19 @@ class Scenario(BaseScenario):
 
         relative_longitudinal_velocity_history = self.get_local_relative_longitudinal_velocity_history(
             agent_index, indexing_tuple_1
-        )  # [batch_size, n_nearing_agents, n_observed_steps]
-        relative_acceleration_history = torch.cat(
-            [
-                torch.zeros_like(relative_longitudinal_velocity_history[..., :1]),
-                (
-                    relative_longitudinal_velocity_history[..., 1:]
-                    - relative_longitudinal_velocity_history[..., :-1]
-                )
-                / self.dt,
-            ],
-            dim=-1,
-        )
+        )  # [batch_size, n_nearing_agents, n_observed_steps], ordered as [t, t-1, ...]
+        current_relative_longitudinal_velocity = relative_longitudinal_velocity_history[
+            ..., :1
+        ]
+        if relative_longitudinal_velocity_history.shape[-1] > 1:
+            current_relative_acceleration = (
+                current_relative_longitudinal_velocity
+                - relative_longitudinal_velocity_history[..., 1:2]
+            ) / self.dt
+        else:
+            current_relative_acceleration = torch.zeros_like(
+                current_relative_longitudinal_velocity
+            )
 
         # Distances to nearing agents
         obs_distance_other_agents = (
@@ -3292,11 +3293,10 @@ class Scenario(BaseScenario):
         obs_pos = obs_pos_other_agents  # [batch, n_nearing, 2]
         obs_rot = obs_rot_other_agents.unsqueeze(-1)  # [batch, n_nearing, 1]（扩维对齐）
         obs_relative_longitudinal_velocity = (
-            relative_longitudinal_velocity_history[..., -1:]
-            / self.obs_relative_velocity_scale
+            current_relative_longitudinal_velocity / self.obs_relative_velocity_scale
         ).reshape(self.world.batch_dim, self.observations.n_nearing_agents, -1)
         obs_relative_acceleration = (
-            relative_acceleration_history[..., -1:] / self.obs_relative_acceleration_scale
+            current_relative_acceleration / self.obs_relative_acceleration_scale
         ).reshape(self.world.batch_dim, self.observations.n_nearing_agents, -1)
         obs_distance = obs_distance_other_agents.unsqueeze(-1)  # [batch, n_nearing, 1]（扩维对齐）
 
