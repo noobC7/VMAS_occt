@@ -319,9 +319,6 @@ class Scenario(BaseScenario):
         self.lane_width = 6  # 道路宽度
         if self.task_class == TaskClass.OCCT_PLATOON:
             self.hinge_edge_buffer=kwargs.pop("hinge_edge_buffer", self.agent_width/2*1.2) # hinge判断可用的最小边缘距离
-            self.hinge_short_term_status_mode = kwargs.pop(
-                "hinge_short_term_status_mode", "boundary_margin"
-            )
             self.reward_transition_blend_enabled = bool(
                 kwargs.pop("reward_transition_blend_enabled", False)
             )
@@ -389,7 +386,7 @@ class Scenario(BaseScenario):
                 (batch_dim, self.n_hinges, self.n_points_short_term, 5),
                 device=device,
                 dtype=torch.float32,
-            ),  # [x, y, vx, vy, hinge_signal]
+            ),  # [x, y, vx, vy, hinge_dis_boundary]
             short_term_indices=torch.zeros(
                 (batch_dim, self.n_agents, self.n_points_short_term),
                 device=device,
@@ -553,6 +550,26 @@ class Scenario(BaseScenario):
             ),
             error_vel=torch.zeros(
                 (batch_dim, self.n_agents, 2), device=device, dtype=torch.float32
+            ),
+            platoon_error_vel=torch.zeros(
+                (batch_dim, self.n_agents, 2), device=device, dtype=torch.float32
+            ),
+            hinge_error_vel=torch.zeros(
+                (batch_dim, self.n_agents, 2), device=device, dtype=torch.float32
+            ),
+            past_platoon_error_vel=CircularBuffer(
+                torch.zeros(
+                    (n_stored_steps, batch_dim, self.n_agents, 2),
+                    device=device,
+                    dtype=torch.float32,
+                )
+            ),
+            past_hinge_error_vel=CircularBuffer(
+                torch.zeros(
+                    (n_stored_steps, batch_dim, self.n_agents, 2),
+                    device=device,
+                    dtype=torch.float32,
+                )
             ),
             error_space=CircularBuffer(
                 torch.zeros(
@@ -1407,10 +1424,7 @@ class Scenario(BaseScenario):
             device=self.world.device,
             sample_ds=self.sample_interval,
             env_j=env_j,
-            hinge_edge_buffer=self.hinge_edge_buffer,
-            corner_s=self.road.batch_corner_s_begin,
             hinge_relative_pos=self.hinge_relative_pos,
-            status_mode=self.hinge_short_term_status_mode,
         )[env_j]
         self.ref_paths_agent_related.hinge_status[env_j, :] = False
         for agent_i in range(self.n_agents):
@@ -1812,10 +1826,7 @@ class Scenario(BaseScenario):
                     device=self.world.device,
                     sample_ds=hinge_ref_sample_ds,
                     env_j=slice(None),
-                    hinge_edge_buffer=self.hinge_edge_buffer,
-                    corner_s=self.road.batch_corner_s_begin,
                     hinge_relative_pos=self.hinge_relative_pos,
-                    status_mode=self.hinge_short_term_status_mode,
                 )[0, agent_idx]
                 ref_points = ref_path[:, :2]
                 ref_speeds = torch.linalg.norm(ref_path[:, 2:4], dim=-1)
@@ -2290,10 +2301,7 @@ class Scenario(BaseScenario):
             device=self.world.device,
             sample_ds=self.sample_interval,
             env_j=slice(None),
-            hinge_edge_buffer=self.hinge_edge_buffer,
-            corner_s=self.road.batch_corner_s_begin,
             hinge_relative_pos=self.hinge_relative_pos,
-            status_mode=self.hinge_short_term_status_mode,
         )
 
         self.ref_paths_agent_related.hinge_status.zero_()
@@ -2440,12 +2448,14 @@ class Scenario(BaseScenario):
                     error_space[:, agent_idx, 1] = actual_distance - self.platoon_space_batch
         return error_space
 
-    def _compute_tracking_error_vel(self):
+    def _compute_tracking_error_vel_components(self):
         error_vel = torch.zeros(
             (self.world.batch_dim, self.n_agents, 2),
             device=self.world.device,
             dtype=torch.float32,
         )
+        platoon_error_vel = torch.zeros_like(error_vel)
+        hinge_error_vel = torch.zeros_like(error_vel)
         agent_speed = torch.stack(
             [torch.linalg.norm(agent.state.vel, dim=1) for agent in self.world.agents],
             dim=1,
@@ -2463,19 +2473,30 @@ class Scenario(BaseScenario):
                     self.get_target_hinge_vel(agent_idx, 0),
                     dim=-1,
                 )
-                error_vel[hinge_status, agent_idx, 0] = ego_speed[hinge_status] - target_hinge_speed[hinge_status]
-                error_vel[hinge_status, agent_idx, 1] = error_vel[hinge_status, agent_idx, 0]
-
                 front_vehicle_speed_error = agent_speed[:, agent_idx - 1] - ego_speed
-                error_vel[non_hinge_status, agent_idx, 0] = front_vehicle_speed_error[non_hinge_status]
                 rear_vehicle_speed_error = agent_speed[:, agent_idx + 1] - ego_speed
-                error_vel[non_hinge_status, agent_idx, 1] = rear_vehicle_speed_error[non_hinge_status]
+                platoon_error_vel[:, agent_idx, 0] = front_vehicle_speed_error
+                platoon_error_vel[:, agent_idx, 1] = rear_vehicle_speed_error
+                hinge_error_vel[:, agent_idx, 0] = ego_speed - target_hinge_speed
+                hinge_error_vel[:, agent_idx, 1] = hinge_error_vel[:, agent_idx, 0]
+                error_vel[non_hinge_status, agent_idx] = platoon_error_vel[
+                    non_hinge_status, agent_idx
+                ]
+                error_vel[hinge_status, agent_idx] = hinge_error_vel[
+                    hinge_status, agent_idx
+                ]
             else:
                 if agent_idx == 0:
                     error_vel[:, agent_idx, 0] = ego_speed - leader_ref_speed
                 else:
                     error_vel[:, agent_idx, 0] = ego_speed - leader_speed
                 error_vel[:, agent_idx, 1] = error_vel[:, agent_idx, 0]
+                platoon_error_vel[:, agent_idx] = error_vel[:, agent_idx]
+                hinge_error_vel[:, agent_idx] = error_vel[:, agent_idx]
+        return error_vel, platoon_error_vel, hinge_error_vel
+
+    def _compute_tracking_error_vel(self):
+        error_vel, _, _ = self._compute_tracking_error_vel_components()
         return error_vel
     def update_observation_and_normalize(self, agent, agent_index):
         """Update observation and normalize them."""
@@ -2508,9 +2529,15 @@ class Scenario(BaseScenario):
             )
 
             error_space = self._compute_tracking_error_space()
-            error_vel = self._compute_tracking_error_vel()
+            error_vel, platoon_error_vel, hinge_error_vel = (
+                self._compute_tracking_error_vel_components()
+            )
             self.observations.error_space.add(error_space)
             self.observations.error_vel = error_vel
+            self.observations.platoon_error_vel = platoon_error_vel
+            self.observations.hinge_error_vel = hinge_error_vel
+            self.observations.past_platoon_error_vel.add(platoon_error_vel)
+            self.observations.past_hinge_error_vel.add(hinge_error_vel)
             if True:
                 pos_i_others = torch.zeros(
                     (self.world.batch_dim, self.n_agents, self.n_agents, 2),
@@ -2685,32 +2712,28 @@ class Scenario(BaseScenario):
             + ((agent_index, 0))
         )  # In local coordinate system, only the first component is interesting, as the second is always 0
         self_short_term = self.observations.past_relative_ref_info.get_latest()[:,agent_index,agent_index,:,:]
-        effective_short_term = self_short_term
         if self.task_class == TaskClass.OCCT_PLATOON:
-            hinge_mask = self.ref_paths_agent_related.hinge_status[:,agent_index][:, None, None]
-            observed_hinge_short_term = self.observations.past_relative_hinge_info.get_latest()[
+            self_hinge_status = self.ref_paths_agent_related.hinge_status[:,agent_index].to(torch.float32)
+            relative_hinge_info = self.observations.past_relative_hinge_info.get_latest()[
                 :,agent_index,agent_index
             ]
-            if self.hinge_short_term_status_mode=="binary":
-                hinge_short_term_status = observed_hinge_short_term[..., 4:5]
-            else:
-                hinge_short_term_status = torch.clamp(observed_hinge_short_term[..., 4:5]/(self.lane_width/2),
-                                                      min=0,max=1)
-            hinge_short_term_speed = torch.linalg.norm(
-                observed_hinge_short_term[..., 2:4],
+            hinge_pos = torch.clamp(relative_hinge_info[..., :2],min=-1,max=1)
+            hinge_speed = torch.linalg.norm(
+                relative_hinge_info[..., 2:4],
                 dim=-1,
                 keepdim=True,
             )
-            hinge_info = torch.cat(
-                (observed_hinge_short_term[..., :2], hinge_short_term_speed),
+            hinge_dis_boundary = torch.clamp(relative_hinge_info[..., 4:5]/(self.lane_width/2),
+                                                      min=-1,max=1)
+            observed_hinge_info = torch.cat(
+                (hinge_pos, hinge_speed, hinge_dis_boundary),
                 dim=-1,
             )
-            effective_short_term = torch.where(hinge_mask, hinge_info, self_short_term)
-        if hinge_info is not None and hinge_info.max() > self.obs_audit_large_threshold:
+        if observed_hinge_info is not None and observed_hinge_info.max() > self.obs_audit_large_threshold:
             print(
                 f"[OBS_AUDIT_DEBUG] HINGE_INFO_ABNORMAL "
                 f"step={self._get_obs_audit_step()} agent={agent_index} "
-                f"max_abs={hinge_info.max():.3e}"
+                f"max_abs={observed_hinge_info.max():.3e}"
             )
             import pdb;pdb.set_trace()
         self_left_boundary_pts = self.observations.past_left_boundary.get_latest()[
@@ -2751,30 +2774,33 @@ class Scenario(BaseScenario):
                 else None,
             ),
             ("self_ref_points", self_short_term[...,:2].reshape(self.world.batch_dim, -1)),
-            (
-                "self_hinge_velocity",
-                hinge_info[...,2].reshape(self.world.batch_dim, -1)
-                if not self.mask_ref_v
-                else None,
-            ),
-            ("self_hinge_points", hinge_info[...,:2].reshape(self.world.batch_dim, -1)),
+            
             ("self_left_boundary_distance", self_left_dis.reshape(self.world.batch_dim, -1)),
             ("self_right_boundary_distance", self_right_dis.reshape(self.world.batch_dim, -1)),
             (
                 "self_hinge_status",
-                hinge_short_term_status.reshape(self.world.batch_dim, -1)
+                self_hinge_status.reshape(self.world.batch_dim, -1)
                 if self.task_class == TaskClass.OCCT_PLATOON
                 else None,
             ),
             (
-                "self_distance_to_ref",
-                torch.linalg.norm(self_short_term[
-                    :, 0, :2
-                ],dim=-1).reshape(self.world.batch_dim, -1),
+                "self_hinge_info",
+                observed_hinge_info.reshape(self.world.batch_dim, -1)
+                if self.task_class == TaskClass.OCCT_PLATOON
+                else None,
             ),
             (
-                "self_distance_to_hinge",
-                torch.linalg.norm(hinge_info[
+                "self_hinge_error_vel",
+                (
+                    self.observations.hinge_error_vel[:, agent_index]
+                    / self.normalizers.error_v
+                ).reshape(
+                    self.world.batch_dim, -1
+                ),
+            ),
+            (
+                "self_distance_to_ref",
+                torch.linalg.norm(self_short_term[
                     :, 0, :2
                 ],dim=-1).reshape(self.world.batch_dim, -1),
             ),
@@ -2791,8 +2817,11 @@ class Scenario(BaseScenario):
                 ].reshape(self.world.batch_dim, -1),
             ),
             (
-                "self_error_vel",
-                (self.observations.error_vel[:, agent_index] / self.normalizers.error_v).reshape(
+                "self_platoon_error_vel",
+                (
+                    self.observations.platoon_error_vel[:, agent_index]
+                    / self.normalizers.error_v
+                ).reshape(
                     self.world.batch_dim, -1
                 ),
             ),
@@ -2846,11 +2875,9 @@ class Scenario(BaseScenario):
                 observed_hinge_short_term = self.observations.past_relative_hinge_info.get_latest(
                     step
                 )[:, agent_index, agent_index]
-                if self.hinge_short_term_status_mode=="binary":
-                    hinge_short_term_status = observed_hinge_short_term[..., 4:5]
-                else:
-                    hinge_short_term_status = torch.clamp(observed_hinge_short_term[..., 4:5]/(self.lane_width/2),
-                                                      min=0,max=1)
+                hinge_short_term_pos = torch.clamp(observed_hinge_short_term[..., :2],min=-1,max=1)
+                hinge_short_term_status = torch.clamp(observed_hinge_short_term[..., 4:5]/(self.lane_width/2),
+                                                      min=-1,max=1)
                 hinge_short_term_speed = torch.linalg.norm(
                     observed_hinge_short_term[..., 2:4],
                     dim=-1,
@@ -2858,7 +2885,7 @@ class Scenario(BaseScenario):
                 )
                 hinge_info = torch.cat(
                     (
-                        observed_hinge_short_term[..., :2],
+                        hinge_short_term_pos,
                         hinge_short_term_speed,
                         hinge_short_term_status,
                     ),
@@ -2895,6 +2922,14 @@ class Scenario(BaseScenario):
             distance_to_right_boundary = self.observations.past_distance_to_right_boundary.get_latest(
                 step
             )[:, agent_index].reshape(batch_size, 1)
+            platoon_error_vel = (
+                self.observations.past_platoon_error_vel.get_latest(step)[:, agent_index]
+                / self.normalizers.error_v
+            ).reshape(batch_size, -1)
+            hinge_error_vel = (
+                self.observations.past_hinge_error_vel.get_latest(step)[:, agent_index]
+                / self.normalizers.error_v
+            ).reshape(batch_size, -1)
             error_space = (
                 self.observations.error_space.get_latest(step)[:, agent_index, :]
                 / self.normalizers.error_pos
@@ -2917,6 +2952,8 @@ class Scenario(BaseScenario):
                     hinge_distance,
                     distance_to_left_boundary,
                     distance_to_right_boundary,
+                    platoon_error_vel,
+                    hinge_error_vel,
                     error_space,
                 ),
                 dim=-1,
@@ -3259,11 +3296,11 @@ class Scenario(BaseScenario):
             / self.obs_relative_velocity_scale
         ).reshape(self.world.batch_dim, self.observations.n_nearing_agents, -1)
         obs_relative_acceleration = (
-            relative_acceleration_history / self.obs_relative_acceleration_scale
+            relative_acceleration_history[..., -1:] / self.obs_relative_acceleration_scale
         ).reshape(self.world.batch_dim, self.observations.n_nearing_agents, -1)
         obs_distance = obs_distance_other_agents.unsqueeze(-1)  # [batch, n_nearing, 1]（扩维对齐）
 
-        # 2. 拼接单个agent的所有特征：[pos(2) + rot(1) + rel_long_vel(1) + rel_acc(n_steps) + distance(1)]
+        # 2. 拼接单个agent的所有特征：[pos(2) + rot(1) + rel_long_vel(1) + rel_acc(1) + distance(1)]
         single_agent_feat = torch.cat([
             obs_pos,
             obs_rot,
@@ -3413,20 +3450,16 @@ class Scenario(BaseScenario):
 
         for name, tensor in observation_groups:
             self.obs_audit_prev_groups[name] = tensor.detach().clone()
-    def get_target_hinge_status(self, agent_index, ready_n=None):
-        hinge_short_term = self.ref_paths_agent_related.hinge_short_term[:, agent_index] # [B, n_points, 5]
-        ready_n = hinge_short_term.shape[-2] if ready_n is None else ready_n
-        hinge_signal = hinge_short_term[:, :ready_n, -1]
-        if self.hinge_short_term_status_mode == "boundary_margin":
-            hinge_ready = hinge_signal > 0.0
-        else:
-            hinge_ready = hinge_signal > 0.5    # [batch_dim, n_points]
+    def get_target_hinge_status(self, agent_index):
+        hinge_dis_boundary = self.ref_paths_agent_related.hinge_short_term[:, agent_index, :, -1] # [B, n_points, 5]
+        hinge_ready = hinge_dis_boundary > self.hinge_edge_buffer
         is_block, block_order = check_boolean_block(hinge_ready)
         # 0=先0后1(过完弯），2=纯1(直道) is_block(不是反复可铰接)
+        is_after_corner = self.observations.agent_s[:,agent_index] > self.road.batch_corner_s_begin
         if self.traditional_control==MethodClass.MARL:
-            ready_to_hinge = (((block_order==0) | (block_order==2)) & is_block)
+            ready_to_hinge = (((block_order==0) | (block_order==2)) & is_block) & is_after_corner
         else:
-            ready_to_hinge = (((block_order==2)) & is_block)
+            ready_to_hinge = (((block_order==2)) & is_block) & is_after_corner
         return ready_to_hinge
 
     def get_dynamic_target_arc_positions(self):
@@ -4330,6 +4363,8 @@ class Scenario(BaseScenario):
             "mean_error_space": agent_error_space.mean(-1),
             "error_space": agent_error_space,
             "error_vel": self.observations.error_vel[:, agent_index],
+            "platoon_error_vel": self.observations.platoon_error_vel[:, agent_index],
+            "hinge_error_vel": self.observations.hinge_error_vel[:, agent_index],
             "ref_vel": self.ref_paths_agent_related.short_term[:, agent_index, 0, 2],
             "episode_done": done_status["is_done"].float(),
             "episode_success": done_status["is_success"].float(),

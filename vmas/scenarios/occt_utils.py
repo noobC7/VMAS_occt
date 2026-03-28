@@ -158,6 +158,10 @@ class OcctObservations:
         n_stored_steps=None,
         n_observed_steps=None,
         error_vel=None,
+        platoon_error_vel=None,
+        hinge_error_vel=None,
+        past_platoon_error_vel: CircularBuffer = None,
+        past_hinge_error_vel: CircularBuffer = None,
         error_space: CircularBuffer = None,
         agent_hinge_status: CircularBuffer = None,
         agent_s=None,
@@ -185,6 +189,10 @@ class OcctObservations:
         self.n_stored_steps = n_stored_steps  # Number of past steps to store
         self.n_observed_steps = n_observed_steps  # Number of past steps to observe
         self.error_vel = error_vel  # Front/rear relative longitudinal velocity in ego-local frame
+        self.platoon_error_vel = platoon_error_vel  # Platoon-mode front/rear speed errors
+        self.hinge_error_vel = hinge_error_vel  # Hinge-mode target speed errors
+        self.past_platoon_error_vel = past_platoon_error_vel
+        self.past_hinge_error_vel = past_hinge_error_vel
         self.error_space = error_space  # Gap error relative to reference gap (unnormalized)
         self.agent_hinge_status = agent_hinge_status  # 车辆铰接状态（0：未铰接，1：铰接），铰接后车辆被动行驶且奖励屏蔽
         self.agent_s = agent_s  # Arc length position
@@ -454,6 +462,8 @@ def check_hinge_points_in_boundary(
     """
     并行判断预瞄点是否在左右边界内且与边界至少距离K米
     核心修复：仅针对「最近的边界线段」判断位置合法性，适配弯道边界
+    return_boundary_margin=True 时，boundary_margin 返回 signed feasibility margin:
+    大于0表示在可行范围内，等于0表示恰好压在可行边界上，小于0表示越界或侵入K缓冲区
     返回形状：[B, n_agent, n_pts, 1] 的布尔张量（True=满足条件，False=不满足）
     """
     # ========== 1. 预处理维度，适配广播 ==========
@@ -554,7 +564,17 @@ def check_hinge_points_in_boundary(
     
     # 最终条件：同时满足所有条件
     final_cond = cond_in_bound & cond_left_dist & cond_right_dist  # [B,4,4]
-    boundary_margin = torch.minimum(left_min_dist, right_min_dist).unsqueeze(-1)
+    left_signed_margin = torch.where(
+        left_in_bound,
+        left_min_dist - K,
+        -(left_min_dist + K),
+    )
+    right_signed_margin = torch.where(
+        right_in_bound,
+        right_min_dist - K,
+        -(right_min_dist + K),
+    )
+    boundary_margin = torch.minimum(left_signed_margin, right_signed_margin).unsqueeze(-1)
     # 调整形状为 [B,4,4,1]
     final_cond = final_cond.unsqueeze(-1)
 
@@ -572,9 +592,6 @@ def get_short_term_hinge_path_by_s(
     sample_ds: int = None,
     env_j: int = None,
     hinge_relative_pos: Tensor = None,
-    hinge_edge_buffer: float = 0.0,
-    corner_s: Tensor = None,
-    status_mode: str = "binary",
 ):
     if device is None:
         device = torch.device("cpu")
@@ -683,65 +700,22 @@ def get_short_term_hinge_path_by_s(
         align_corners=True
     ).squeeze(1) # [B, steps]
     
-    # 2. 获取边界
     ref_left_boundary = occt_map.get_pts(interpolated, env_j, line="left")
     ref_right_boundary = occt_map.get_pts(interpolated, env_j, line="right")
     
-    # 3. 计算在边界内的掩码
-    # 确保 check_hinge_points_in_boundary 返回的是 [B, N_hinge, n_points, 1]
-    if status_mode == "boundary_margin":
-        is_in_boundary, boundary_margin = check_hinge_points_in_boundary(
-            ref_left_boundary=ref_left_boundary,
-            ref_right_boundary=ref_right_boundary,
-            hinge_short_term=hinge_short_term,
-            K=hinge_edge_buffer,
-            return_boundary_margin=True,
-        )
-    else:
-        is_in_boundary = check_hinge_points_in_boundary(
-            ref_left_boundary=ref_left_boundary,
-            ref_right_boundary=ref_right_boundary,
-            hinge_short_term=hinge_short_term,
-            K=hinge_edge_buffer,
-        )
-        boundary_margin = None
-    
-    # # 4. 【关键修复】判定是否已经过了拐角
-    # 确保 is_after_corner 维度为 [B, 1, 1, 1] 然后广播到 [B, N_hinge, n_points_to_return, 1]
-    is_after_corner = (torch.atleast_1d(first_agent_s) > corner_s).view(B, 1, 1, 1)
-    is_after_corner = is_after_corner.expand(-1, hinge_pts_num, n_points_to_return, 1)
-    is_in_straight = (torch.atleast_1d(first_agent_s) < (corner_s-25)).view(B, 1, 1, 1)
-    is_in_straight = is_in_straight.expand(-1, hinge_pts_num, n_points_to_return, 1)
-    # 5. 【关键修复】判定是否是侧向 Hinge
-    # 创建一个 [1, N_hinge, 1, 1] 的索引张量
-    hinge_idx_raw = torch.arange(hinge_pts_num, device=device).view(1, hinge_pts_num, 1, 1)
-    # 逻辑：物理 Agent 索引之外的点都是侧向点
-    is_side_hinge = (hinge_idx_raw >= len(agents)).expand(B, -1, n_points_to_return, 1)
-
-    # 6. 计算 hinge signal:
-    #    - binary: 0/1 ready bit
-    #    - boundary_margin: 可接驳时记录到左右边界的最小距离，否则置0
-    # 维度对齐：[B, 8, 4, 1] = [B, 8, 4, 1] & ([B, 8, 4, 1] | [B, 8, 4, 1])
-    #hinge_short_term[..., 4:5] = (is_in_boundary & ((is_after_corner | is_in_straight | is_side_hinge))).to(dtype=hinge_short_term.dtype)
-    #hinge_short_term[..., 4:5] = (is_in_boundary & ((is_after_corner | is_side_hinge))).to(dtype=hinge_short_term.dtype)
-
-    # 260316 simplify
-    # 260323 correction
-    is_after_corner = (agent_s > corner_s[:,None].expand(-1,hinge_pts_num)).view(B, hinge_pts_num, 1, 1)
-    is_after_corner = is_after_corner.expand(-1, -1, n_points_to_return, 1)
-    hinge_ready_mask = is_in_boundary & is_after_corner
-    if status_mode == "binary":
-        hinge_short_term[..., 4:5] = hinge_ready_mask.to(dtype=hinge_short_term.dtype)
-    elif status_mode == "boundary_margin":
-        assert boundary_margin is not None
-        hinge_short_term[..., 4:5] = torch.where(
-            hinge_ready_mask,
-            boundary_margin.to(dtype=hinge_short_term.dtype),
-            torch.zeros_like(boundary_margin, dtype=hinge_short_term.dtype),
-        )
-    else:
-        raise ValueError(f"Unsupported hinge short-term status_mode '{status_mode}'.")
-    
+    _, boundary_margin = check_hinge_points_in_boundary(
+        ref_left_boundary=ref_left_boundary,
+        ref_right_boundary=ref_right_boundary,
+        hinge_short_term=hinge_short_term,
+        K=0,
+        return_boundary_margin=True,
+    )
+    # is_after_corner = (torch.atleast_1d(first_agent_s) > corner_s).view(B, 1, 1, 1)
+    # is_after_corner = is_after_corner.expand(-1, hinge_pts_num, n_points_to_return, 1)
+    # is_in_straight = (torch.atleast_1d(first_agent_s) < (corner_s-25)).view(B, 1, 1, 1)
+    # is_in_straight = is_in_straight.expand(-1, hinge_pts_num, n_points_to_return, 1)
+    # hinge_ready_mask = is_in_boundary # & is_after_corner
+    hinge_short_term[..., 4:5] = boundary_margin
     return hinge_short_term
 
 def get_short_term_hinge_path_by_s_backup(
