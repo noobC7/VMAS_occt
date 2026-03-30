@@ -547,9 +547,6 @@ class Scenario(BaseScenario):
             n_observed_steps=torch.tensor(
                 n_observed_steps, device=device, dtype=torch.int32
             ),
-            error_vel=torch.zeros(
-                (batch_dim, self.n_agents, 2), device=device, dtype=torch.float32
-            ),
             platoon_error_vel=torch.zeros(
                 (batch_dim, self.n_agents, 2), device=device, dtype=torch.float32
             ),
@@ -2448,13 +2445,12 @@ class Scenario(BaseScenario):
         return error_space
 
     def _compute_tracking_error_vel_components(self):
-        error_vel = torch.zeros(
+        platoon_error_vel = torch.zeros(
             (self.world.batch_dim, self.n_agents, 2),
             device=self.world.device,
             dtype=torch.float32,
         )
-        platoon_error_vel = torch.zeros_like(error_vel)
-        hinge_error_vel = torch.zeros_like(error_vel)
+        hinge_error_vel = torch.zeros_like(platoon_error_vel)
         agent_speed = torch.stack(
             [torch.linalg.norm(agent.state.vel, dim=1) for agent in self.world.agents],
             dim=1,
@@ -2466,8 +2462,6 @@ class Scenario(BaseScenario):
             if self.task_class == TaskClass.OCCT_PLATOON:
                 if agent_idx in self.TRACTOR_SLICE:
                     continue
-                hinge_status = self.ref_paths_agent_related.hinge_status[:, agent_idx]
-                non_hinge_status = ~hinge_status
                 target_hinge_speed = torch.linalg.norm(
                     self.get_target_hinge_vel(agent_idx, 0),
                     dim=-1,
@@ -2478,25 +2472,15 @@ class Scenario(BaseScenario):
                 platoon_error_vel[:, agent_idx, 1] = rear_vehicle_speed_error
                 hinge_error_vel[:, agent_idx, 0] = ego_speed - target_hinge_speed
                 hinge_error_vel[:, agent_idx, 1] = hinge_error_vel[:, agent_idx, 0]
-                error_vel[non_hinge_status, agent_idx] = platoon_error_vel[
-                    non_hinge_status, agent_idx
-                ]
-                error_vel[hinge_status, agent_idx] = hinge_error_vel[
-                    hinge_status, agent_idx
-                ]
             else:
                 if agent_idx == 0:
-                    error_vel[:, agent_idx, 0] = ego_speed - leader_ref_speed
+                    speed_error = ego_speed - leader_ref_speed
                 else:
-                    error_vel[:, agent_idx, 0] = ego_speed - leader_speed
-                error_vel[:, agent_idx, 1] = error_vel[:, agent_idx, 0]
-                platoon_error_vel[:, agent_idx] = error_vel[:, agent_idx]
-                hinge_error_vel[:, agent_idx] = error_vel[:, agent_idx]
-        return error_vel, platoon_error_vel, hinge_error_vel
-
-    def _compute_tracking_error_vel(self):
-        error_vel, _, _ = self._compute_tracking_error_vel_components()
-        return error_vel
+                    speed_error = ego_speed - leader_speed
+                platoon_error_vel[:, agent_idx, 0] = speed_error
+                platoon_error_vel[:, agent_idx, 1] = speed_error
+                hinge_error_vel[:, agent_idx] = platoon_error_vel[:, agent_idx]
+        return platoon_error_vel, hinge_error_vel
     def update_observation_and_normalize(self, agent, agent_index):
         """Update observation and normalize them."""
         if agent_index == 0:  # Avoid repeated computations
@@ -2528,11 +2512,8 @@ class Scenario(BaseScenario):
             )
 
             platoon_error_space = self._compute_tracking_error_space()
-            error_vel, platoon_error_vel, hinge_error_vel = (
-                self._compute_tracking_error_vel_components()
-            )
+            platoon_error_vel, hinge_error_vel = self._compute_tracking_error_vel_components()
             self.observations.self_platoon_error_space.add(platoon_error_space)
-            self.observations.error_vel = error_vel
             self.observations.platoon_error_vel = platoon_error_vel
             self.observations.hinge_error_vel = hinge_error_vel
             self.observations.past_platoon_error_vel.add(platoon_error_vel)
@@ -2653,7 +2634,8 @@ class Scenario(BaseScenario):
                             :, a_i, a_j, :, 2:
                         ] = self.ref_paths_agent_related.hinge_short_term[:, a_j, :, 2:]
                 
-                assert not torch.isnan(self.observations.error_vel).any()
+                assert not torch.isnan(self.observations.platoon_error_vel).any()
+                assert not torch.isnan(self.observations.hinge_error_vel).any()
 
                 # Add new observations & normalize
                 self.observations.past_pos.add(
@@ -2855,7 +2837,7 @@ class Scenario(BaseScenario):
                 (
                     "self_hinge_error_vel",
                     (
-                        self.observations.past_hinge_error_vel.get_latest(step)[:, agent_index]
+                        self.observations.past_hinge_error_vel.get_latest(step)[:, agent_index,0]
                         / self.normalizers.error_v
                     ).reshape(batch_size, 1),
                 ),
@@ -2880,7 +2862,7 @@ class Scenario(BaseScenario):
                     (
                         self.observations.past_platoon_error_vel.get_latest(step)[:, agent_index]
                         / self.normalizers.error_v
-                    ).reshape(batch_size, 1),
+                    ).reshape(batch_size, 2),
                 ),
                 (
                     "self_platoon_error_space",
@@ -3350,14 +3332,18 @@ class Scenario(BaseScenario):
         )
         reward_details["reward_hinge_space"][:, agent_index] = reward_hinge_space
         
-        platoon_vel_error = torch.max(torch.abs(self.observations.error_vel[:, agent_index]), dim=-1)[0]
+        platoon_vel_error = torch.max(
+            torch.abs(self.observations.platoon_error_vel[:, agent_index]), dim=-1
+        )[0]
         reward_platoon_vel = (
             self.clamp_error_reward(self.rewards.reward_platoon_vel, platoon_vel_error)
             * platoon_weight
         )
         reward_details["reward_platoon_vel"][:, agent_index] = reward_platoon_vel
 
-        hinge_vel_error = torch.max(torch.abs(self.observations.error_vel[:, agent_index]), dim=-1)[0]
+        hinge_vel_error = torch.max(
+            torch.abs(self.observations.hinge_error_vel[:, agent_index]), dim=-1
+        )[0]
         reward_hinge_vel = (
             self.clamp_error_reward(self.rewards.reward_hinge_vel, hinge_vel_error)
             * hinge_weight
@@ -4030,7 +4016,6 @@ class Scenario(BaseScenario):
             "is_collision_with_lanelets": is_collision_with_lanelets,
             "mean_error_space": agent_error_space.mean(-1),
             "error_space": agent_error_space,
-            "error_vel": self.observations.error_vel[:, agent_index],
             "platoon_error_vel": self.observations.platoon_error_vel[:, agent_index],
             "hinge_error_vel": self.observations.hinge_error_vel[:, agent_index],
             "ref_vel": self.ref_paths_agent_related.short_term[:, agent_index, 0, 2],
