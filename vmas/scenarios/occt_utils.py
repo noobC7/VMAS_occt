@@ -162,7 +162,7 @@ class OcctObservations:
         hinge_error_vel=None,
         past_platoon_error_vel: CircularBuffer = None,
         past_hinge_error_vel: CircularBuffer = None,
-        error_space: CircularBuffer = None,
+        self_platoon_error_space: CircularBuffer = None,
         agent_hinge_status: CircularBuffer = None,
         agent_s=None,
         past_pos: CircularBuffer = None,
@@ -193,7 +193,7 @@ class OcctObservations:
         self.hinge_error_vel = hinge_error_vel  # Hinge-mode target speed errors
         self.past_platoon_error_vel = past_platoon_error_vel
         self.past_hinge_error_vel = past_hinge_error_vel
-        self.error_space = error_space  # Gap error relative to reference gap (unnormalized)
+        self.self_platoon_error_space = self_platoon_error_space  # Platoon gap error relative to reference gap (unnormalized)
         self.agent_hinge_status = agent_hinge_status  # 车辆铰接状态（0：未铰接，1：铰接），铰接后车辆被动行驶且奖励屏蔽
         self.agent_s = agent_s  # Arc length position
         
