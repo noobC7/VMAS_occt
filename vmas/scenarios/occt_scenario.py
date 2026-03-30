@@ -309,10 +309,14 @@ class Scenario(BaseScenario):
         use_history_observation = bool(kwargs.pop("use_history_observation", False))
         history_obs_len = int(kwargs.pop("history_obs_len", n_observed_steps))
         history_obs_dim = kwargs.pop("history_obs_dim", None)
+        remove_hinge_status_from_observation = bool(
+            kwargs.pop("remove_hinge_status_from_observation", False)
+        )
         if history_obs_dim is not None:
             history_obs_dim = int(history_obs_dim)
             if history_obs_dim <= 0:
                 raise ValueError("history_obs_dim must be a positive integer or None.")
+        self.remove_hinge_status_from_observation = remove_hinge_status_from_observation
         
         # map params
         B = batch_dim
@@ -2781,6 +2785,7 @@ class Scenario(BaseScenario):
                 "self_hinge_status",
                 self_hinge_status.reshape(self.world.batch_dim, -1)
                 if self.task_class == TaskClass.OCCT_PLATOON
+                and not self.remove_hinge_status_from_observation
                 else None,
             ),
             (
@@ -2954,7 +2959,7 @@ class Scenario(BaseScenario):
                     distance_to_right_boundary,
                     platoon_error_vel,
                     hinge_error_vel,
-                    error_space,
+                    #error_space,
                 ),
                 dim=-1,
             )
@@ -3678,7 +3683,7 @@ class Scenario(BaseScenario):
         hinge_desire_pos = self.get_target_hinge_pos(agent_index)
         hinge_pos_errors = torch.norm(hinge_desire_pos - agent_desire_pos, dim=-1)
         reward_hinge_space = (
-            self.clamp_error_reward(self.rewards.reward_hinge_space, hinge_pos_errors)
+            self.clamp_error_reward(self.rewards.reward_hinge_space, hinge_pos_errors, offset = 2.5, max = 2.5,)
             * hinge_weight
         )
         reward_details["reward_hinge_space"][:, agent_index] = reward_hinge_space
@@ -3705,6 +3710,7 @@ class Scenario(BaseScenario):
         reward_hinge_ref = (
             self.clamp_error_reward(
                 self.rewards.reward_hinge_ref, weighted_hinge_ref_path_error
+                ,offset = 2.5, max = 2.5,
             )
             * hinge_weight
         )
