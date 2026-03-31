@@ -142,6 +142,25 @@ class Scenario(BaseScenario):
         )
         target_road_id = kwargs.pop("target_road_id", 0)
         self.target_road_id = None if target_road_id is None else int(target_road_id)
+        disable_all_hinged_done_road_ids = kwargs.pop(
+            "disable_all_hinged_done_road_ids", ()
+        )
+        if disable_all_hinged_done_road_ids is None:
+            disable_all_hinged_done_road_ids = ()
+        if isinstance(disable_all_hinged_done_road_ids, int):
+            disable_all_hinged_done_road_ids = (disable_all_hinged_done_road_ids,)
+        self.disable_all_hinged_done_road_ids = tuple(
+            sorted({int(road_id) for road_id in disable_all_hinged_done_road_ids})
+        )
+        self.disable_all_hinged_done_road_id_tensor = (
+            torch.tensor(
+                self.disable_all_hinged_done_road_ids,
+                device=device,
+                dtype=torch.long,
+            )
+            if self.disable_all_hinged_done_road_ids
+            else torch.empty(0, device=device, dtype=torch.long)
+        )
         self.task_class=kwargs.pop("task_class", TaskClass.OCCT_PLATOON)
         self.dt = float(kwargs.get("dt", 0.05))
         self.n_agents=kwargs.pop("n_agents", 5)
@@ -2749,6 +2768,7 @@ class Scenario(BaseScenario):
         ]
 
         observed_hinge_info = None
+        observed_hinge_first_point_info = None
         self_hinge_status = None
         if self.task_class == TaskClass.OCCT_PLATOON:
             self_hinge_status = self.ref_paths_agent_related.hinge_status[
@@ -2772,6 +2792,7 @@ class Scenario(BaseScenario):
                 (hinge_pos, hinge_speed, hinge_dis_boundary),
                 dim=-1,
             )
+            observed_hinge_first_point_info = observed_hinge_info[:, 0, :]
             if (
                 observed_hinge_info is not None
                 and observed_hinge_info.max() > self.obs_audit_large_threshold
@@ -2829,8 +2850,14 @@ class Scenario(BaseScenario):
                     else None,
                 ),
                 (
-                    "self_hinge_info",
+                    "self_hinge_preview_info",
                     observed_hinge_info
+                    if self.task_class == TaskClass.OCCT_PLATOON
+                    else None,
+                ),
+                (
+                    "self_hinge_past_info",
+                    observed_hinge_first_point_info
                     if self.task_class == TaskClass.OCCT_PLATOON
                     else None,
                 ),
@@ -3131,6 +3158,14 @@ class Scenario(BaseScenario):
         return self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[
             :, self.FOLLOWER_SLICE
         ].all(dim=-1)
+
+    def _get_all_hinged_done_disabled_mask(self):
+        if self.disable_all_hinged_done_road_id_tensor.numel() == 0:
+            return torch.zeros(self.batch_dim, device=self.device, dtype=torch.bool)
+        return (
+            self.road.batch_id.unsqueeze(-1)
+            == self.disable_all_hinged_done_road_id_tensor.unsqueeze(0)
+        ).any(dim=-1)
 
     def get_hinged_followers_ratio(self):
         if self.task_class != TaskClass.OCCT_PLATOON or self.n_followers <= 0:
@@ -3840,14 +3875,16 @@ class Scenario(BaseScenario):
         is_collision_with_lanelets = self.collisions.with_lanelets.any(dim=-1)
         is_collision_with_exit_segments = self.collisions.with_exit_segments.any(dim=-1)
         is_agent_all_hinged = self.get_all_followers_hinged()
+        is_all_hinged_done_disabled = self._get_all_hinged_done_disabled_mask()
+        is_done_by_all_hinged = is_agent_all_hinged & ~is_all_hinged_done_disabled
         is_done = (
             is_collision_with_agents_env
             | is_collision_with_exit_segments
             | is_collision_with_lanelets
-            | is_agent_all_hinged
+            | is_done_by_all_hinged
         )
         # Success is defined strictly as "done only because all followers hinged".
-        is_success = is_agent_all_hinged & ~(
+        is_success = is_done_by_all_hinged & ~(
             is_collision_with_agents_env
             | is_collision_with_exit_segments
             | is_collision_with_lanelets

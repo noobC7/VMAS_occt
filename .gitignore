@@ -255,3 +255,4 @@ cython_debug/
 vmas/scenarios_data/cr_maps
 
 *.pt
+*.mp4

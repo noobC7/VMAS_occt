@@ -18,6 +18,7 @@ from vmas.scenarios.occt_scenario import AGENT_INDEX_FOCUS, MethodClass, Scenari
 DEFAULT_METHODS = ("pid", "mppi")
 DEFAULT_ROAD_IDS = list(range(6))
 DEFAULT_RESULT_DIR = Path(__file__).resolve().parent / "occt_scenario_test_result"
+SPECIAL_ALL_HINGED_SKIP_ROADS = (0, 1)
 
 
 def parse_method(method: str) -> MethodClass:
@@ -58,6 +59,7 @@ class ValidationRecorder:
         road_id: int,
         requested_episodes: int,
         result_dir: Path,
+        capture_episode_videos: bool = False,
     ):
         self.method = method
         self.method_name = method.name.lower()
@@ -65,15 +67,34 @@ class ValidationRecorder:
         self.requested_episodes = int(requested_episodes)
         self.result_dir = result_dir
         self.result_dir.mkdir(parents=True, exist_ok=True)
+        self.capture_episode_videos = bool(capture_episode_videos)
 
         self.dt: Optional[float] = None
         self.n_agents: Optional[int] = None
         self.agent_names: Optional[List[str]] = None
         self.followers: Optional[List[int]] = None
         self.road_name: Optional[str] = None
+        self.first_saved_episode_outcome: Optional[str] = None
+        self.pending_opposite_episode_outcome: Optional[str] = None
+        self.saved_render_paths: List[str] = []
 
         self.current_steps: List[Dict[str, Any]] = []
         self.episodes: List[Dict[str, Any]] = []
+
+    def _get_episode_outcome_label(self, episode_summary: Dict[str, Any]) -> str:
+        return "success" if bool(episode_summary["success"]) else "fail"
+
+    def _build_episode_render_name(self, episode_summary: Dict[str, Any]) -> str:
+        road_name = sanitize_filename(self.road_name or f"road_{self.road_id}")
+        outcome = self._get_episode_outcome_label(episode_summary)
+        episode_index = int(episode_summary["episode_index"])
+        return str(
+            self.result_dir
+            / (
+                f"traditional_{self.method_name}_road{self.road_id}_{road_name}_"
+                f"ep{episode_index}_{outcome}"
+            )
+        )
 
     def _stack_agent_info(
         self,
@@ -113,6 +134,13 @@ class ValidationRecorder:
             "num_steps": int(reward.shape[0]),
             "reward": reward,
             "done": done,
+            "step_compute_time_s": torch.tensor(
+                [
+                    float(step_record["step_compute_time_s"])
+                    for step_record in self.current_steps
+                ],
+                dtype=torch.float64,
+            ),
             "info": episode_info,
             "total_reward": reward.sum(dim=0),
             "success": bool(final_info["episode_success"][0].item()),
@@ -129,13 +157,24 @@ class ValidationRecorder:
             "road_id": int(final_info["road_batch_id"][0].item()),
             "road_name": self.road_name,
         }
+        episode_summary["mean_step_compute_time_s"] = float(
+            episode_summary["step_compute_time_s"].mean().item()
+        )
+        episode_summary["max_step_compute_time_s"] = float(
+            episode_summary["step_compute_time_s"].max().item()
+        )
+        episode_summary["min_step_compute_time_s"] = float(
+            episode_summary["step_compute_time_s"].min().item()
+        )
         self.episodes.append(episode_summary)
         self.current_steps = []
 
         print(
             f"[validation] method={self.method_name} road_id={self.road_id} "
             f"episode={len(self.episodes)}/{self.requested_episodes} "
-            f"steps={episode_summary['num_steps']} success={episode_summary['success']}"
+            f"steps={episode_summary['num_steps']} success={episode_summary['success']} "
+            f"step_time_mean={episode_summary['mean_step_compute_time_s']:.6f}s "
+            f"step_time_max={episode_summary['max_step_compute_time_s']:.6f}s"
         )
 
     def on_step(
@@ -149,6 +188,7 @@ class ValidationRecorder:
         episode_index: int,
         step_index: int,
         total_rew,
+        step_compute_time_s: Optional[float] = None,
     ) -> None:
         del obs, step_index, total_rew
         scenario = env.unwrapped.scenario
@@ -167,6 +207,11 @@ class ValidationRecorder:
             {
                 "reward": torch.as_tensor(rew, dtype=torch.float32),
                 "done": torch.as_tensor(done, dtype=torch.bool),
+                "step_compute_time_s": (
+                    float("nan")
+                    if step_compute_time_s is None
+                    else float(step_compute_time_s)
+                ),
                 "info": self._stack_agent_info(info),
             }
         )
@@ -177,6 +222,17 @@ class ValidationRecorder:
     def save(self) -> Path:
         if self.current_steps:
             self._finalize_episode(len(self.episodes))
+
+        if (
+            self.capture_episode_videos
+            and self.first_saved_episode_outcome is not None
+            and self.pending_opposite_episode_outcome is not None
+        ):
+            print(
+                f"[validation] method={self.method_name} road_id={self.road_id} "
+                f"no episode with outcome={self.pending_opposite_episode_outcome} "
+                f"found after the first saved episode"
+            )
 
         road_name = self.road_name or f"road_{self.road_id}"
         file_name = (
@@ -199,10 +255,67 @@ class ValidationRecorder:
             "n_agents": self.n_agents,
             "agent_names": self.agent_names,
             "followers": self.followers,
+            "saved_render_paths": list(self.saved_render_paths),
             "episodes": self.episodes,
         }
         torch.save(payload, save_path)
         return save_path
+
+    def on_episode_end(
+        self,
+        *,
+        env,
+        obs,
+        rew,
+        done,
+        info,
+        episode_index: int,
+        episode_length: int,
+        total_rew,
+    ) -> Dict[str, Any]:
+        del env, obs, rew, done, info, episode_length, total_rew
+        if not self.capture_episode_videos or not self.episodes:
+            return {"should_continue": True, "save_render": False}
+
+        episode_summary = self.episodes[-1]
+        if int(episode_summary["episode_index"]) != int(episode_index):
+            episode_summary = next(
+                (
+                    saved_episode
+                    for saved_episode in reversed(self.episodes)
+                    if int(saved_episode["episode_index"]) == int(episode_index)
+                ),
+                self.episodes[-1],
+            )
+
+        outcome = self._get_episode_outcome_label(episode_summary)
+        should_save_render = False
+
+        if self.first_saved_episode_outcome is None:
+            self.first_saved_episode_outcome = outcome
+            self.pending_opposite_episode_outcome = (
+                "fail" if outcome == "success" else "success"
+            )
+            should_save_render = True
+        elif self.pending_opposite_episode_outcome == outcome:
+            should_save_render = True
+            self.pending_opposite_episode_outcome = None
+
+        if not should_save_render:
+            return {"should_continue": True, "save_render": False}
+
+        render_name = self._build_episode_render_name(episode_summary)
+        render_path = render_name + ".mp4"
+        self.saved_render_paths.append(render_path)
+        print(
+            f"[validation] method={self.method_name} road_id={self.road_id} "
+            f"saved render episode={episode_index} outcome={outcome} path={render_path}"
+        )
+        return {
+            "should_continue": True,
+            "save_render": True,
+            "render_name": render_name,
+        }
 
 
 def run_validation(
@@ -214,12 +327,14 @@ def run_validation(
     display_info: bool,
     control_two_agents: bool,
     save_render: bool,
+    disable_all_hinged_done_road_ids: Optional[List[int]],
 ) -> Path:
     recorder = ValidationRecorder(
         method=method,
         road_id=road_id,
         requested_episodes=episodes,
         result_dir=result_dir,
+        capture_episode_videos=save_render,
     )
 
     print(
@@ -231,12 +346,15 @@ def run_validation(
         control_two_agents=control_two_agents,
         display_info=display_info,
         save_render=save_render,
+        save_render_max_episodes=2 if save_render else None,
         seed=seed,
         agent_index_focus=AGENT_INDEX_FOCUS,
         step_callback=recorder.on_step,
+        episode_end_callback=recorder.on_episode_end if save_render else None,
         max_episodes=episodes,
         traditional_control=method,
         target_road_id=road_id,
+        disable_all_hinged_done_road_ids=disable_all_hinged_done_road_ids,
     )
     save_path = recorder.save()
     print(f"[validation] saved result to {save_path}")
@@ -292,7 +410,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-render",
         action="store_true",
-        help="Save the rendered video for each validation run.",
+        help=(
+            "For each road and method run, save the first episode mp4 and, if it "
+            "appears later, the first episode with the opposite outcome."
+        ),
+    )
+    parser.add_argument(
+        "--disable-all-hinged-done-on-road01",
+        action="store_true",
+        help=(
+            "When the road id is 0 or 1, do not end the episode only because all "
+            "followers are hinged."
+        ),
     )
     return parser.parse_args()
 
@@ -322,6 +451,11 @@ def main() -> None:
                     display_info=args.display_info,
                     control_two_agents=args.control_two_agents,
                     save_render=args.save_render,
+                    disable_all_hinged_done_road_ids=(
+                        list(SPECIAL_ALL_HINGED_SKIP_ROADS)
+                        if args.disable_all_hinged_done_on_road01
+                        else None
+                    ),
                 )
             )
 

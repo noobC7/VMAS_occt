@@ -12,9 +12,10 @@ If you have more than 1 agent, you can control another one with W,A,S,D
 and switch the agent with these controls using LSHIFT
 """
 
+import time
 from argparse import ArgumentParser, BooleanOptionalAction
 from operator import add
-from typing import Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 import numpy as np
 from torch import Tensor
@@ -45,6 +46,7 @@ class InteractiveEnv:
         display_info: bool = True,
         save_render: bool = False,
         render_name: str = "interactive",
+        save_render_max_episodes: Optional[int] = None,
         agent_index_focus: int = 0,
         step_callback: Optional[Callable] = None,
         episode_end_callback: Optional[Callable] = None,
@@ -71,6 +73,8 @@ class InteractiveEnv:
         self.display_info = display_info
         self.save_render = save_render
         self.render_name = render_name
+        self.save_render_max_episodes = save_render_max_episodes
+        self.saved_render_episodes = 0
         self.agent_index_focus = agent_index_focus
         self.step_callback = step_callback
         self.episode_end_callback = episode_end_callback
@@ -91,13 +95,50 @@ class InteractiveEnv:
 
         self._cycle()
 
-    def _save_render_if_needed(self):
-        if self.save_render and self.frame_list:
+    def _should_capture_render(self) -> bool:
+        if not self.save_render:
+            return False
+        if self.save_render_max_episodes is None:
+            return True
+        return self.saved_render_episodes < self.save_render_max_episodes
+
+    def _save_render_if_needed(self, render_name: Optional[str] = None):
+        if self.frame_list:
             save_video(
-                self.render_name,
+                self.render_name if render_name is None else render_name,
                 self.frame_list,
                 fps=1 / self.env.unwrapped.world.dt,
             )
+            self.frame_list = []
+            self.saved_render_episodes += 1
+
+    def _discard_render_if_needed(self):
+        self.frame_list = []
+
+    @staticmethod
+    def _resolve_episode_end_result(
+        callback_result: Any,
+        default_should_continue: bool,
+        default_save_render: bool,
+        default_render_name: str,
+    ) -> Dict[str, Any]:
+        result = {
+            "should_continue": default_should_continue,
+            "save_render": default_save_render,
+            "render_name": default_render_name,
+        }
+        if isinstance(callback_result, dict):
+            if "should_continue" in callback_result:
+                result["should_continue"] = bool(callback_result["should_continue"])
+            if "save_render" in callback_result:
+                result["save_render"] = bool(callback_result["save_render"])
+            if "render_name" in callback_result and callback_result["render_name"] is not None:
+                result["render_name"] = str(callback_result["render_name"])
+            return result
+        if callback_result is None:
+            return result
+        result["should_continue"] = bool(callback_result)
+        return result
 
     def _close_viewer_if_needed(self):
         viewer = getattr(self.env.unwrapped, "viewer", None)
@@ -139,7 +180,9 @@ class InteractiveEnv:
                     : self.agents[self.current_agent_index2].dynamics.needed_action_size
                 ]
 
+            step_begin = time.perf_counter()
             obs, rew, done, info = self.env.step(action_list)
+            step_compute_time_s = time.perf_counter() - step_begin
             total_rew = list(map(add, total_rew, rew))
 
             if self.display_info and self.n_agents > 0:
@@ -173,6 +216,7 @@ class InteractiveEnv:
                         episode_index=episode_index,
                         step_index=episode_step,
                         total_rew=tuple(total_rew),
+                        step_compute_time_s=step_compute_time_s,
                     )
                 except StopIteration:
                     should_continue = False
@@ -181,18 +225,24 @@ class InteractiveEnv:
                     self._close_viewer_if_needed()
                     break
 
+            should_capture_render = self._should_capture_render()
             frame = self.env.render(
-                mode="rgb_array" if self.save_render else "human",
+                mode="rgb_array" if should_capture_render else "human",
                 visualize_when_rgb=True,
                 agent_index_focus=self.agent_index_focus,
             )
-            if self.save_render:
+            if should_capture_render:
                 self.frame_list.append(frame)
 
             if done:
+                episode_end_result = {
+                    "should_continue": True,
+                    "save_render": should_capture_render and bool(self.frame_list),
+                    "render_name": self.render_name,
+                }
                 if self.episode_end_callback is not None:
                     try:
-                        should_continue = self.episode_end_callback(
+                        callback_result = self.episode_end_callback(
                             env=self.env,
                             obs=obs,
                             rew=rew,
@@ -203,15 +253,27 @@ class InteractiveEnv:
                             total_rew=tuple(total_rew),
                         )
                     except StopIteration:
-                        should_continue = False
-                    if should_continue is False:
-                        self._save_render_if_needed()
-                        self._close_viewer_if_needed()
-                        break
+                        callback_result = False
+                    episode_end_result = self._resolve_episode_end_result(
+                        callback_result=callback_result,
+                        default_should_continue=episode_end_result["should_continue"],
+                        default_save_render=episode_end_result["save_render"],
+                        default_render_name=episode_end_result["render_name"],
+                    )
+
+                if episode_end_result["save_render"]:
+                    self._save_render_if_needed(
+                        render_name=episode_end_result["render_name"]
+                    )
+                else:
+                    self._discard_render_if_needed()
+
+                if episode_end_result["should_continue"] is False:
+                    self._close_viewer_if_needed()
+                    break
                 episode_index += 1
                 episode_step = 0
                 if self.max_episodes is not None and episode_index >= self.max_episodes:
-                    self._save_render_if_needed()
                     self._close_viewer_if_needed()
                     break
                 self.reset = True
@@ -378,6 +440,8 @@ def render_interactively(
     step_callback: Optional[Callable] = None,
     episode_end_callback: Optional[Callable] = None,
     max_episodes: Optional[int] = None,
+    render_name: Optional[str] = None,
+    save_render_max_episodes: Optional[int] = None,
     **kwargs,
 ):
     """Executes a scenario and renders it so that you can debug and control agents interactively.
@@ -395,11 +459,19 @@ def render_interactively(
         control_two_agents (bool, optional): Whether to control two agents or just one. Defaults to ``False``.
         display_info (bool, optional): Whether to display on the screen the following info from the first controlled agent:
             name, reward, total reward, done, and observation. Defaults to ``True``.
-        save_render (bool, optional): Whether to save a video of the render up to the first reset.
-            The video will be saved in the directory of this file with the name ``{scenario}_interactive``.
+        save_render (bool, optional): Whether to save rendered episodes as mp4 files.
+            The video will be saved in the directory of this file with the name
+            ``{scenario}_interactive`` unless ``render_name`` is provided.
             Defaults to ``False``.
+        render_name (str, optional): Base output path for the saved mp4 file, without the
+            extension. Defaults to ``{scenario}_interactive`` or ``interactive``.
+        save_render_max_episodes (int, optional): Maximum number of episodes to capture into
+            videos. Defaults to ``None``.
         step_callback (Callable, optional): Callback executed after every env step.
         episode_end_callback (Callable, optional): Callback executed whenever an episode ends.
+            It may return ``None``/``bool`` for continue control only, or a dict with
+            ``should_continue``, ``save_render``, and ``render_name`` to control
+            episode-level video saving.
         max_episodes (int, optional): Stop the interactive loop after this many completed episodes.
 
     Examples:
@@ -428,9 +500,14 @@ def render_interactively(
         control_two_agents=control_two_agents,
         display_info=display_info,
         save_render=save_render,
-        render_name=f"{scenario}_interactive"
-        if isinstance(scenario, str)
-        else "interactive",
+        render_name=(
+            render_name
+            if render_name is not None
+            else f"{scenario}_interactive"
+            if isinstance(scenario, str)
+            else "interactive"
+        ),
+        save_render_max_episodes=save_render_max_episodes,
         agent_index_focus=agent_index_focus,
         step_callback=step_callback,
         episode_end_callback=episode_end_callback,
@@ -481,4 +558,5 @@ if __name__ == "__main__":
         control_two_agents=args.control_two_agents,
         save_render=args.save_render,
         display_info=args.display_info,
+        enable_obs_audit=False,
     )
