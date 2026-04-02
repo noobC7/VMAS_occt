@@ -3980,7 +3980,6 @@ class Scenario(BaseScenario):
         command_acceleration = self._compute_agent_command_acceleration(agent_index)
         command_jerk = self._compute_agent_command_jerk(agent_index)
         steering_rate_deg = self._compute_agent_steering_rate_deg(agent_index)
-        reward_phase_weight = self.reward_phase_weights[:, agent_index]
         agent_reward_details = {}
         for reward_name, reward_tensor in self.reward_details.items():
             # reward_tensor 维度：(batch_dim, n_agents) → 提取当前智能体的列
@@ -4039,8 +4038,6 @@ class Scenario(BaseScenario):
             "command_jerk_abs": command_jerk.abs(),
             "steering_rate_deg": steering_rate_deg,
             "steering_rate_abs_deg": steering_rate_deg.abs(),
-            "reward_phase_weight": reward_phase_weight,
-            "reward_phase_platoon_weight": 1.0 - reward_phase_weight,
             "distance_ref": self.distances.ref_paths[:, agent_index],
             "distance_lookahead_pts": torch.mean(self.distances.lookahead_pts[:, agent_index], dim=-1),
             "distance_left_b": self.distances.left_boundaries[:, agent_index].min(
