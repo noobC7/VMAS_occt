@@ -119,6 +119,9 @@ class Scenario(BaseScenario):
         self.env_total_step = torch.zeros(batch_dim, device=device, dtype=torch.long)
         self.success_count = torch.zeros(batch_dim, device=device, dtype=torch.float32)
         self.failure_count = torch.zeros(batch_dim, device=device, dtype=torch.float32)
+        self.all_hinged_reward_granted = torch.zeros(
+            batch_dim, device=device, dtype=torch.bool
+        )
         self.agent_index_focus = kwargs.pop("agent_index_focus", AGENT_INDEX_FOCUS)
         self.enable_obs_audit = kwargs.pop("enable_obs_audit", True)
         self.obs_audit_interval = int(kwargs.pop("obs_audit_interval", 100))
@@ -785,6 +788,8 @@ class Scenario(BaseScenario):
 
             "reward_goal": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "reward_hinge": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_all_hinge": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
+            "reward_hinged_hold": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
 
             "reward_platoon_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
             "reward_hinge_vel": torch.zeros((batch_dim, n_agents), device=device, dtype=torch.float32),
@@ -924,8 +929,24 @@ class Scenario(BaseScenario):
         reward_hinge = (
             kwargs.pop("reward_hinge", 100) / r_p_normalizer
         )
+        reward_all_hinge = (
+            kwargs.pop("reward_all_hinge", 0) / r_p_normalizer
+        )
+        reward_hinged_hold = (
+            kwargs.pop("reward_hinged_hold", 0) / r_p_normalizer
+        )
         self.reward_approach_hinge = torch.tensor(
             kwargs.pop("reward_approach_hinge", 100) / r_p_normalizer,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.reward_all_hinge = torch.tensor(
+            reward_all_hinge,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.reward_hinged_hold = torch.tensor(
+            reward_hinged_hold,
             device=device,
             dtype=torch.float32,
         )
@@ -1201,6 +1222,7 @@ class Scenario(BaseScenario):
             idx_mask = torch.zeros(B, dtype=torch.bool, device=device)
             idx_mask[env_index] = True
         self.hinge_active_steps[idx_mask] = 0
+        self.all_hinged_reward_granted[idx_mask] = False
         self.reward_phase_weights[idx_mask] = 0.0
         self.reward_phase_transition_start[idx_mask] = 0.0
         self.reward_phase_transition_target[idx_mask] = 0.0
@@ -3174,6 +3196,11 @@ class Scenario(BaseScenario):
             :, self.FOLLOWER_SLICE
         ].to(torch.float32).mean(dim=-1)
 
+    def get_all_hinged_reward_mask(self):
+        if self.task_class != TaskClass.OCCT_PLATOON:
+            return torch.zeros(self.batch_dim, device=self.device, dtype=torch.bool)
+        return self.get_all_followers_hinged() & ~self.all_hinged_reward_granted
+
     def get_hinge_approach_progress(self, agent_index, is_simple=False):
         if self.observations.past_relative_hinge_info.valid_size < 2:
             return torch.zeros(self.batch_dim, device=self.device, dtype=torch.float32)
@@ -3432,6 +3459,9 @@ class Scenario(BaseScenario):
         reward_hinge = self.rewards.reward_hinge * (hinge_once & hinge_status).to(torch.float32)
             
         reward_details["reward_hinge"][:, agent_index] = reward_hinge
+        reward_details["reward_all_hinge"][:, agent_index] = (
+            self.reward_all_hinge * self.get_all_hinged_reward_mask().to(torch.float32)
+        )
         hinge_steps = self.hinge_active_steps[:, agent_index]
         #print(f"hinge_steps-[{hinge_steps.min().cpu(),hinge_steps.mean().cpu(),hinge_steps.max().cpu()}]")
         #hinge_time_cost = -torch.clamp(hinge_steps/self.normalizers.hinge_step,max=2)
@@ -3606,7 +3636,12 @@ class Scenario(BaseScenario):
             current_hinge_status = self.ref_paths_agent_related.agent_hinge_status.get_latest(n=1)[:, agent_index]
             agent_is_fixed = last_hinge_status & current_hinge_status
             self.rew = self.rew * ~agent_is_fixed
+            reward_details["reward_hinged_hold"][:, agent_index] = (
+                self.reward_hinged_hold * agent_is_fixed.to(torch.float32)
+            )
             for r in reward_details.keys():
+                if r in {"reward_all_hinge", "reward_hinged_hold"}:
+                    continue
                 reward_details[r][:,agent_index] = reward_details[r][:,agent_index] * ~agent_is_fixed
         #print(f"reward calc, agent_index: {agent_index}, time: {t2-t1:.6f}s")
         # [update] previous positions and short-term reference paths
@@ -3617,6 +3652,11 @@ class Scenario(BaseScenario):
             if r!="reward_total":
                 self.rew+=reward_details[r][:,agent_index]
         reward_details["reward_total"][:,agent_index] = self.rew
+        if (
+            self.task_class == TaskClass.OCCT_PLATOON
+            and agent_index == (self.HINGE_LAST_INDEX - 1)
+        ):
+            self.all_hinged_reward_granted |= self.get_all_followers_hinged()
         self.reward_update_time += t3-t0
         #print(f"reward_update_time_total: {self.reward_update_time:.6f}s")
         return self.rew
@@ -3883,7 +3923,6 @@ class Scenario(BaseScenario):
             | is_collision_with_lanelets
             | is_done_by_all_hinged
         )
-        # Success is defined strictly as "done only because all followers hinged".
         is_success = is_done_by_all_hinged & ~(
             is_collision_with_agents_env
             | is_collision_with_exit_segments
