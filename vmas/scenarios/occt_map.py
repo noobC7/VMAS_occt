@@ -410,9 +410,18 @@ class OcctCRMap(MapBase):
         self.max_path_s_list = None
         
         # 处理CommonRoad地图
-        if cr_map_dir.split('/')[-1]=="chapter4":
-            self._cr_map_process(cr_map_dir)
-            #self._cr_map_process_chapter4(cr_map_dir,extend_left_boundary=True)
+        if "chapter4"  in cr_map_dir.split('/')[-1]:
+            #chapter4 road list
+            path_list=((188,113),(102,119),(112,113),
+                        (172,164),(172,166),(153,175),
+                        (100,117),(100,129),(127,102),(177,129),(177,117),
+                        (124,146))
+            #chapter4 road list v2
+            path_list=((188,113),(112,113),(172,166),(153,175),(100,129),(177,117))
+            self._cr_map_process(cr_map_dir, path_list)
+        elif "chapter3" in cr_map_dir.split('/')[-1]:
+            path_list=((144,137),(177,117))
+            self._cr_map_process(cr_map_dir,path_list)
         else:
             self._cr_map_process(cr_map_dir)
         
@@ -712,7 +721,7 @@ class OcctCRMap(MapBase):
 
     #     return extend_center, extend_left, extend_right
     
-    def _cr_map_process(self, map_dir: str) -> None:
+    def _cr_map_process(self, map_dir: str, path_list: list) -> None:
         """
         处理CommonRoad地图和车道信息
         
@@ -791,47 +800,6 @@ class OcctCRMap(MapBase):
                     "left_vertices": [],
                     "right_vertices": []
                 }
-                # if not((path_ids[0]==128 and path_ids[-1]==106) or \
-                #    (path_ids[0]==102 and path_ids[-1]==175) or \
-                #    (path_ids[0]==189 and path_ids[-1]==175)):
-                # # if not(path_ids[0]==128 and path_ids[-1]==106):
-                # # if not((path_ids[0]==128 and path_ids[-1]==106) or \
-                # #    (path_ids[0]==102 and path_ids[-1]==175)):
-                #     continue
-                # if ((path_ids[0]==100 and path_ids[-1]==129) or \
-                #    (path_ids[0]==108 and path_ids[-1]==166) or \
-                #    (path_ids[0]==128 and path_ids[-1]==106) or \
-                #     (path_ids[0]==189 and path_ids[-1]==103)):
-                #if not (path_ids[0]==102 and path_ids[-1]==164):
-                # if not(path_ids[0]==128 and path_ids[-1]==106):
-                # if not((path_ids[0]==100 and path_ids[-1]==169)):
-                #     continue
-                # for chapter 2 paper illustration
-                # if not ((path_ids[0]==177 and path_ids[-1]==129) or \
-                #    (path_ids[0]==153 and path_ids[-1]==175)):
-                #     continue
-                # if (path_ids[0]==112 and path_ids[-1]==129):
-                #     continue
-                # if not (path_ids[0]==177 and path_ids[-1]==129):
-                #     continue
-                # if map_name == "USA_Roundabout_EP_repaired.xml":
-                #     if (path_ids[-1]==124) or \
-                #         (path_ids[0]==100 and path_ids[-1]==169) or \
-                #             (path_ids[0]==149 and path_ids[-1]==157) or \
-                #             (path_ids[0]==149 and path_ids[-1]==124) or \
-                #             (path_ids[0]==127 and path_ids[-1]==124) or \
-                #             (path_ids[0]==127 and path_ids[-1]==157) or \
-                #             (path_ids[0]==149 and path_ids[-1]==132):
-                #         continue
-                #chapter4 road list
-                path_list=({188,113},(102,119),(112,113),
-                           (172,164),(172,166),(153,175),
-                           (100,117),(100,129),(127,102),(177,129),(177,117),
-                           (124,146))
-                #chapter4 road list v2
-                path_list=({188,113},(112,113),(172,166),(153,175),(100,129),(177,117))
-                           
-                           
                 # 260316 12 path
                 if (path_ids[0],path_ids[-1]) not in path_list:
                     continue
@@ -2458,7 +2426,8 @@ if __name__ == "__main__chapter4_no_extra_hinge":
 if __name__ == "__main__":
     device = torch.device("cuda")
     road = OcctCRMap(batch_dim=200, 
-                     cr_map_dir="vmas/scenarios_data/cr_maps/chapter4_6_path/",
+                     #cr_map_dir="vmas/scenarios_data/cr_maps/chapter4_6_path",
+                     cr_map_dir="vmas/scenarios_data/cr_maps/chapter3_2_path",
                      max_ref_v=15/3.6 ,
                      min_lane_width=2.4, 
                      min_lane_len=80,
