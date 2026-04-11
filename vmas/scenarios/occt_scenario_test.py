@@ -17,7 +17,7 @@ from vmas.scenarios.occt_scenario import AGENT_INDEX_FOCUS, MethodClass, Scenari
 
 DEFAULT_METHODS = ("pid", "mppi")
 DEFAULT_ROAD_IDS = list(range(6))
-DEFAULT_RESULT_DIR = Path(__file__).resolve().parent / "occt_scenario_test_result"
+DEFAULT_RESULT_DIR = Path(__file__).resolve().parent / "occt_scenario_test_result0408"
 SPECIAL_ALL_HINGED_SKIP_ROADS = (0, 1)
 
 

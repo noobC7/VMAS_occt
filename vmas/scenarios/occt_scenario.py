@@ -1022,6 +1022,33 @@ class Scenario(BaseScenario):
             hinge_time_cost=torch.tensor(penalty_hinge_time_cost, device=device, dtype=torch.float32),
         )
 
+        self.enable_failure_replay_restore = bool(
+            kwargs.pop("enable_failure_replay_restore", False)
+        )
+        self.failure_replay_pre_failure_seconds = float(
+            kwargs.pop("failure_replay_pre_failure_seconds", 1.5)
+        )
+        self.failure_replay_margin_steps = int(
+            kwargs.pop("failure_replay_margin_steps", 0)
+        )
+        self.failure_replay_k_steps = max(
+            1, int(round(self.failure_replay_pre_failure_seconds / self.dt))
+        )
+        self.failure_replay_snapshot_dim = 8
+        self.failure_curriculum_bank = None
+        self.failure_curriculum_collect_enabled = False
+        self.failure_curriculum_sampling_enabled = False
+        self.failure_curriculum_replay_probability = 0.0
+        self.failure_curriculum_min_bank_size = 0
+        self.failure_curriculum_iteration = 0
+        self.current_episode_replay_source = torch.zeros(
+            batch_dim, device=device, dtype=torch.bool
+        )
+        self.current_episode_replay_entry_id = torch.full(
+            (batch_dim,), -1, device=device, dtype=torch.long
+        )
+        self.failure_curriculum_events = []
+
         ScenarioUtils.check_kwargs_consumed(kwargs)
         self.n_steps_before_recording=kwargs.pop("n_steps_before_recording", 10)
 
@@ -1031,6 +1058,18 @@ class Scenario(BaseScenario):
                 device=device,
                 dtype=torch.float32,
             )  # [pos_x, pos_y, rot, vel_x, vel_y],
+        )
+        self.failure_replay_snapshot_buffer = CircularBuffer(
+            torch.zeros(
+                (
+                    self.failure_replay_k_steps + 1,
+                    batch_dim,
+                    self.n_agents,
+                    self.failure_replay_snapshot_dim,
+                ),
+                device=device,
+                dtype=torch.float32,
+            )
         )
     # ========== 2) 创建 World ==========
     def init_world(self, batch_dim: int, device: torch.device) -> World:
@@ -1199,6 +1238,181 @@ class Scenario(BaseScenario):
             vx = vel[idx_mask] * torch.cos(theta[idx_mask])
             vy = vel[idx_mask] * torch.sin(theta[idx_mask])
             agent.state.vel[idx_mask] = torch.stack([vx, vy], dim=-1)
+
+    def configure_failure_curriculum(
+        self,
+        bank,
+        collect_enabled: bool,
+        enabled: bool,
+        replay_probability: float,
+        min_bank_size: int,
+        iteration: int,
+    ) -> None:
+        self.failure_curriculum_bank = bank
+        self.failure_curriculum_collect_enabled = bool(collect_enabled)
+        self.failure_curriculum_sampling_enabled = bool(enabled)
+        self.failure_curriculum_replay_probability = float(replay_probability)
+        self.failure_curriculum_min_bank_size = int(min_bank_size)
+        self.failure_curriculum_iteration = int(iteration)
+
+    def drain_failure_curriculum_events(self) -> List[Dict]:
+        events = self.failure_curriculum_events
+        self.failure_curriculum_events = []
+        return events
+
+    def _get_current_cur_delta(self) -> Tensor:
+        cur_delta = torch.zeros(
+            (self.batch_dim, self.n_agents, 1),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        for agent_idx, agent in enumerate(self.world.agents):
+            if hasattr(agent.dynamics, "cur_delta") and agent.dynamics.cur_delta is not None:
+                cur_delta[:, agent_idx, 0] = agent.dynamics.cur_delta.squeeze(-1)
+        return cur_delta
+
+    def _build_failure_replay_buffer_state(self) -> Tensor:
+        return torch.cat(
+            (
+                torch.stack([a.state.pos for a in self.world.agents], dim=1),
+                torch.stack([a.state.rot for a in self.world.agents], dim=1),
+                torch.stack([a.state.vel for a in self.world.agents], dim=1),
+                torch.stack([a.state.ang_vel for a in self.world.agents], dim=1),
+                self._get_current_cur_delta(),
+                self.observations.agent_s.unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+
+    def _build_failure_replay_snapshot(self, env_index: int) -> Dict[str, Tensor]:
+        snapshot_state = self.failure_replay_snapshot_buffer.get_latest(
+            n=self.failure_replay_k_steps + 1
+        )[env_index].detach().clone()
+        return {
+            "agent_state": snapshot_state,
+        }
+
+    def _get_failure_type_for_env(self, done_status: Dict[str, Tensor], env_index: int) -> str:
+        if bool(done_status["is_collision_with_agents_env"][env_index].item()):
+            return "collision_with_agents"
+        if bool(done_status["is_collision_with_lanelets"][env_index].item()):
+            return "collision_with_lanelets"
+        if bool(done_status["is_collision_with_exit_segments"][env_index].item()):
+            return "collision_with_exit_segments"
+        return "unknown_failure"
+
+    def _record_failure_curriculum_events(self, done_status: Dict[str, Tensor]) -> None:
+        if not self.failure_curriculum_collect_enabled:
+            return
+
+        done_mask = done_status["is_done"]
+        success_mask = done_status["is_success"]
+        failure_mask = done_status["is_failure"]
+
+        for env_index in torch.where(done_mask)[0].tolist():
+            road_id = int(self.road.batch_id[env_index].item())
+            source_entry_id = int(self.current_episode_replay_entry_id[env_index].item())
+            is_replay_source = bool(self.current_episode_replay_source[env_index].item())
+            failure_type = self._get_failure_type_for_env(done_status, env_index)
+            has_valid_snapshot = int(self.env_current_step[env_index].item()) >= (
+                self.failure_replay_k_steps + self.failure_replay_margin_steps
+            )
+            snapshot = (
+                self._build_failure_replay_snapshot(env_index)
+                if has_valid_snapshot and bool(failure_mask[env_index].item())
+                else None
+            )
+
+            if is_replay_source:
+                if bool(success_mask[env_index].item()):
+                    self.failure_curriculum_events.append(
+                        {
+                            "event_type": "replay_success",
+                            "source_entry_id": source_entry_id,
+                            "road_id": road_id,
+                        }
+                    )
+                elif bool(failure_mask[env_index].item()):
+                    self.failure_curriculum_events.append(
+                        {
+                            "event_type": "replay_failure",
+                            "source_entry_id": source_entry_id,
+                            "road_id": road_id,
+                            "failure_type": failure_type,
+                            "snapshot": snapshot,
+                        }
+                    )
+            elif bool(failure_mask[env_index].item()) and snapshot is not None:
+                self.failure_curriculum_events.append(
+                    {
+                        "event_type": "new_failure",
+                        "source_entry_id": -1,
+                        "road_id": road_id,
+                        "failure_type": failure_type,
+                        "snapshot": snapshot,
+                    }
+                )
+
+    def _sample_failure_curriculum_snapshot(self, env_index: int):
+        if (
+            not self.enable_failure_replay_restore
+            or not self.failure_curriculum_sampling_enabled
+            or self.failure_curriculum_bank is None
+        ):
+            return None
+        if torch.rand(1, device=self.device).item() >= self.failure_curriculum_replay_probability:
+            return None
+        road_id = int(self.road.batch_id[env_index].item())
+        return self.failure_curriculum_bank.sample(
+            self.failure_curriculum_iteration,
+            road_id=road_id,
+        )
+
+    def _restore_failure_replay_snapshot(
+        self,
+        env_index: int,
+        snapshot: Dict[str, Tensor],
+        entry_id: int,
+        agents,
+    ) -> None:
+        agent_state = snapshot["agent_state"].to(self.device)
+        pos = agent_state[:, 0:2]
+        rot = agent_state[:, 2:3]
+        vel = agent_state[:, 3:5]
+        ang_vel = agent_state[:, 5:6]
+        cur_delta = agent_state[:, 6:7]
+        agent_s = agent_state[:, 7]
+
+        for agent_idx, agent in enumerate(agents):
+            agent.state.pos[env_index] = pos[agent_idx]
+            agent.state.rot[env_index] = rot[agent_idx]
+            agent.state.vel[env_index] = vel[agent_idx]
+            if hasattr(agent.state, "ang_vel"):
+                agent.state.ang_vel[env_index] = ang_vel[agent_idx]
+            if hasattr(agent.dynamics, "cur_delta") and agent.dynamics.cur_delta is not None:
+                agent.dynamics.cur_delta[env_index] = cur_delta[agent_idx]
+
+        self.observations.agent_s[env_index] = agent_s
+        for i_agent in range(self.n_agents):
+            self.reset_init_distances_and_short_term_ref_path(
+                env_index, i_agent, agents
+            )
+        if self.task_class == TaskClass.OCCT_PLATOON:
+            self.reset_init_hinge_short_term(env_index, agents)
+
+        mutual_distances = get_distances_between_agents(self=self, is_set_diagonal=True)
+        mutual_frenet_distances = get_frenet_distances_between_agents(
+            self.observations.agent_s
+        )
+        self.distances.agents[env_index, :, :] = mutual_distances[env_index, :, :]
+        self.distances.agents_frenet[env_index, :, :] = mutual_frenet_distances[
+            env_index, :, :
+        ]
+        self.collisions.with_agents[env_index, :, :] = False
+        self.collisions.with_lanelets[env_index, :] = False
+        self.collisions.with_exit_segments[env_index, :] = False
+        self.current_episode_replay_source[env_index] = True
+        self.current_episode_replay_entry_id[env_index] = int(entry_id)
             
     def reset_world_at(self, env_index: Optional[int] = None, agent_index: Optional[int] = None):
         """
@@ -1221,12 +1435,15 @@ class Scenario(BaseScenario):
         else:
             idx_mask = torch.zeros(B, dtype=torch.bool, device=device)
             idx_mask[env_index] = True
+        self.current_episode_replay_source[idx_mask] = False
+        self.current_episode_replay_entry_id[idx_mask] = -1
         self.hinge_active_steps[idx_mask] = 0
         self.all_hinged_reward_granted[idx_mask] = False
         self.reward_phase_weights[idx_mask] = 0.0
         self.reward_phase_transition_start[idx_mask] = 0.0
         self.reward_phase_transition_target[idx_mask] = 0.0
         self.reward_phase_transition_progress[idx_mask] = 1.0
+        sampled_failure_replay = {}
         if self.simple_mppi is not None:
             self.simple_mppi.reset()
         if hasattr(self, "_last_vel_errors"):
@@ -1411,7 +1628,20 @@ class Scenario(BaseScenario):
             self.collisions.with_agents[env_j, :, :] = False
             self.collisions.with_lanelets[env_j, :] = False
             self.collisions.with_exit_segments[env_j, :] = False
+            if self.enable_failure_replay_restore:
+                sampled_result = self._sample_failure_curriculum_snapshot(env_i)
+                if sampled_result is not None:
+                    sampled_failure_replay[env_i] = sampled_result
         self.time_records["reset_agents_loop"] = time.time() - stage10_start
+
+        if sampled_failure_replay:
+            for replay_env_index, (entry_id, snapshot) in sampled_failure_replay.items():
+                self._restore_failure_replay_snapshot(
+                    replay_env_index,
+                    snapshot,
+                    entry_id,
+                    agents,
+                )
 
         # ============== 阶段11：重置状态缓冲区 ==============
         stage11_start = time.time()
@@ -1426,6 +1656,9 @@ class Scenario(BaseScenario):
             dim=-1,
         )
         self.state_buffer.add(state_add)  # Add new state
+        self.failure_replay_snapshot_buffer.add(
+            self._build_failure_replay_buffer_state()
+        )
         
         self.time_records["state_buffer"] = time.time() - stage11_start
 
@@ -3907,6 +4140,9 @@ class Scenario(BaseScenario):
                 dim=-1,
             )
             self.state_buffer.add(state_add)
+            self.failure_replay_snapshot_buffer.add(
+                self._build_failure_replay_buffer_state()
+            )
     def _get_done_status(self) -> Dict[str, Tensor]:
         """Compute environment-level done reasons and success/failure labels."""
         is_collision_with_agents_env = self.collisions.with_agents.view(
@@ -3944,6 +4180,7 @@ class Scenario(BaseScenario):
         """
         done_status = self._get_done_status()
         is_done = done_status["is_done"]
+        self._record_failure_curriculum_events(done_status)
         self.success_count += done_status["is_success"].float()
         self.failure_count += done_status["is_failure"].float()
         self.env_total_step[is_done] = self.env_current_step[is_done]
@@ -4095,6 +4332,8 @@ class Scenario(BaseScenario):
             "episode_done": done_status["is_done"].float(),
             "episode_success": done_status["is_success"].float(),
             "episode_failure": done_status["is_failure"].float(),
+            "episode_replay_source": self.current_episode_replay_source.float(),
+            "episode_replay_entry_id": self.current_episode_replay_entry_id.to(torch.float32),
             "done_all_hinged": done_status["is_agent_all_hinged"].float(),
             "done_collision_with_agents": done_status["is_collision_with_agents_env"].float(),
             "done_collision_with_lanelets": done_status["is_collision_with_lanelets"].float(),
