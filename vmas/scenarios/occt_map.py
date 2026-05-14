@@ -423,7 +423,8 @@ class OcctCRMap(MapBase):
             path_list=((144,137),(177,117))
             self._cr_map_process(cr_map_dir,path_list)
         else:
-            self._cr_map_process(cr_map_dir)
+            path_list=((144,137),(177,129))
+            self._cr_map_process(cr_map_dir,path_list)
         
         print(f"[OcctCRMap]共{len(self.path_library)}条路径数据,最长为{self.max_path_length:.2f}米,顶点有{len(self.max_path_s_list)}个,平均宽度为{self.get_lane_width():.2f}米")
         # 确保有路径数据
@@ -1771,8 +1772,8 @@ class OcctCRMap(MapBase):
         fig_size_small = (4, 3)  
         
         # 2. 缩小字号以适配小画布
-        font_size_label = 8      # 坐标轴标签
-        font_size_tick = 6       # 刻度数字
+        font_size_label = 10      # 坐标轴标签
+        font_size_tick = 9       # 刻度数字
         font_size_legend = 5     # 图例文字
         
         font_path = '/usr/share/fonts/truetype/msttcorefonts/SongTi.ttf'
@@ -1805,7 +1806,7 @@ class OcctCRMap(MapBase):
         ego_params.vehicle_shape.occupancy.shape.edgecolor = "#006400"
         ego_params.vehicle_shape.occupancy.shape.zorder = 20
         
-        xy_limit={0:((20,80),(-40,20)), 1:((30,100),(-40,30))}
+        xy_limit={0:((10,90),(-40,20)), 1:((30,100),(-40,30))}
 
         for path_id, path_data in enumerate(self.path_library):
             
@@ -2391,23 +2392,23 @@ class OcctCRMap(MapBase):
 #             self.path_library[self.batch_id[i].item()]["right_vertices"] for i in range(self.batch_dim)
 #         ], dim=0)
 
-if __name__ == "__main__chapter23":
+if __name__ == "__main__":
     device = torch.device("cuda")
     # road = OcctMap(batch_dim=1, device=device)
     # road.plot_road_debug()
 
     road = OcctCRMap(batch_dim=200, 
-                     cr_map_dir="vmas/scenarios_data/cr_maps/debug",
+                     cr_map_dir="vmas/scenarios_data/cr_maps/paper_plot",
                      max_ref_v=15/3.6 ,
-                     min_lane_width=2.9, 
+                     min_lane_width=2, 
                      min_lane_len=120,
                      device=device, 
                      sample_gap=1, 
                      is_constant_ref_v=False,
                      rod_len=30.0)
     
-    road.plot_road_debug()
-    road.plot_road_for_paper(vis_dir="vmas/scenarios_data/cr_maps/debug/vis_paper")
+    #road.plot_road_debug()
+    road.plot_road_for_paper(vis_dir="vmas/scenarios_data/cr_maps/paper_plot/vis_paper")
 if __name__ == "__main__chapter4_no_extra_hinge":
     device = torch.device("cuda")
     road = OcctCRMap(batch_dim=200, 
@@ -2423,7 +2424,7 @@ if __name__ == "__main__chapter4_no_extra_hinge":
                      n_agents=4)
     
     road.plot_road_debug()
-if __name__ == "__main__":
+if __name__ == "__main__mian":
     device = torch.device("cuda")
     road = OcctCRMap(batch_dim=200, 
                      #cr_map_dir="vmas/scenarios_data/cr_maps/chapter4_6_path",

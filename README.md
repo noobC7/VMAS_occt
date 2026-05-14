@@ -357,6 +357,12 @@ or in this way:
 xvfb-run -s \"-screen 0 1400x900x24\" python <your_script.py>
 ```
 To create a fake screen you need to have `Xvfb` installed.
+python scripts/calc_occt_virtual_vehicle_metrics_multi.py \
+  output/occt_dynamic_compare/occt_dynamic_2car.pkl \
+  output/occt_dynamic_compare/occt_dynamic_3car.pkl \
+  output/occt_dynamic_compare/occt_dynamic_4car.pkl \
+  --output output/occt_dynamic_compare \
+  --legend 无助力 1车助力 2车助力
 
 ## List of environments
 ### VMAS

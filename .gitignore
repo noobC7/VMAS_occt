@@ -254,5 +254,8 @@ cython_debug/
 
 vmas/scenarios_data/cr_maps
 
+output/
+docs/
+scripts/
 *.pt
 *.mp4

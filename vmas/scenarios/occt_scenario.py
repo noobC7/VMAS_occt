@@ -28,7 +28,7 @@ class MethodClass(IntEnum):
     PID = 1
     MPPI = 2
 DEFAULT_TRADITIONAL_CONTROL = MethodClass.MARL
-AGENT_INDEX_FOCUS=2
+AGENT_INDEX_FOCUS=0
 class TaskClass(IntEnum):
     SIMPLE_PLATOON = 0 # without cargo
     OCCT_PLATOON = 1 # with cargo
@@ -123,7 +123,7 @@ class Scenario(BaseScenario):
             batch_dim, device=device, dtype=torch.bool
         )
         self.agent_index_focus = kwargs.pop("agent_index_focus", AGENT_INDEX_FOCUS)
-        self.enable_obs_audit = kwargs.pop("enable_obs_audit", True)
+        self.enable_obs_audit = kwargs.pop("enable_obs_audit", False)
         self.obs_audit_interval = int(kwargs.pop("obs_audit_interval", 100))
         self.obs_audit_agent_index = int(
             kwargs.pop("obs_audit_agent_index", self.agent_index_focus)
@@ -143,7 +143,7 @@ class Scenario(BaseScenario):
         self.traditional_control = parse_traditional_control(
             kwargs.pop("traditional_control", DEFAULT_TRADITIONAL_CONTROL)
         )
-        target_road_id = kwargs.pop("target_road_id", 0)
+        target_road_id = kwargs.pop("target_road_id", 2)
         self.target_road_id = None if target_road_id is None else int(target_road_id)
         disable_all_hinged_done_road_ids = kwargs.pop(
             "disable_all_hinged_done_road_ids", ()
@@ -171,6 +171,15 @@ class Scenario(BaseScenario):
             (batch_dim, self.n_agents), device=device, dtype=torch.float32
         )
         self.logged_control_steer = torch.zeros_like(self.logged_control_acc)
+        self.logged_occt_drive_force = torch.zeros(
+            (batch_dim, 2), device=device, dtype=torch.float32
+        )
+        self.logged_occt_internal_force = torch.zeros(
+            batch_dim, device=device, dtype=torch.float32
+        )
+        self.logged_occt_resistance_force = torch.zeros(
+            batch_dim, device=device, dtype=torch.float32
+        )
         self.hinge_active_steps = torch.zeros(
             (batch_dim, self.n_agents), device=device, dtype=torch.long
         )
@@ -219,6 +228,44 @@ class Scenario(BaseScenario):
         self.hinge_lookahead_idx = kwargs.pop("hinge_lookahead_idx", 2) # lookahead index for hinge tracking agent path
         assert self.agent_lookahead_idx < self.n_points_short_term, "agent_lookahead_idx must be less than n_points_short_term"
         assert self.hinge_lookahead_idx < self.n_points_short_term, "hinge_lookahead_idx must be less than n_points_short_term"
+        self.occt_drive_baseline = str(
+            kwargs.pop("occt_drive_baseline", "4car")
+        ).lower()
+        drive_baseline_defaults = {
+            "2car": (400.0, 5.0),
+            "3car": (500.0, 7.5),
+            "4car": (800.0, 9.0),
+            "front_base": (800.0, 9.0),
+            "rear_base": (800.0, 9.0),
+        }
+        if self.occt_drive_baseline not in drive_baseline_defaults:
+            raise ValueError(
+                "occt_drive_baseline must be one of "
+                "{'2car', '3car', '4car', 'front_base', 'rear_base'}."
+            )
+        default_force_cap, default_power_cap_kw = drive_baseline_defaults[
+            self.occt_drive_baseline
+        ]
+        self.occt_drive_force_cap = float(
+            kwargs.pop("occt_drive_force_cap", default_force_cap)
+        )
+        self.occt_drive_power_cap_kw = float(
+            kwargs.pop("occt_drive_power_cap_kw", default_power_cap_kw)
+        )
+        self.occt_drive_power_blend_speed = float(
+            kwargs.pop("occt_drive_power_blend_speed", 0.5)
+        )
+        self.max_acceleration = float(kwargs.get("max_acceleration", 3.0))
+        self.occt_kinematic_max_acceleration = float(
+            kwargs.pop(
+                "occt_kinematic_max_acceleration",
+                0.1
+                if self.occt_drive_baseline in {"front_base", "rear_base"}
+                else self.max_acceleration,
+            )
+        )
+        if self.occt_kinematic_max_acceleration <= 0.0:
+            raise ValueError("occt_kinematic_max_acceleration must be positive.")
         self.mppi_horizon_steps = int(kwargs.pop("mppi_horizon_steps", 30))
         self.mppi_num_samples = int(kwargs.pop("mppi_num_samples", 256))
         self.mppi_lambda = float(kwargs.pop("mppi_lambda", 10.0))
@@ -267,7 +314,6 @@ class Scenario(BaseScenario):
             "max_steering_angle",
             torch.deg2rad(torch.tensor(35, device=device, dtype=torch.float32)),
         )
-        self.max_acceleration = float(kwargs.get("max_acceleration", 3.0))
         self.max_steering_rate = kwargs.pop(
             "max_steering_rate",
             torch.deg2rad(torch.tensor(35, device=device, dtype=torch.float32)),
@@ -1907,7 +1953,10 @@ class Scenario(BaseScenario):
         Kd=-0
         desire_acc = torch.clamp(Kp * error_v + Kd * cur_acc, 
                                  min=-self.max_acceleration,
-                                 max=self.max_acceleration)
+                                 max=self.occt_kinematic_max_acceleration \
+                                    if self.occt_drive_baseline in \
+                                          {"front_base", "rear_base"} \
+                                            else self.max_acceleration)
         v_front += desire_acc * self.dt
         s_front += v_front * self.dt # [B]
         delta_s, infeasible = self.road.solve_delta_s(s_front, self.rod_len*torch.ones_like(s_front))
@@ -1927,7 +1976,10 @@ class Scenario(BaseScenario):
         Kd=-0
         desire_acc = torch.clamp(Kp * error_v + Kd * cur_acc, 
                                  min=-self.max_acceleration,
-                                 max=self.max_acceleration)
+                                 max=self.occt_kinematic_max_acceleration \
+                                    if self.occt_drive_baseline in \
+                                          {"front_base", "rear_base"} \
+                                            else self.max_acceleration)
         v_rear += desire_acc * self.dt
         s_rear += v_rear * self.dt # [B]
         delta_s, infeasible = self.road.solve_delta_s(s_rear, self.rod_len*torch.ones_like(s_rear), backward=False)
@@ -1935,10 +1987,70 @@ class Scenario(BaseScenario):
         s_front = s_rear + delta_s
         v_front = (s_front - self.observations.agent_s[:, self.HINGE_FIRST_INDEX])/self.dt
         return v_front, v_rear
+
+    def _get_occt_drive_force_limit(self, speed: Tensor) -> Tensor:
+        effective_speed = torch.clamp(
+            speed, min=self.occt_drive_power_blend_speed
+        )
+        power_limited_force = (
+            self.occt_drive_power_cap_kw * 1000.0 / effective_speed
+        )
+        return torch.minimum(
+            torch.full_like(speed, self.occt_drive_force_cap),
+            power_limited_force,
+        )
+
+    def _pre_step_occt_kinematic(self, v_front: Tensor) -> None:
+        s_front_prev = self.observations.agent_s[:, self.HINGE_FIRST_INDEX].clone()
+        s_rear_prev = self.observations.agent_s[:, self.HINGE_LAST_INDEX].clone()
+
+        s_front = v_front * self.dt + s_front_prev
+        s_max = self.road.get_s_max() - 1e-6
+        s_min = torch.zeros_like(s_max)
+        s_front = torch.clamp(s_front, min=s_min, max=s_max)
+
+        delta_s, infeasible = self.road.solve_delta_s(
+            s_front, self.rod_len * torch.ones_like(s_front)
+        )
+        assert not infeasible.any(), "Infeasible delta_s"
+        s_rear = torch.clamp(s_front - delta_s, min=s_min, max=s_max)
+
+        v_front_actual = (s_front - s_front_prev) / self.dt
+        v_rear_actual = (s_rear - s_rear_prev) / self.dt
+        v_front_prev = torch.linalg.norm(self.tractor_front.state.vel, dim=-1)
+        v_rear_prev = torch.linalg.norm(self.tractor_rear.state.vel, dim=-1)
+
+        self.observations.agent_s[:, self.HINGE_FIRST_INDEX] = s_front
+        self.observations.agent_s[:, self.HINGE_LAST_INDEX] = s_rear
+        self.logged_control_acc[:, self.HINGE_FIRST_INDEX] = (
+            (v_front_actual - v_front_prev) / self.dt
+        ).detach().clone()
+        self.logged_control_acc[:, self.HINGE_LAST_INDEX] = (
+            (v_rear_actual - v_rear_prev) / self.dt
+        ).detach().clone()
+
+        front_rear_theta = self.road.get_tangent_heading(
+            self.observations.agent_s[:, self.TRACTOR_SLICE]
+        )
+        front_theta = front_rear_theta[:, 0]
+        rear_theta = front_rear_theta[:, 1]
+        p_front, p_rear = self.get_front_rear_pts(
+            self.observations.agent_s[:, self.TRACTOR_SLICE]
+        )
+        idx_mask = torch.ones(self.batch_dim, dtype=torch.bool, device=self.device)
+        self._set_pose(
+            self.tractor_front, p_front, front_theta, v_front_actual, idx_mask
+        )
+        self._set_pose(
+            self.tractor_rear, p_rear, rear_theta, v_rear_actual, idx_mask
+        )
     
     def pre_step(self):
         self.logged_control_acc.zero_()
         self.logged_control_steer.zero_()
+        self.logged_occt_drive_force.zero_()
+        self.logged_occt_internal_force.zero_()
+        self.logged_occt_resistance_force.zero_()
         if self.task_class == TaskClass.SIMPLE_PLATOON:
             return
         self.M_total = 5000.0  # 总质量 (2辆小车 + 扇叶)
@@ -1950,76 +2062,90 @@ class Scenario(BaseScenario):
         v_front1, v_rear1 = self.get_front_rear_v_use_front()
         v_front2, v_rear2 = self.get_front_rear_v_use_rear()
         
-        # 依然保留你的保守速度选择逻辑，作为“驱动力”的输入
-        select_idx = torch.max(v_front1, v_rear1) < torch.max(v_front2, v_rear2)
-        v_target_f = torch.where(select_idx, v_front1, v_front2)
-        v_target_r = torch.where(select_idx, v_rear1, v_rear2)
+        if self.occt_drive_baseline == "front_base":
+            self._pre_step_occt_kinematic(v_front1)
+        elif self.occt_drive_baseline == "rear_base":
+            self._pre_step_occt_kinematic(v_front2)
+        else:
+            # 依然保留你的保守速度选择逻辑，作为“驱动力”的输入
+            select_idx = torch.max(v_front1, v_rear1) < torch.max(v_front2, v_rear2)
+            v_target_f = torch.where(select_idx, v_front1, v_front2)
+            v_target_r = torch.where(select_idx, v_rear1, v_rear2)
 
-        # 2. 获取当前状态
-        s_f_curr = self.observations.agent_s[:, self.HINGE_FIRST_INDEX]
-        s_r_curr = self.observations.agent_s[:, self.HINGE_LAST_INDEX]
-        
-        # 3. 计算刚体动力学约束力
-        # 计算当前实际弦长距离 (可以通过 get_front_rear_pts 得到欧式距离)
-        p_f, p_r = self.get_front_rear_pts(self.observations.agent_s[:, self.TRACTOR_SLICE])
-        current_dist = torch.norm(p_f - p_r, dim=1)
-        dist_error = current_dist - self.L_cargo
-        
-        # 计算距离变化率 (用于阻尼)
-        v_f_curr =  torch.linalg.norm(self.tractor_front.state.vel, dim=-1)
-        v_r_curr = torch.linalg.norm(self.tractor_rear.state.vel, dim=-1)
-        dist_rate = v_f_curr - v_r_curr # 简化表达
+            # 2. 获取当前状态
+            s_f_curr = self.observations.agent_s[:, self.HINGE_FIRST_INDEX]
+            s_r_curr = self.observations.agent_s[:, self.HINGE_LAST_INDEX]
+            
+            # 3. 计算刚体动力学约束力
+            # 计算当前实际弦长距离 (可以通过 get_front_rear_pts 得到欧式距离)
+            p_f, p_r = self.get_front_rear_pts(self.observations.agent_s[:, self.TRACTOR_SLICE])
+            current_dist = torch.norm(p_f - p_r, dim=1)
+            dist_error = current_dist - self.L_cargo
+            
+            # 计算距离变化率 (用于阻尼)
+            v_f_curr =  torch.linalg.norm(self.tractor_front.state.vel, dim=-1)
+            v_r_curr = torch.linalg.norm(self.tractor_rear.state.vel, dim=-1)
+            dist_rate = v_f_curr - v_r_curr # 简化表达
 
-        # 虚拟内部约束力 (Internal Force)
-        f_internal = self.K_rigid * dist_error + self.D_rigid * dist_rate
+            # 虚拟内部约束力 (Internal Force)
+            f_internal = self.K_rigid * dist_error + self.D_rigid * dist_rate
+            # 4. 计算驱动力 (Driving Force)
+            # 基于理想运动学速度与当前速度的偏差来产生驱动力
+            f_drive_f = self.K_drive * (v_target_f - v_f_curr)
+            f_drive_r = self.K_drive * (v_target_r - v_r_curr)
+            drive_limit_f = self._get_occt_drive_force_limit(v_f_curr)
+            drive_limit_r = self._get_occt_drive_force_limit(v_r_curr)
+            f_drive_f = torch.minimum(f_drive_f, drive_limit_f)
+            f_drive_r = torch.minimum(f_drive_r, drive_limit_r)
+            self.logged_occt_drive_force[:, 0] = f_drive_f.detach().clone()
+            self.logged_occt_drive_force[:, 1] = f_drive_r.detach().clone()
+            self.logged_occt_internal_force = f_internal.detach().clone()
+            self.logged_occt_resistance_force = f_internal.abs().detach().clone()
 
-        # 4. 计算驱动力 (Driving Force)
-        # 基于理想运动学速度与当前速度的偏差来产生驱动力
-        f_drive_f = self.K_drive * (v_target_f - v_f_curr)
-        f_drive_r = self.K_drive * (v_target_r - v_r_curr)
+            # 5. 应用牛顿定律更新加速度 (考虑巨大的质量 M)
+            # a = (F_drive + F_internal) / M
+            # 注意：首车受向后的拉力，尾车受向前的拉力
+            a_f = (f_drive_f - f_internal) / (self.M_total / 2) 
+            a_r = (f_drive_r + f_internal) / (self.M_total / 2)
+            self.logged_control_acc[:, self.HINGE_FIRST_INDEX] = a_f.detach().clone()
+            self.logged_control_acc[:, self.HINGE_LAST_INDEX] = a_r.detach().clone()
 
-        # 5. 应用牛顿定律更新加速度 (考虑巨大的质量 M)
-        # a = (F_drive + F_internal) / M
-        # 注意：首车受向后的拉力，尾车受向前的拉力
-        a_f = (f_drive_f - f_internal) / (self.M_total / 2) 
-        a_r = (f_drive_r + f_internal) / (self.M_total / 2)
+            # 6. 积分得到新速度和新位移
+            v_f_new = v_f_curr + a_f * self.dt
+            v_r_new = v_r_curr + a_r * self.dt
+            s_f_new = s_f_curr + v_f_new * self.dt
+            s_r_new = s_r_curr + v_r_new * self.dt
 
-        # 6. 积分得到新速度和新位移
-        v_f_new = v_f_curr + a_f * self.dt
-        v_r_new = v_r_curr + a_r * self.dt
-        s_f_new = s_f_curr + v_f_new * self.dt
-        s_r_new = s_r_curr + v_r_new * self.dt
+            # 7. 更新状态与位姿 (保持你的道路映射逻辑)
+            s_max = self.road.get_s_max() - 1e-6
+            self.observations.agent_s[:, self.HINGE_FIRST_INDEX] = torch.clamp(s_f_new, max = s_max)
+            self.observations.agent_s[:, self.HINGE_LAST_INDEX] = torch.clamp(s_r_new, max = s_max)
+            
+            p_front_dyn, p_rear_dyn = self.get_front_rear_pts(self.observations.agent_s[:, self.TRACTOR_SLICE])
+            front_rear_theta_dyn = self.road.get_tangent_heading(
+                self.observations.agent_s[:, self.TRACTOR_SLICE]
+            )
+            front_theta_dyn = front_rear_theta_dyn[:, 0]
+            rear_theta_dyn = front_rear_theta_dyn[:, 1]
 
-        # 7. 更新状态与位姿 (保持你的道路映射逻辑)
-        s_max = self.road.get_s_max() - 1e-6
-        self.observations.agent_s[:, self.HINGE_FIRST_INDEX] = torch.clamp(s_f_new, max = s_max)
-        self.observations.agent_s[:, self.HINGE_LAST_INDEX] = torch.clamp(s_r_new, max = s_max)
-        
-        p_front_dyn, p_rear_dyn = self.get_front_rear_pts(self.observations.agent_s[:, self.TRACTOR_SLICE])
+            # ---- 3. 改写 _set_pose 调用 ----
+            # 使用动力学积分得到的速度 v_f_new 和 v_r_new，而不是运动学解算的建议速度
+            idx_mask = torch.ones(self.batch_dim, dtype=torch.bool, device=self.device)
+            self._set_pose(
+                self.tractor_front, 
+                p_front_dyn, 
+                front_theta_dyn, 
+                v_f_new,       # 动力学平滑后的速度
+                idx_mask
+            )
 
-        # ---- 2. 获取对应的航向角 ----
-        front_rear_theta_dyn = self.road.get_tangent_heading(self.observations.agent_s[:, self.TRACTOR_SLICE])
-        front_theta_dyn = front_rear_theta_dyn[:, 0]
-        rear_theta_dyn = front_rear_theta_dyn[:, 1]
-
-        # ---- 3. 改写 _set_pose 调用 ----
-        # 使用动力学积分得到的速度 v_f_new 和 v_r_new，而不是运动学解算的建议速度
-        idx_mask = torch.ones(self.batch_dim, dtype=torch.bool, device=self.device)
-        self._set_pose(
-            self.tractor_front, 
-            p_front_dyn, 
-            front_theta_dyn, 
-            v_f_new,       # 动力学平滑后的速度
-            idx_mask
-        )
-
-        self._set_pose(
-            self.tractor_rear, 
-            p_rear_dyn, 
-            rear_theta_dyn, 
-            v_r_new,       # 动力学平滑后的速度
-            idx_mask
-        )
+            self._set_pose(
+                self.tractor_rear, 
+                p_rear_dyn, 
+                rear_theta_dyn, 
+                v_r_new,       # 动力学平滑后的速度
+                idx_mask
+            )
 
         if self.traditional_control!=MethodClass.MARL:
             if self.task_class==TaskClass.SIMPLE_PLATOON:
@@ -4154,9 +4280,9 @@ class Scenario(BaseScenario):
         is_all_hinged_done_disabled = self._get_all_hinged_done_disabled_mask()
         is_done_by_all_hinged = is_agent_all_hinged & ~is_all_hinged_done_disabled
         is_done = (
-            is_collision_with_agents_env
-            | is_collision_with_exit_segments
-            | is_collision_with_lanelets
+            #is_collision_with_agents_env
+             is_collision_with_exit_segments
+            #| is_collision_with_lanelets
             | is_done_by_all_hinged
         )
         is_success = is_done_by_all_hinged & ~(
